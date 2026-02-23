@@ -625,6 +625,10 @@ fn clip_single(
   use_copy: bool,
   profile: Option<&ClipTranscodeProfile>,
 ) -> Result<(), String> {
+  if let Some(parent) = output_path.parent() {
+    fs::create_dir_all(parent)
+      .map_err(|err| format!("Failed to create clip output dir: {}", err))?;
+  }
   let mut args = vec!["-i".to_string(), source.input_path.clone()];
 
   if let Some(start) = source.start_time.as_deref() {

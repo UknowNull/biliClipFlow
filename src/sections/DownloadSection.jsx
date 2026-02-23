@@ -167,6 +167,7 @@ export default function DownloadSection() {
   const [quickFillTasks, setQuickFillTasks] = useState([]);
   const [quickFillPage, setQuickFillPage] = useState(1);
   const [quickFillTotal, setQuickFillTotal] = useState(0);
+  const [quickFillSearch, setQuickFillSearch] = useState("");
   const quickFillPageSize = 10;
   const [syncPickerOpen, setSyncPickerOpen] = useState(false);
   const [deleteConfirmRecord, setDeleteConfirmRecord] = useState(null);
@@ -353,7 +354,7 @@ export default function DownloadSection() {
     }
     loadQuickFillTasks(quickFillPage);
     return undefined;
-  }, [quickFillOpen, quickFillPage]);
+  }, [quickFillOpen, quickFillPage, quickFillSearch]);
 
   useEffect(() => {
     setVideoItems((prev) => {
@@ -795,18 +796,19 @@ export default function DownloadSection() {
     applyActivitySelection(target);
   };
 
-  const loadQuickFillTasks = async (page = quickFillPage) => {
+  const loadQuickFillTasks = async (page = quickFillPage, keyword = quickFillSearch) => {
     try {
       try {
         await invokeCommand("auth_client_log", {
           message: `quick_fill_request page=${page} size=${quickFillPageSize}`,
         });
       } catch (_) {}
-      const data = await invokeCommand("submission_list", {
-        page,
-        page_size: quickFillPageSize,
-        pageSize: quickFillPageSize,
-      });
+      const payload = { page, page_size: quickFillPageSize, pageSize: quickFillPageSize };
+      const trimmedKeyword = keyword?.trim();
+      if (trimmedKeyword) {
+        payload.query = trimmedKeyword;
+      }
+      const data = await invokeCommand("submission_list", payload);
       const items = data?.items || [];
       const total = Number(data?.total) || 0;
       try {
@@ -2106,6 +2108,17 @@ export default function DownloadSection() {
                   <button className="h-7 px-3 rounded-lg text-xs" onClick={closeQuickFill}>
                     关闭
                   </button>
+                </div>
+                <div className="mt-3">
+                  <input
+                    value={quickFillSearch}
+                    onChange={(event) => {
+                      setQuickFillSearch(event.target.value);
+                      setQuickFillPage(1);
+                    }}
+                    placeholder="标题或BV号搜索"
+                    className="w-full rounded-lg border border-[var(--split-color)] bg-white px-3 py-2 text-sm text-[var(--content-color)]"
+                  />
                 </div>
                 <div className="mt-3 h-[420px] overflow-y-auto rounded-xl border border-[var(--split-color)]">
                   <table className="w-full text-left text-sm">

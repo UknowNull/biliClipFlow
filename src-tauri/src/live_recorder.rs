@@ -736,6 +736,10 @@ fn run_record_loop(
   let mut stream_urls: Vec<String> = Vec::new();
   let mut stream_url_index: usize = 0;
   let mut force_no_qn_until: Option<i64> = None;
+  let mut timestamp_fixer = TimestampFixer::new(
+    enable_timestamp_fix,
+    settings.flv_fix_adjust_timestamp_jump,
+  );
 
   loop {
     if stop_flag.load(Ordering::SeqCst) {
@@ -976,10 +980,6 @@ fn run_record_loop(
     let mut buf = vec![0u8; 8192];
     let mut parser = FlvStreamParser::new();
     let mut cache = FlvHeaderCache::new();
-    let mut timestamp_fixer = TimestampFixer::new(
-      enable_timestamp_fix,
-      settings.flv_fix_adjust_timestamp_jump,
-    );
     let mut last_tag_timestamp: Option<u32> = None;
     let mut stagnant_count: usize = 0;
     let mut last_progress_at = Instant::now();

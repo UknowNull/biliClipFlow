@@ -68,6 +68,7 @@ export default function SubmissionSection() {
   const [activityMessage, setActivityMessage] = useState("");
   const [tasks, setTasks] = useState([]);
   const [totalTasks, setTotalTasks] = useState(0);
+  const [taskSearch, setTaskSearch] = useState("");
   const [selectedTask, setSelectedTask] = useState(null);
   const [detailTab, setDetailTab] = useState("basic");
   const [currentPage, setCurrentPage] = useState(1);
@@ -97,6 +98,7 @@ export default function SubmissionSection() {
   const [quickFillTasks, setQuickFillTasks] = useState([]);
   const [quickFillPage, setQuickFillPage] = useState(1);
   const [quickFillTotal, setQuickFillTotal] = useState(0);
+  const [quickFillSearch, setQuickFillSearch] = useState("");
   const [updateOpen, setUpdateOpen] = useState(false);
   const [resegmentOpen, setResegmentOpen] = useState(false);
   const [resegmentTaskId, setResegmentTaskId] = useState("");
@@ -115,6 +117,7 @@ export default function SubmissionSection() {
   const [repostUseCurrentBvid, setRepostUseCurrentBvid] = useState(false);
   const [repostSubmitting, setRepostSubmitting] = useState(false);
   const [createSubmitting, setCreateSubmitting] = useState(false);
+
   const [repostMode, setRepostMode] = useState("SPECIFIED");
   const [repostMergedVideos, setRepostMergedVideos] = useState([]);
   const [repostMergedId, setRepostMergedId] = useState("");
@@ -123,6 +126,7 @@ export default function SubmissionSection() {
     path: "",
     filename: "",
   });
+
   const [defaultBaiduSyncPath, setDefaultBaiduSyncPath] = useState("/录播");
   const [updateTaskId, setUpdateTaskId] = useState("");
   const [updateSourceVideos, setUpdateSourceVideos] = useState([emptySource(0)]);
@@ -632,9 +636,14 @@ export default function SubmissionSection() {
     page = currentPage,
     size = pageSize,
     refreshRemote = false,
+    keyword = taskSearch,
   ) => {
     try {
       const payload = { page, page_size: size };
+      const trimmedKeyword = keyword?.trim();
+      if (trimmedKeyword) {
+        payload.query = trimmedKeyword;
+      }
       if (refreshRemote) {
         payload.refresh_remote = true;
       }
@@ -658,18 +667,19 @@ export default function SubmissionSection() {
     }
   };
 
-  const loadQuickFillTasks = async (page = quickFillPage) => {
+  const loadQuickFillTasks = async (page = quickFillPage, keyword = quickFillSearch) => {
     try {
       try {
         await invokeCommand("auth_client_log", {
           message: `quick_fill_request page=${page} size=${quickFillPageSize}`,
         });
       } catch (_) {}
-      const data = await invokeCommand("submission_list", {
-        page,
-        page_size: quickFillPageSize,
-        pageSize: quickFillPageSize,
-      });
+      const payload = { page, page_size: quickFillPageSize, pageSize: quickFillPageSize };
+      const trimmedKeyword = keyword?.trim();
+      if (trimmedKeyword) {
+        payload.query = trimmedKeyword;
+      }
+      const data = await invokeCommand("submission_list", payload);
       const items = data?.items || [];
       const total = Number(data?.total) || 0;
       try {
@@ -776,7 +786,7 @@ export default function SubmissionSection() {
     }
     loadTasks(statusFilter, currentPage, pageSize);
     return undefined;
-  }, [submissionView, statusFilter, currentPage, pageSize]);
+  }, [submissionView, statusFilter, currentPage, pageSize, taskSearch]);
 
   useEffect(() => {
     if (submissionView !== "list") {
@@ -786,7 +796,7 @@ export default function SubmissionSection() {
       loadTasks(statusFilter, currentPage, pageSize);
     }, 3000);
     return () => clearInterval(timer);
-  }, [submissionView, statusFilter, currentPage, pageSize]);
+  }, [submissionView, statusFilter, currentPage, pageSize, taskSearch]);
 
   useEffect(() => {
     if (!quickFillOpen) {
@@ -794,7 +804,7 @@ export default function SubmissionSection() {
     }
     loadQuickFillTasks(quickFillPage);
     return undefined;
-  }, [quickFillOpen, quickFillPage]);
+  }, [quickFillOpen, quickFillPage, quickFillSearch]);
 
   useEffect(() => {
     if (!isDetailView || !selectedTask?.task?.taskId) {
@@ -1639,8 +1649,8 @@ export default function SubmissionSection() {
       setMessage("请选择合并视频");
       return;
     }
-    if (repostMode === "FULL_REPROCESS" && !repostUseCurrentBvid && !repostHasBvid) {
-      setMessage("当前任务没有BV号，只能选择重新生成投稿");
+    if (repostMode === "FULL_REPROCESS" && repostUseCurrentBvid && !repostHasBvid) {
+      setMessage("当前任务没有BV号，无法集成投稿");
       return;
     }
     setMessage("");
@@ -3063,6 +3073,17 @@ export default function SubmissionSection() {
                 关闭
               </button>
             </div>
+            <div className="mt-3">
+              <input
+                value={quickFillSearch}
+                onChange={(event) => {
+                  setQuickFillSearch(event.target.value);
+                  setQuickFillPage(1);
+                }}
+                placeholder="标题或BV号搜索"
+                className="w-full rounded-xl border border-black/10 bg-white px-3 py-2 text-sm text-[var(--ink)]"
+              />
+            </div>
             <div className="mt-3 h-[420px] overflow-y-auto rounded-xl border border-black/5">
               <table className="w-full text-left text-sm">
                 <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
@@ -3371,6 +3392,15 @@ export default function SubmissionSection() {
             投稿任务列表
           </div>
           <div className="flex flex-wrap gap-2">
+            <input
+              value={taskSearch}
+              onChange={(event) => {
+                setTaskSearch(event.target.value);
+                setCurrentPage(1);
+              }}
+              placeholder="标题或BV号搜索"
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+            />
             <button
               className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
               onClick={openCreateView}
@@ -3629,8 +3659,10 @@ export default function SubmissionSection() {
             <select
               value={pageSize}
               onChange={(event) => {
-                setPageSize(Number(event.target.value));
+                const nextSize = Number(event.target.value);
+                setPageSize(nextSize);
                 setCurrentPage(1);
+                loadTasks(statusFilter, 1, nextSize);
               }}
               className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
             >

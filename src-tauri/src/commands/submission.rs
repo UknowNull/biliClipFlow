@@ -4429,6 +4429,7 @@ pub async fn submission_list(
   state: State<'_, AppState>,
   page: Option<i64>,
   page_size: Option<i64>,
+  query: Option<String>,
   refresh_remote: Option<bool>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
   let context = SubmissionContext::new(&state);
@@ -4443,7 +4444,7 @@ pub async fn submission_list(
   }
   let page = page.unwrap_or(1).max(1);
   let page_size = page_size.unwrap_or(20).max(1);
-  let response = match load_tasks(&context, None, page, page_size) {
+  let response = match load_tasks(&context, None, page, page_size, query) {
     Ok(result) => ApiResponse::success(result),
     Err(err) => ApiResponse::error(format!("Failed to load tasks: {}", err)),
   };
@@ -4456,6 +4457,7 @@ pub async fn submission_list_by_status(
   status: String,
   page: Option<i64>,
   page_size: Option<i64>,
+  query: Option<String>,
   refresh_remote: Option<bool>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
   let context = SubmissionContext::new(&state);
@@ -4473,7 +4475,7 @@ pub async fn submission_list_by_status(
   }
   let page = page.unwrap_or(1).max(1);
   let page_size = page_size.unwrap_or(20).max(1);
-  let response = match load_tasks(&context, Some(status), page, page_size) {
+  let response = match load_tasks(&context, Some(status), page, page_size, query) {
     Ok(result) => ApiResponse::success(result),
     Err(err) => ApiResponse::error(format!("Failed to load tasks: {}", err)),
   };
@@ -5803,18 +5805,37 @@ fn load_tasks(
   status: Option<String>,
   page: i64,
   page_size: i64,
+  query: Option<String>,
 ) -> Result<PaginatedSubmissionTasks, String> {
   context
     .db
     .with_conn(|conn| {
-      let total = if status.is_some() {
-        conn.query_row(
-          "SELECT COUNT(*) FROM submission_task WHERE status = ?1",
-          [status.clone().unwrap_or_default()],
+      let query = query.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+          None
+        } else {
+          Some(trimmed)
+        }
+      });
+      let like_query = query.as_ref().map(|value| format!("%{}%", value));
+      let total = match (status.as_ref(), like_query.as_ref()) {
+        (Some(status), Some(pattern)) => conn.query_row(
+          "SELECT COUNT(*) FROM submission_task WHERE status = ?1 AND (title LIKE ?2 COLLATE NOCASE OR bvid LIKE ?2 COLLATE NOCASE)",
+          (status, pattern),
           |row| row.get(0),
-        )?
-      } else {
-        conn.query_row("SELECT COUNT(*) FROM submission_task", [], |row| row.get(0))?
+        )?,
+        (Some(status), None) => conn.query_row(
+          "SELECT COUNT(*) FROM submission_task WHERE status = ?1",
+          [status],
+          |row| row.get(0),
+        )?,
+        (None, Some(pattern)) => conn.query_row(
+          "SELECT COUNT(*) FROM submission_task WHERE title LIKE ?1 COLLATE NOCASE OR bvid LIKE ?1 COLLATE NOCASE",
+          [pattern],
+          |row| row.get(0),
+        )?,
+        (None, None) => conn.query_row("SELECT COUNT(*) FROM submission_task", [], |row| row.get(0))?,
       };
       let offset = (page - 1).saturating_mul(page_size);
       let order_by = "ORDER BY \
@@ -5849,8 +5870,17 @@ fn load_tasks(
           ELSE 0 \
         END DESC, \
         st.created_at DESC";
-      let sql = if status.is_some() {
-        format!(
+      let sql = match (status.as_ref(), like_query.as_ref()) {
+        (Some(_), Some(_)) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
+                  wi.status, wi.current_step, wi.progress \
+           FROM submission_task st \
+           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           WHERE st.status = ?1 AND (st.title LIKE ?2 COLLATE NOCASE OR st.bvid LIKE ?2 COLLATE NOCASE) {} LIMIT ?3 OFFSET ?4",
+          order_by
+        ),
+        (Some(_), None) => format!(
           "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress \
@@ -5858,9 +5888,17 @@ fn load_tasks(
            LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
            WHERE st.status = ?1 {} LIMIT ?2 OFFSET ?3",
           order_by
-        )
-      } else {
-        format!(
+        ),
+        (None, Some(_)) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
+                  wi.status, wi.current_step, wi.progress \
+           FROM submission_task st \
+           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           WHERE st.title LIKE ?1 COLLATE NOCASE OR st.bvid LIKE ?1 COLLATE NOCASE {} LIMIT ?2 OFFSET ?3",
+          order_by
+        ),
+        (None, None) => format!(
           "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress \
@@ -5868,14 +5906,19 @@ fn load_tasks(
            LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
            {} LIMIT ?1 OFFSET ?2",
           order_by
-        )
+        ),
       };
 
       let mut stmt = conn.prepare(&sql)?;
-      let rows = if let Some(status) = status {
-        stmt.query_map((status, page_size, offset), map_submission_task)?
-      } else {
-        stmt.query_map((page_size, offset), map_submission_task)?
+      let rows = match (status, like_query) {
+        (Some(status), Some(pattern)) => {
+          stmt.query_map((status, pattern, page_size, offset), map_submission_task)?
+        }
+        (Some(status), None) => stmt.query_map((status, page_size, offset), map_submission_task)?,
+        (None, Some(pattern)) => {
+          stmt.query_map((pattern, page_size, offset), map_submission_task)?
+        }
+        (None, None) => stmt.query_map((page_size, offset), map_submission_task)?,
       };
 
       let list = rows.collect::<Result<Vec<_>, _>>()?;
