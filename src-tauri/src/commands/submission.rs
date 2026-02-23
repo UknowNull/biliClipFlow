@@ -4425,10 +4425,12 @@ pub async fn submission_resegment(
 }
 
 #[tauri::command]
+#[allow(non_snake_case)]
 pub async fn submission_list(
   state: State<'_, AppState>,
   page: Option<i64>,
   page_size: Option<i64>,
+  pageSize: Option<i64>,
   query: Option<String>,
   refresh_remote: Option<bool>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
@@ -4443,7 +4445,7 @@ pub async fn submission_list(
     }
   }
   let page = page.unwrap_or(1).max(1);
-  let page_size = page_size.unwrap_or(20).max(1);
+  let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
   let response = match load_tasks(&context, None, page, page_size, query) {
     Ok(result) => ApiResponse::success(result),
     Err(err) => ApiResponse::error(format!("Failed to load tasks: {}", err)),
@@ -4452,11 +4454,13 @@ pub async fn submission_list(
 }
 
 #[tauri::command]
+#[allow(non_snake_case)]
 pub async fn submission_list_by_status(
   state: State<'_, AppState>,
   status: String,
   page: Option<i64>,
   page_size: Option<i64>,
+  pageSize: Option<i64>,
   query: Option<String>,
   refresh_remote: Option<bool>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
@@ -4474,7 +4478,7 @@ pub async fn submission_list_by_status(
     }
   }
   let page = page.unwrap_or(1).max(1);
-  let page_size = page_size.unwrap_or(20).max(1);
+  let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
   let response = match load_tasks(&context, Some(status), page, page_size, query) {
     Ok(result) => ApiResponse::success(result),
     Err(err) => ApiResponse::error(format!("Failed to load tasks: {}", err)),

@@ -637,12 +637,20 @@ export default function SubmissionSection() {
     size = pageSize,
     refreshRemote = false,
     keyword = taskSearch,
+    source = "auto",
   ) => {
     try {
-      const payload = { page, page_size: size };
+      const payload = { page, page_size: size, pageSize: size };
       const trimmedKeyword = keyword?.trim();
       if (trimmedKeyword) {
         payload.query = trimmedKeyword;
+      }
+      if (source === "page_size_change") {
+        try {
+          await invokeCommand("auth_client_log", {
+            message: `submission_list_request source=${source} page=${page} size=${size} status=${filter} query=${trimmedKeyword || "-"}`,
+          });
+        } catch (_) {}
       }
       if (refreshRemote) {
         payload.refresh_remote = true;
@@ -656,6 +664,13 @@ export default function SubmissionSection() {
             });
       const items = data?.items || [];
       const total = Number(data?.total) || 0;
+      if (source === "page_size_change") {
+        try {
+          await invokeCommand("auth_client_log", {
+            message: `submission_list_response source=${source} page=${page} size=${size} items=${items.length} total=${total}`,
+          });
+        } catch (_) {}
+      }
       setTasks(items);
       setTotalTasks(total);
       const maxPage = Math.max(1, Math.ceil(total / size));
@@ -3660,9 +3675,11 @@ export default function SubmissionSection() {
               value={pageSize}
               onChange={(event) => {
                 const nextSize = Number(event.target.value);
+                if (nextSize === pageSize) {
+                  return;
+                }
                 setPageSize(nextSize);
-                setCurrentPage(1);
-                loadTasks(statusFilter, 1, nextSize);
+                loadTasks(statusFilter, currentPage, nextSize, false, taskSearch, "page_size_change");
               }}
               className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
             >
