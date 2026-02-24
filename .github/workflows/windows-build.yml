@@ -1,0 +1,49 @@
+name: build-windows
+on:
+  push:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: "reaction-cut-rust"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: "reaction-cut-rust/pnpm-lock.yaml"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install WiX
+        run: choco install -y wixtoolset
+
+      - name: Install deps
+        run: pnpm install
+
+      - name: Fetch bins (Windows x64)
+        run: $env:BIN_DOWNLOAD="1"; pnpm run install-bins
+
+      - name: Build bundles
+        run: pnpm exec tauri build --bundles nsis,msi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "reaction-cut-rust-windows"
+          path: |
+            reaction-cut-rust/src-tauri/target/release/bundle/nsis/*.exe
+            reaction-cut-rust/src-tauri/target/release/bundle/msi/*.msi
