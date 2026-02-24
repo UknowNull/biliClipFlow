@@ -7,12 +7,24 @@ on:
         required: false
         default: "false"
         type: boolean
+      release_notes_mode:
+        description: "Release notes mode (auto or manual)"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - manual
       release_tag:
         description: "Release tag (e.g. v1.0.0) when create_release=true"
         required: false
         type: string
       release_name:
         description: "Release name (optional)"
+        required: false
+        type: string
+      release_body:
+        description: "Release notes body when release_notes_mode=manual"
         required: false
         type: string
       prerelease:
@@ -93,6 +105,11 @@ jobs:
         run: |
           Write-Error "release_tag is required when create_release=true"
           exit 1
+      - name: Validate release notes (manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true && inputs.release_notes_mode == 'manual' && inputs.release_body == ''
+        run: |
+          Write-Error "release_body is required when release_notes_mode=manual"
+          exit 1
       - name: Package release zips
         shell: bash
         env:
@@ -125,12 +142,22 @@ jobs:
             zip -r "dist/release-zips/reaction-cut-rust-${RELEASE_TAG}-macos-${arch_lower}.zip" "$dir"
           done
 
-      - name: Publish release (manual)
-        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true
+      - name: Publish release (auto notes)
+        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true && inputs.release_notes_mode == 'auto'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
           name: ${{ inputs.release_name }}
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true
+          files: dist/release-zips/*.zip
+
+      - name: Publish release (manual notes)
+        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true && inputs.release_notes_mode == 'manual'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_name }}
+          prerelease: ${{ inputs.prerelease }}
+          body: ${{ inputs.release_body }}
           files: dist/release-zips/*.zip
