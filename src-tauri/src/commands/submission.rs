@@ -35,7 +35,7 @@ use crate::login_refresh;
 use crate::login_store::{AuthInfo, LoginStore};
 use crate::path_store::{
   load_local_path_prefix, to_absolute_local_path_opt_with_prefix, to_absolute_local_path_with_prefix,
-  to_stored_local_path,
+  to_stored_local_path_with_prefix,
 };
 use crate::processing::{
   clip_sources, decide_clip_copy, merge_files, parse_time_to_seconds, probe_duration_seconds,
@@ -51,6 +51,7 @@ struct SubmissionContext {
   db: Arc<Db>,
   app_log_path: Arc<PathBuf>,
   edit_upload_state: Arc<Mutex<EditUploadState>>,
+  local_path_prefix: PathBuf,
 }
 
 impl SubmissionContext {
@@ -59,6 +60,7 @@ impl SubmissionContext {
       db: state.db.clone(),
       app_log_path: state.app_log_path.clone(),
       edit_upload_state: state.edit_upload_state.clone(),
+      local_path_prefix: load_local_path_prefix(state.db.as_ref()),
     }
   }
 }
@@ -395,6 +397,14 @@ pub struct SubmissionBindMergedRemoteRequest {
   pub remote_path: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionDeleteMergedRequest {
+  pub task_id: String,
+  pub merged_id: i64,
+  pub delete_local_file: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskCreationResult {
@@ -491,6 +501,14 @@ pub struct SubmissionDeleteResult {
   pub conflicts: Vec<DeleteFilePreview>,
   pub deleted_paths: Vec<String>,
   pub missing_paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionDeleteMergedResult {
+  pub deleted: bool,
+  pub deleted_local_file: bool,
+  pub archived_local_path: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -723,6 +741,13 @@ pub async fn submission_create(
     &state.app_log_path,
     &format!("submission_create_start task_id={}", task_id),
   );
+  let stored_source_paths = request
+    .source_videos
+    .iter()
+    .map(|source| {
+      to_stored_local_path_with_prefix(context.local_path_prefix.as_path(), &source.source_file_path)
+    })
+    .collect::<Vec<_>>();
 
   let result = context.db.with_conn(|conn| {
     let normalized_baidu_sync_filename =
@@ -758,9 +783,8 @@ pub async fn submission_create(
       ],
     )?;
 
-    for source in &request.source_videos {
+    for (source, stored_source_path) in request.source_videos.iter().zip(stored_source_paths.iter()) {
       let source_id = uuid::Uuid::new_v4().to_string();
-      let stored_source_path = to_stored_submission_path(&context, &source.source_file_path);
       conn.execute(
         "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2290,7 +2314,7 @@ async fn try_restore_merged_from_baidu(
     if status == 2 && !local_path_value.trim().is_empty() {
       let local_path_buf =
         to_absolute_local_path_with_prefix(
-          load_local_path_prefix(context.db.as_ref()).as_path(),
+          context.local_path_prefix.as_path(),
           &local_path_value,
         );
       if local_path_buf.exists() {
@@ -3511,10 +3535,12 @@ pub async fn resume_reprocess_after_baidu_restore(
   task_id: String,
   download_record_id: i64,
 ) {
+  let local_path_prefix = load_local_path_prefix(db.as_ref());
   let context = SubmissionContext {
     db,
     app_log_path: app_log_path.clone(),
     edit_upload_state,
+    local_path_prefix,
   };
   let record = context.db.with_conn(|conn| {
     conn
@@ -3547,7 +3573,7 @@ pub async fn resume_reprocess_after_baidu_restore(
   };
   let local_path_buf =
     to_absolute_local_path_with_prefix(
-      load_local_path_prefix(context.db.as_ref()).as_path(),
+      context.local_path_prefix.as_path(),
       &local_path,
     );
   if !local_path_buf.exists() {
@@ -4959,6 +4985,160 @@ pub fn submission_bind_merged_remote_file(
 }
 
 #[tauri::command]
+pub fn submission_delete_merged_video(
+  state: State<'_, AppState>,
+  request: SubmissionDeleteMergedRequest,
+) -> ApiResponse<SubmissionDeleteMergedResult> {
+  let context = SubmissionContext::new(&state);
+  let task_id = request.task_id.trim().to_string();
+  if task_id.is_empty() {
+    return ApiResponse::error("任务ID不能为空");
+  }
+  if request.merged_id <= 0 {
+    return ApiResponse::error("合并视频ID无效");
+  }
+
+  let current_bilibili_uid = match require_current_bilibili_uid(&state) {
+    Ok(value) => value,
+    Err(err) => return ApiResponse::error(err),
+  };
+  let task_owner = context.db.with_conn(|conn| {
+    conn
+      .query_row(
+        "SELECT bilibili_uid FROM submission_task WHERE task_id = ?1",
+        [&task_id],
+        |row| row.get::<_, Option<i64>>(0),
+      )
+      .optional()
+  });
+  let task_owner = match task_owner {
+    Ok(Some(value)) => value,
+    Ok(None) => return ApiResponse::error("投稿任务不存在"),
+    Err(err) => return ApiResponse::error(format!("读取投稿任务失败: {}", err)),
+  };
+  if task_owner != Some(current_bilibili_uid) {
+    return ApiResponse::error("当前账号无权删除该合并视频");
+  }
+
+  let merged_record = context.db.with_conn(|conn| {
+    conn
+      .query_row(
+        "SELECT video_path, remote_dir, remote_name FROM merged_video WHERE id = ?1 AND task_id = ?2",
+        (request.merged_id, &task_id),
+        |row| {
+          Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+          ))
+        },
+      )
+      .optional()
+  });
+  let (stored_video_path, remote_dir, remote_name) = match merged_record {
+    Ok(Some(value)) => value,
+    Ok(None) => return ApiResponse::error("合并视频不存在"),
+    Err(err) => return ApiResponse::error(format!("读取合并视频失败: {}", err)),
+  };
+
+  let base_dir = resolve_submission_base_dir(&context, &task_id);
+  let runtime_video_path = stored_video_path
+    .as_deref()
+    .map(|value| value.trim())
+    .filter(|value| !value.is_empty())
+    .map(|value| to_runtime_submission_path(&context, value));
+  let mut archived_local_path = None;
+  if let Some(video_path) = runtime_video_path.as_deref() {
+    let local_path = Path::new(video_path);
+    if path_exists(local_path) {
+      if request.delete_local_file {
+        if let Err(err) = remove_path_if_exists_with_retry(
+          &state.app_log_path,
+          "merged_local",
+          local_path,
+          5,
+          Duration::from_millis(300),
+        ) {
+          return ApiResponse::error(err);
+        }
+      } else if should_archive_deleted_merged_path(&base_dir, local_path) {
+        match archive_merged_local_file(&state.app_log_path, &base_dir, local_path) {
+          Ok(path) => archived_local_path = Some(path),
+          Err(err) => return ApiResponse::error(err),
+        }
+      }
+    }
+  }
+
+  let now = now_rfc3339();
+  let delete_result = context.db.with_conn_mut(|conn| {
+    let tx = conn.transaction()?;
+    tx.execute(
+      "DELETE FROM task_output_segment WHERE task_id = ?1 AND merged_id = ?2",
+      (&task_id, request.merged_id),
+    )?;
+    tx.execute(
+      "DELETE FROM merged_source_video WHERE task_id = ?1 AND merged_id = ?2",
+      (&task_id, request.merged_id),
+    )?;
+
+    let remote_dir = remote_dir
+      .as_deref()
+      .map(|value| value.trim())
+      .filter(|value| !value.is_empty());
+    let remote_name = remote_name
+      .as_deref()
+      .map(|value| value.trim())
+      .filter(|value| !value.is_empty());
+    if let (Some(remote_dir), Some(remote_name)) = (remote_dir, remote_name) {
+      tx.execute(
+        "DELETE FROM baidu_sync_task \
+         WHERE source_type = 'submission_merged' AND source_id = ?1 \
+           AND remote_dir = ?2 AND remote_name = ?3 \
+           AND status IN ('PENDING', 'FAILED', 'PAUSED', 'CANCELLED')",
+        (&task_id, remote_dir, remote_name),
+      )?;
+    }
+    if let Some(stored_path) = stored_video_path
+      .as_deref()
+      .map(|value| value.trim())
+      .filter(|value| !value.is_empty())
+    {
+      tx.execute(
+        "DELETE FROM baidu_sync_task \
+         WHERE source_type = 'submission_merged' AND source_id = ?1 \
+           AND local_path = ?2 \
+           AND status IN ('PENDING', 'FAILED', 'PAUSED', 'CANCELLED')",
+        (&task_id, stored_path),
+      )?;
+    }
+
+    let deleted = tx.execute(
+      "DELETE FROM merged_video WHERE id = ?1 AND task_id = ?2",
+      (request.merged_id, &task_id),
+    )?;
+    if deleted == 0 {
+      return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    tx.execute(
+      "UPDATE submission_task SET updated_at = ?1 WHERE task_id = ?2",
+      (&now, &task_id),
+    )?;
+    tx.commit()?;
+    Ok(())
+  });
+  if let Err(err) = delete_result {
+    return ApiResponse::error(format!("删除合并视频失败: {}", err));
+  }
+
+  ApiResponse::success(SubmissionDeleteMergedResult {
+    deleted: true,
+    deleted_local_file: request.delete_local_file,
+    archived_local_path,
+  })
+}
+
+#[tauri::command]
 pub fn submission_edit_prepare(
   state: State<'_, AppState>,
   task_id: String,
@@ -5735,6 +5915,74 @@ fn cleanup_submission_files(log_path: &PathBuf, base_dir: &Path) -> Result<(), S
   }
   remove_path_if_exists(log_path, "base", base_dir)?;
   Ok(())
+}
+
+fn should_archive_deleted_merged_path(base_dir: &Path, local_path: &Path) -> bool {
+  local_path.starts_with(base_dir.join("merge"))
+    || local_path.starts_with(base_dir.join("updates"))
+    || local_path.starts_with(base_dir.join("runs"))
+}
+
+fn archive_merged_local_file(
+  log_path: &PathBuf,
+  base_dir: &Path,
+  source_path: &Path,
+) -> Result<String, String> {
+  let file_name = source_path
+    .file_name()
+    .and_then(|value| value.to_str())
+    .filter(|value| !value.trim().is_empty())
+    .ok_or_else(|| "合并视频文件名无效".to_string())?;
+  let archive_dir = base_dir.join("archived_merged");
+  fs::create_dir_all(&archive_dir).map_err(|err| format!("创建归档目录失败: {}", err))?;
+  let stem = Path::new(file_name)
+    .file_stem()
+    .and_then(|value| value.to_str())
+    .unwrap_or("merged");
+  let ext = Path::new(file_name)
+    .extension()
+    .and_then(|value| value.to_str())
+    .unwrap_or("mp4");
+
+  let mut target_path = archive_dir.join(file_name);
+  if target_path.exists() {
+    let stamp = sanitize_filename(&now_rfc3339());
+    target_path = archive_dir.join(format!("{}_{}.{}", stem, stamp, ext));
+  }
+  let mut duplicate_index = 1usize;
+  while target_path.exists() {
+    target_path = archive_dir.join(format!("{}_{}_{}.{}", stem, sanitize_filename(&now_rfc3339()), duplicate_index, ext));
+    duplicate_index = duplicate_index.saturating_add(1);
+  }
+
+  append_log(
+    log_path,
+    &format!(
+      "submission_merged_archive_start from={} to={}",
+      source_path.to_string_lossy(),
+      target_path.to_string_lossy()
+    ),
+  );
+
+  match fs::rename(source_path, &target_path) {
+    Ok(()) => {}
+    Err(_) => {
+      fs::copy(source_path, &target_path)
+        .map_err(|err| format!("归档合并视频失败: {}", err))?;
+      fs::remove_file(source_path)
+        .map_err(|err| format!("清理原始合并视频失败: {}", err))?;
+    }
+  }
+
+  append_log(
+    log_path,
+    &format!(
+      "submission_merged_archive_ok from={} to={}",
+      source_path.to_string_lossy(),
+      target_path.to_string_lossy()
+    ),
+  );
+  Ok(target_path.to_string_lossy().to_string())
 }
 
 fn remove_path_if_exists_with_retry(
@@ -7226,7 +7474,7 @@ fn load_task_detail(
       ),
     );
   }
-  let path_prefix = load_local_path_prefix(context.db.as_ref());
+  let path_prefix = context.local_path_prefix.clone();
   let mut detail = context
     .db
     .with_conn(|conn| {
@@ -7993,10 +8241,12 @@ pub fn start_submission_workflow(
   edit_upload_state: Arc<Mutex<EditUploadState>>,
   task_id: String,
 ) {
+  let local_path_prefix = load_local_path_prefix(db.as_ref());
   let context = SubmissionContext {
     db,
     app_log_path,
     edit_upload_state,
+    local_path_prefix,
   };
   tauri::async_runtime::spawn(async move {
     let _ = run_submission_workflow(context, task_id).await;
@@ -8315,6 +8565,7 @@ async fn run_submission_upload(
     db: context.db.clone(),
     app_log_path: context.app_log_path.clone(),
     edit_upload_state: context.edit_upload_state.clone(),
+    local_path_prefix: load_local_path_prefix(context.db.as_ref()),
   };
   append_log(
     &context.app_log_path,
@@ -8724,6 +8975,7 @@ async fn submission_queue_loop(context: SubmissionQueueContext) {
     db: context.db.clone(),
     app_log_path: context.app_log_path.clone(),
     edit_upload_state: context.edit_upload_state.clone(),
+    local_path_prefix: load_local_path_prefix(context.db.as_ref()),
   };
   loop {
     let task_id = match load_next_queued_task(&submission_context) {
@@ -9080,6 +9332,7 @@ async fn recover_submission_tasks(context: SubmissionQueueContext) {
     db: context.db.clone(),
     app_log_path: context.app_log_path.clone(),
     edit_upload_state: context.edit_upload_state.clone(),
+    local_path_prefix: load_local_path_prefix(context.db.as_ref()),
   };
   let mut processing_ids = Vec::new();
   for status in ["PENDING", "CLIPPING", "MERGING", "SEGMENTING"] {
@@ -12906,10 +13159,7 @@ fn resolve_submission_base_dir(context: &SubmissionContext, task_id: &str) -> Pa
 }
 
 fn to_runtime_submission_path(context: &SubmissionContext, value: &str) -> String {
-  let path = to_absolute_local_path_with_prefix(
-    load_local_path_prefix(context.db.as_ref()).as_path(),
-    value,
-  );
+  let path = to_absolute_local_path_with_prefix(context.local_path_prefix.as_path(), value);
   if path.as_os_str().is_empty() {
     String::new()
   } else {
@@ -12921,12 +13171,11 @@ fn to_runtime_submission_path_opt(
   context: &SubmissionContext,
   value: Option<String>,
 ) -> Option<String> {
-  let prefix = load_local_path_prefix(context.db.as_ref());
-  to_absolute_local_path_opt_with_prefix(prefix.as_path(), value)
+  to_absolute_local_path_opt_with_prefix(context.local_path_prefix.as_path(), value)
 }
 
 fn to_stored_submission_path(context: &SubmissionContext, value: &str) -> String {
-  to_stored_local_path(context.db.as_ref(), value)
+  to_stored_local_path_with_prefix(context.local_path_prefix.as_path(), value)
 }
 
 fn load_workflow_status(

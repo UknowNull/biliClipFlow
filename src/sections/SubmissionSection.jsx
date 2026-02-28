@@ -150,6 +150,11 @@ export default function SubmissionSection() {
   const [remoteFilePickerPath, setRemoteFilePickerPath] = useState("/");
   const [bindingMergedVideo, setBindingMergedVideo] = useState(null);
   const [bindingRemoteFile, setBindingRemoteFile] = useState(false);
+  const [deleteMergedOpen, setDeleteMergedOpen] = useState(false);
+  const [deleteMergedTarget, setDeleteMergedTarget] = useState(null);
+  const [deleteMergedLocalFile, setDeleteMergedLocalFile] = useState(false);
+  const [deleteMergedSubmitting, setDeleteMergedSubmitting] = useState(false);
+  const [deleteMergedMessage, setDeleteMergedMessage] = useState("");
   const [updateSubmitting, setUpdateSubmitting] = useState(false);
   const [retryingSegmentIds, setRetryingSegmentIds] = useState(() => new Set());
   const [editSegments, setEditSegments] = useState([]);
@@ -977,6 +982,66 @@ export default function SubmissionSection() {
       setMessage(error?.message || "绑定网盘文件失败");
     } finally {
       setBindingRemoteFile(false);
+    }
+  };
+
+  const openDeleteMergedModal = (mergedVideo) => {
+    const taskId = selectedTask?.task?.taskId || "";
+    const mergedId = Number(mergedVideo?.id || 0);
+    if (!taskId || !mergedId) {
+      setMessage("合并视频信息不完整，无法删除");
+      return;
+    }
+    setDeleteMergedTarget({
+      taskId,
+      mergedId,
+      fileName: mergedVideo?.fileName || "",
+      videoPath: mergedVideo?.videoPath || "",
+    });
+    setDeleteMergedLocalFile(false);
+    setDeleteMergedMessage("");
+    setDeleteMergedOpen(true);
+  };
+
+  const closeDeleteMergedModal = (force = false) => {
+    if (!force && deleteMergedSubmitting) {
+      return;
+    }
+    setDeleteMergedOpen(false);
+    setDeleteMergedTarget(null);
+    setDeleteMergedLocalFile(false);
+    setDeleteMergedMessage("");
+  };
+
+  const handleConfirmDeleteMerged = async () => {
+    if (!deleteMergedTarget?.taskId || !deleteMergedTarget?.mergedId) {
+      setDeleteMergedMessage("删除目标不存在，请重试");
+      return;
+    }
+    setDeleteMergedSubmitting(true);
+    setDeleteMergedMessage("");
+    try {
+      const result = await invokeCommand("submission_delete_merged_video", {
+        request: {
+          taskId: deleteMergedTarget.taskId,
+          mergedId: deleteMergedTarget.mergedId,
+          deleteLocalFile: deleteMergedLocalFile,
+        },
+      });
+      const detail = await fetchTaskDetail(deleteMergedTarget.taskId, { log: false });
+      setSelectedTask(detail);
+      if (deleteLocalFile) {
+        setMessage("合并视频已删除，本地文件已同步删除");
+      } else if (result?.archivedLocalPath) {
+        setMessage(`合并视频已删除，本地文件已归档到：${result.archivedLocalPath}`);
+      } else {
+        setMessage("合并视频已删除");
+      }
+      closeDeleteMergedModal(true);
+    } catch (error) {
+      setDeleteMergedMessage(error?.message || "删除合并视频失败");
+    } finally {
+      setDeleteMergedSubmitting(false);
     }
   };
 
@@ -4546,6 +4611,58 @@ export default function SubmissionSection() {
               </div>
             </div>
           ) : null}
+          {deleteMergedOpen ? (
+            <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/40 px-4">
+              <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-lg">
+                <div className="text-sm font-semibold text-[var(--ink)]">删除合并视频</div>
+                <div className="mt-2 text-xs text-[var(--muted)]">
+                  删除后不可恢复，请确认是否继续。
+                </div>
+                <div className="mt-3 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-xs text-[var(--ink)]">
+                  <div className="truncate">文件名：{deleteMergedTarget?.fileName || "-"}</div>
+                  <div className="mt-1 truncate text-[var(--muted)]">
+                    路径：{deleteMergedTarget?.videoPath || "-"}
+                  </div>
+                </div>
+                <label className="mt-4 flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={deleteMergedLocalFile}
+                    onChange={(event) => setDeleteMergedLocalFile(event.target.checked)}
+                    disabled={deleteMergedSubmitting}
+                  />
+                  <div>
+                    <div className="font-semibold text-[var(--ink)]">同时删除本地文件</div>
+                    <div className="text-xs text-[var(--muted)]">
+                      不勾选时将保留本地文件，仅移除合并视频记录。
+                    </div>
+                  </div>
+                </label>
+                {deleteMergedMessage ? (
+                  <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                    {deleteMergedMessage}
+                  </div>
+                ) : null}
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={() => closeDeleteMergedModal(false)}
+                    disabled={deleteMergedSubmitting}
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="rounded-full border border-red-200 bg-red-500 px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={handleConfirmDeleteMerged}
+                    disabled={deleteMergedSubmitting}
+                  >
+                    {deleteMergedSubmitting ? "处理中" : "确认删除"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </>
       ) : null}
 
@@ -4895,9 +5012,11 @@ export default function SubmissionSection() {
                   ) : (
                     selectedTask.mergedVideos.map((item, index) => {
                       const remotePath = resolveMergedRemotePath(item);
-                      const unbound = remotePath === "-";
                       const bindingThisItem =
                         bindingRemoteFile && Number(bindingMergedVideo?.mergedId || 0) === Number(item.id);
+                      const deletingThisItem =
+                        deleteMergedSubmitting &&
+                        Number(deleteMergedTarget?.mergedId || 0) === Number(item.id);
                       return (
                         <tr key={item.id} className="border-t border-black/5">
                           <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
@@ -4911,17 +5030,26 @@ export default function SubmissionSection() {
                             {formatDateTime(item.createTime)}
                           </td>
                           <td className="px-4 py-2">
-                            {unbound ? (
+                            <div className="flex flex-wrap gap-2">
                               <button
                                 className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
                                 onClick={() => openRemoteFilePickerForMerged(item)}
-                                disabled={bindingRemoteFile}
+                                disabled={bindingRemoteFile || deleteMergedSubmitting}
                               >
-                                {bindingThisItem ? "绑定中" : "绑定网盘文件"}
+                                {bindingThisItem
+                                  ? "绑定中"
+                                  : remotePath === "-"
+                                    ? "绑定网盘文件"
+                                    : "修改绑定"}
                               </button>
-                            ) : (
-                              <span className="text-xs text-[var(--muted)]">已绑定</span>
-                            )}
+                              <button
+                                className="rounded-full border border-red-200 bg-red-50 px-2 py-1 text-xs font-semibold text-red-600 disabled:cursor-not-allowed disabled:opacity-60"
+                                onClick={() => openDeleteMergedModal(item)}
+                                disabled={bindingRemoteFile || deleteMergedSubmitting}
+                              >
+                                {deletingThisItem ? "删除中" : "删除"}
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       );

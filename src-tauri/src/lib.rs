@@ -250,6 +250,7 @@ pub fn run() {
             commands::submission::submission_delete_preview,
             commands::submission::submission_detail,
             commands::submission::submission_bind_merged_remote_file,
+            commands::submission::submission_delete_merged_video,
             commands::submission::submission_edit_prepare,
             commands::submission::submission_edit_add_segment,
             commands::submission::submission_edit_reupload_segment,
