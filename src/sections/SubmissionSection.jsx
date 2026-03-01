@@ -3308,10 +3308,7 @@ export default function SubmissionSection() {
       ? Math.ceil(updateTotalClipSeconds / updateSegmentDurationSeconds)
       : 0;
 
-  const detailSegmentationEnabled =
-    typeof selectedTask?.workflowConfig?.segmentationConfig?.enabled === "boolean"
-      ? selectedTask.workflowConfig.segmentationConfig.enabled
-      : Boolean(selectedTask?.outputSegments?.length);
+  const detailHasOutputSegments = (selectedTask?.outputSegments?.length || 0) > 0;
   const partitionLabel = (() => {
     const exact = partitions.find((item) => String(item.tid) === String(taskForm.partitionId));
     if (exact?.name) {
@@ -5996,7 +5993,7 @@ export default function SubmissionSection() {
                     </tbody>
                   </table>
                 </div>
-              ) : detailSegmentationEnabled ? (
+              ) : detailHasOutputSegments ? (
                 <table className="w-full text-left text-sm">
                   <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                     <tr>

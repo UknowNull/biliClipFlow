@@ -7785,15 +7785,6 @@ fn load_task_detail(
   context: &SubmissionContext,
   task_id: &str,
 ) -> Result<SubmissionTaskDetail, String> {
-  if let Err(err) = ensure_merged_video_records(context, task_id) {
-    append_log(
-      &context.app_log_path,
-      &format!(
-        "submission_merge_history_sync_fail task_id={} err={}",
-        task_id, err
-      ),
-    );
-  }
   let path_prefix = context.local_path_prefix.clone();
   let mut detail = context
     .db
@@ -12135,6 +12126,17 @@ fn load_update_sources(
 }
 
 fn validate_source_video_inputs(sources: &[SourceVideoInput]) -> Result<(), String> {
+  fn parse_source_time_seconds(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+      return None;
+    }
+    if trimmed == "00:00:00" {
+      return Some(0.0);
+    }
+    parse_time_to_seconds(trimmed)
+  }
+
   if sources.is_empty() {
     return Err("请至少添加一个源视频".to_string());
   }
@@ -12150,7 +12152,7 @@ fn validate_source_video_inputs(sources: &[SourceVideoInput]) -> Result<(), Stri
       .map(|value| value.trim())
       .filter(|value| !value.is_empty())
     {
-      Some(value) => parse_time_to_seconds(value)
+      Some(value) => parse_source_time_seconds(value)
         .ok_or_else(|| format!("第{}行开始时间格式不合法", row))?,
       None => 0.0,
     };
@@ -12160,7 +12162,7 @@ fn validate_source_video_inputs(sources: &[SourceVideoInput]) -> Result<(), Stri
       .map(|value| value.trim())
       .filter(|value| !value.is_empty())
     {
-      Some(value) => parse_time_to_seconds(value)
+      Some(value) => parse_source_time_seconds(value)
         .ok_or_else(|| format!("第{}行结束时间格式不合法", row))?,
       None => return Err(format!("第{}行结束时间不能为空", row)),
     };
@@ -14588,5 +14590,29 @@ mod tests {
       .expect("load segment");
     assert_eq!(stored_segment_path, "segments/part-001.mp4");
     assert_eq!(segment_merged_id, Some(merged_row_id));
+  }
+
+  #[test]
+  fn validate_source_video_inputs_accepts_zero_start_time() {
+    let sources = vec![SourceVideoInput {
+      source_file_path: "demo/source.mp4".to_string(),
+      sort_order: 1,
+      start_time: Some("00:00:00".to_string()),
+      end_time: Some("00:00:05".to_string()),
+    }];
+    let result = validate_source_video_inputs(&sources);
+    assert!(result.is_ok());
+  }
+
+  #[test]
+  fn validate_source_video_inputs_rejects_zero_end_time() {
+    let sources = vec![SourceVideoInput {
+      source_file_path: "demo/source.mp4".to_string(),
+      sort_order: 1,
+      start_time: Some("00:00:00".to_string()),
+      end_time: Some("00:00:00".to_string()),
+    }];
+    let result = validate_source_video_inputs(&sources);
+    assert_eq!(result.unwrap_err(), "第1行时间范围不合法");
   }
 }
