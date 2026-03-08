@@ -61,8 +61,8 @@ export default function SettingsSection() {
     streamReadTimeoutMs: 15000,
     checkIntervalSec: 180,
     flvFixSplitOnMissing: false,
-    flvFixAdjustTimestampJump: true,
-    flvFixSplitOnTimestampJump: false,
+    flvFixAdjustTimestampJump: false,
+    flvFixSplitOnTimestampJump: true,
     flvFixDisableOnAnnexb: false,
     baiduSyncEnabled: false,
     baiduSyncPath: "/录播",
@@ -903,7 +903,7 @@ export default function SettingsSection() {
                 }))
               }
             />
-            FLV 修复-时间戳跳变自动校准
+            FLV 修复-时间戳跳变自动校准（保守模式）
           </label>
           <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
             <input
@@ -916,7 +916,7 @@ export default function SettingsSection() {
                 }))
               }
             />
-            FLV 修复-时间戳跳变时分段
+            FLV 修复-时间戳跳变时优先分段（推荐）
           </label>
           <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
             <input

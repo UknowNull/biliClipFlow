@@ -12,6 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 use tauri::State;
 use tokio::time::{interval, sleep};
 use url::Url;
@@ -1052,6 +1053,37 @@ async fn handle_integration_download(
     }
   }
 
+  let mut source_remote_meta_by_cid: HashMap<i64, (Option<String>, Option<i64>, Option<String>)> =
+    HashMap::new();
+  if !download_results.is_empty() {
+    let load_meta_result = context.db.with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT cid, bvid, aid, part_title FROM video_download WHERE id = ?1 LIMIT 1",
+      )?;
+      let mut rows = Vec::new();
+      for record in &download_results {
+        let row: Option<(Option<i64>, Option<String>, Option<String>, Option<String>)> = stmt
+          .query_row([record.id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+          })
+          .optional()?;
+        if let Some(value) = row {
+          rows.push(value);
+        }
+      }
+      Ok(rows)
+    });
+    if let Ok(rows) = load_meta_result {
+      for (cid, bvid, aid, part_title) in rows {
+        let Some(cid) = cid else {
+          continue;
+        };
+        let aid = aid.and_then(|value| value.trim().parse::<i64>().ok());
+        source_remote_meta_by_cid.insert(cid, (bvid, aid, part_title));
+      }
+    }
+  }
+
   let insert_result = context.db.with_conn(|conn| {
     conn.execute(
       "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
@@ -1088,13 +1120,36 @@ async fn handle_integration_download(
       let part_id = uuid::Uuid::new_v4().to_string();
       let stored_file_path =
         to_stored_local_path_with_prefix(local_path_prefix.as_path(), &part.file_path);
+      let remote_meta = part
+        .cid
+        .and_then(|cid| source_remote_meta_by_cid.get(&cid).cloned());
+      let remote_bvid = remote_meta.as_ref().and_then(|value| value.0.clone());
+      let remote_aid = remote_meta.as_ref().and_then(|value| value.1);
+      let remote_part_title = remote_meta
+        .as_ref()
+        .and_then(|value| value.2.clone())
+        .or_else(|| {
+          let title = part.original_title.trim().to_string();
+          if title.is_empty() {
+            None
+          } else {
+            Some(title)
+          }
+        });
+      let remote_video_url =
+        remote_bvid.as_ref().map(|value| format!("https://www.bilibili.com/video/{}", value));
       conn.execute(
-        "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO task_source_video (id, task_id, source_file_path, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, sort_order, start_time, end_time) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         (
           part_id,
           &submission_id,
           stored_file_path,
+          remote_video_url.as_deref(),
+          remote_bvid.as_deref(),
+          remote_aid,
+          part.cid,
+          remote_part_title.as_deref(),
           (index + 1) as i64,
           part.start_time,
           part.end_time,

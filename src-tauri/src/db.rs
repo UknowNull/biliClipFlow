@@ -41,7 +41,7 @@ impl Db {
       [],
     );
     let _ = conn.execute(
-      "ALTER TABLE live_settings ADD COLUMN flv_fix_adjust_timestamp_jump INTEGER DEFAULT 1",
+      "ALTER TABLE live_settings ADD COLUMN flv_fix_adjust_timestamp_jump INTEGER DEFAULT 0",
       [],
     );
     let _ = conn.execute(
@@ -64,6 +64,10 @@ impl Db {
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN mission_id INTEGER", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN activity_title TEXT", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN cover_local_path TEXT", []);
+    let _ = conn.execute(
+      "ALTER TABLE submission_task ADD COLUMN import_mode TEXT DEFAULT 'NON_SEGMENTED'",
+      [],
+    );
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN cid INTEGER", []);
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN content TEXT", []);
     let _ = conn.execute(
@@ -93,6 +97,10 @@ impl Db {
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN remote_dir TEXT", []);
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN remote_name TEXT", []);
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN baidu_uid TEXT", []);
+    let _ = conn.execute(
+      "ALTER TABLE merged_video ADD COLUMN sort_order INTEGER DEFAULT 0",
+      [],
+    );
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_progress REAL DEFAULT 0.0", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_uploaded_bytes INTEGER DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_total_bytes INTEGER DEFAULT 0", []);
@@ -103,6 +111,11 @@ impl Db {
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_uri TEXT", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_chunk_size INTEGER DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_last_part_index INTEGER DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE task_source_video ADD COLUMN remote_video_url TEXT", []);
+    let _ = conn.execute("ALTER TABLE task_source_video ADD COLUMN remote_bvid TEXT", []);
+    let _ = conn.execute("ALTER TABLE task_source_video ADD COLUMN remote_aid INTEGER", []);
+    let _ = conn.execute("ALTER TABLE task_source_video ADD COLUMN remote_cid INTEGER", []);
+    let _ = conn.execute("ALTER TABLE task_source_video ADD COLUMN remote_part_title TEXT", []);
     let _ = conn.execute("ALTER TABLE live_room_settings ADD COLUMN baidu_sync_path TEXT", []);
     let _ = conn.execute(
       "ALTER TABLE live_room_settings ADD COLUMN baidu_sync_enabled INTEGER DEFAULT 0",
@@ -110,6 +123,51 @@ impl Db {
     );
     let _ = conn.execute("ALTER TABLE baidu_sync_task ADD COLUMN baidu_uid TEXT", []);
     conn.execute_batch(include_str!("db/schema.sql"))?;
+    let _ = conn.execute(
+      "UPDATE submission_task SET import_mode = 'SEGMENTED' \
+       WHERE import_mode IS NULL OR TRIM(import_mode) = ''",
+      [],
+    );
+    let _ = conn.execute(
+      "UPDATE submission_task \
+       SET import_mode = 'NON_SEGMENTED' \
+       WHERE task_id IN ( \
+         SELECT st.task_id \
+         FROM submission_task st \
+         LEFT JOIN ( \
+           SELECT task_id, COUNT(*) AS merged_count \
+           FROM merged_video \
+           GROUP BY task_id \
+         ) mv ON mv.task_id = st.task_id \
+         LEFT JOIN ( \
+           SELECT task_id, COUNT(*) AS segment_count \
+           FROM task_output_segment \
+           GROUP BY task_id \
+         ) os ON os.task_id = st.task_id \
+         LEFT JOIN ( \
+           SELECT task_id, COUNT(*) AS unbound_count \
+           FROM task_output_segment \
+           WHERE merged_id IS NULL OR merged_id = 0 \
+           GROUP BY task_id \
+         ) ub ON ub.task_id = st.task_id \
+         LEFT JOIN ( \
+           SELECT task_id, COUNT(*) AS multi_bind_merged_count \
+           FROM ( \
+             SELECT task_id, merged_id, COUNT(*) AS c \
+             FROM task_output_segment \
+             WHERE merged_id IS NOT NULL AND merged_id != 0 \
+             GROUP BY task_id, merged_id \
+             HAVING c > 1 \
+           ) tmp \
+           GROUP BY task_id \
+         ) mb ON mb.task_id = st.task_id \
+         WHERE COALESCE(mv.merged_count, 0) > 0 \
+           AND COALESCE(os.segment_count, 0) = COALESCE(mv.merged_count, 0) \
+           AND COALESCE(ub.unbound_count, 0) = 0 \
+           AND COALESCE(mb.multi_bind_merged_count, 0) = 0 \
+       )",
+      [],
+    );
     let _ = conn.execute(
       "INSERT OR IGNORE INTO app_settings (key, value, updated_at) \
        VALUES ('baidu_sync_concurrency', '3', datetime('now'))",

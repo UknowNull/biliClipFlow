@@ -433,7 +433,7 @@ export default function AnchorSection() {
                 <span>上次检查：{formatDateTime(anchor.lastCheckTime)}</span>
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
-                {anchor.liveStatus === 1 ? (
+                {anchor.recordingStatus ? (
                   <button
                     className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)]"
                     onClick={() => handleStopRecord(anchor)}

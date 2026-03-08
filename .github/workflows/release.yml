@@ -23,9 +23,15 @@ jobs:
       - name: Sync app version from git tag
         run: |
           RAW_TAG="${GITHUB_REF_NAME}"
-          VERSION="${RAW_TAG#v}"
+          NORMALIZED_TAG="${RAW_TAG#refs/tags/}"
+          VERSION="${NORMALIZED_TAG#v}"
           if [ -z "${VERSION}" ]; then
             echo "invalid tag: ${RAW_TAG}"
+            exit 1
+          fi
+          SEMVER_REGEX='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if ! [[ "${VERSION}" =~ ${SEMVER_REGEX} ]]; then
+            echo "invalid semver tag: ${RAW_TAG} -> ${VERSION}"
             exit 1
           fi
           pnpm run version:bump -- "${VERSION}"

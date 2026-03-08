@@ -13,6 +13,7 @@ import { formatDateTime } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
 import BaiduRemoteFilePicker from "../components/BaiduRemoteFilePicker";
 import CoverCropModal from "../components/CoverCropModal";
+import RemoteImportTaskView from "../components/RemoteImportTaskView";
 import useSubmissionCover from "../hooks/useSubmissionCover";
 import {
   buildEditBaselineFromDetail,
@@ -94,10 +95,14 @@ export default function SubmissionSection() {
   const [message, setMessage] = useState("");
   const [refreshingRemote, setRefreshingRemote] = useState(false);
   const [submissionView, setSubmissionView] = useState("list");
+  const [remoteImportDialogOpen, setRemoteImportDialogOpen] = useState(false);
+  const [remoteImportInput, setRemoteImportInput] = useState("");
+  const [remoteImportLoading, setRemoteImportLoading] = useState(false);
+  const [remoteImportPreview, setRemoteImportPreview] = useState(null);
   const [deleteTargetId, setDeleteTargetId] = useState("");
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deletePreview, setDeletePreview] = useState(null);
-  const [deleteTaskChecked, setDeleteTaskChecked] = useState(true);
+  const [deleteTaskChecked, setDeleteTaskChecked] = useState(false);
   const [deleteFilesChecked, setDeleteFilesChecked] = useState(false);
   const [deleteFileSelections, setDeleteFileSelections] = useState(() => new Set());
   const [deletePreviewLoading, setDeletePreviewLoading] = useState(false);
@@ -170,6 +175,19 @@ export default function SubmissionSection() {
   const [deleteMergedMessage, setDeleteMergedMessage] = useState("");
   const [updateSubmitting, setUpdateSubmitting] = useState(false);
   const [retryingSegmentIds, setRetryingSegmentIds] = useState(() => new Set());
+  const [segmentBindingSelection, setSegmentBindingSelection] = useState(() => new Set());
+  const [segmentBindingMergedId, setSegmentBindingMergedId] = useState("");
+  const [segmentBindingSubmitting, setSegmentBindingSubmitting] = useState(false);
+  const [sourceReorderSubmitting, setSourceReorderSubmitting] = useState(false);
+  const [mergedReorderSubmitting, setMergedReorderSubmitting] = useState(false);
+  const [mergedOrderDraftIds, setMergedOrderDraftIds] = useState([]);
+  const [mergedOrderDirty, setMergedOrderDirty] = useState(false);
+  const [draggingMergedId, setDraggingMergedId] = useState("");
+  const [mergedBindDialogOpen, setMergedBindDialogOpen] = useState(false);
+  const [mergedBindTarget, setMergedBindTarget] = useState(null);
+  const [mergedBindSelection, setMergedBindSelection] = useState(() => new Set());
+  const [mergedBindSubmitting, setMergedBindSubmitting] = useState(false);
+  const [mergedBindMessage, setMergedBindMessage] = useState("");
   const [editSegments, setEditSegments] = useState([]);
   const editSegmentsRef = useRef([]);
   const [pendingEditUploads, setPendingEditUploads] = useState(0);
@@ -190,11 +208,13 @@ export default function SubmissionSection() {
   const lastDetailTaskIdRef = useRef(null);
   const lastEditTaskIdRef = useRef(null);
   const dragStateRef = useRef({ activeId: "", overId: "" });
+  const mergedDragStateRef = useRef({ activeId: "", overId: "" });
   const coverProxyCacheRef = useRef(new Map());
   const activityRequestSeqRef = useRef(0);
   const isCreateView = submissionView === "create";
   const isDetailView = submissionView === "detail";
   const isEditView = submissionView === "edit";
+  const isRemoteImportView = submissionView === "remoteImport";
   const isReadOnly = isDetailView;
   const quickFillPageSize = 10;
   const deleteFiles = deletePreview?.files || [];
@@ -352,7 +372,7 @@ export default function SubmissionSection() {
     setDeleteTargetId("");
     setDeleteConfirmOpen(false);
     setDeletePreview(null);
-    setDeleteTaskChecked(true);
+    setDeleteTaskChecked(false);
     setDeleteFilesChecked(true);
     setDeleteFileSelections(new Set());
     setDeletePreviewLoading(false);
@@ -415,6 +435,54 @@ export default function SubmissionSection() {
     await loadPartitions();
     await loadCollections();
     await loadBaiduSyncSettings();
+  };
+
+  const openRemoteImportDialog = () => {
+    setRemoteImportDialogOpen(true);
+    setRemoteImportInput("");
+    setRemoteImportLoading(false);
+    setMessage("");
+  };
+
+  const closeRemoteImportDialog = () => {
+    if (remoteImportLoading) {
+      return;
+    }
+    setRemoteImportDialogOpen(false);
+    setRemoteImportInput("");
+  };
+
+  const handleRemoteImportConfirm = async () => {
+    const input = remoteImportInput.trim();
+    if (!input) {
+      setMessage("请输入视频链接或BVID");
+      return;
+    }
+    setRemoteImportLoading(true);
+    setMessage("");
+    try {
+      const preview = await invokeCommand("submission_remote_video_preview", {
+        request: {
+          input,
+          enforceOwnerMatch: true,
+        },
+      });
+      setRemoteImportPreview(preview);
+      setSubmissionView("remoteImport");
+      setRemoteImportDialogOpen(false);
+      setRemoteImportInput("");
+    } catch (error) {
+      setMessage(error?.message || "拉取视频信息失败");
+    } finally {
+      setRemoteImportLoading(false);
+    }
+  };
+
+  const handleRemoteImportSaved = async (result) => {
+    setRemoteImportPreview(null);
+    setSubmissionView("list");
+    setMessage(`远程导入成功，任务ID：${result?.taskId || "-"}`);
+    await loadTasks(statusFilter, currentPage, pageSize);
   };
 
   const openUpdateModal = (task) => {
@@ -600,6 +668,11 @@ export default function SubmissionSection() {
     setQuickFillOpen(false);
     setActivityKeyword("");
     setActivityDropdownOpen(false);
+    setRemoteImportDialogOpen(false);
+    setRemoteImportInput("");
+    setRemoteImportLoading(false);
+    setRemoteImportPreview(null);
+    resetSegmentBindingState();
   };
 
   const loadPartitions = async () => {
@@ -996,6 +1069,55 @@ export default function SubmissionSection() {
     });
   };
 
+  const resetSegmentBindingState = () => {
+    setSegmentBindingSelection(new Set());
+    setSegmentBindingMergedId("");
+    setSegmentBindingSubmitting(false);
+  };
+
+  const resetSegmentBindingStateByDetail = (detail) => {
+    const defaultMergedId =
+      detail?.mergedVideos?.[0]?.id !== undefined && detail?.mergedVideos?.[0]?.id !== null
+        ? String(detail.mergedVideos[0].id)
+        : "";
+    setSegmentBindingSelection(new Set());
+    setSegmentBindingMergedId(defaultMergedId);
+    setSegmentBindingSubmitting(false);
+  };
+
+  const toggleSegmentBindingSelection = (segmentId, checked) => {
+    const normalized = String(segmentId || "").trim();
+    if (!normalized) {
+      return;
+    }
+    setSegmentBindingSelection((prev) => {
+      const next = new Set(prev);
+      if (checked) {
+        next.add(normalized);
+      } else {
+        next.delete(normalized);
+      }
+      return next;
+    });
+  };
+
+  const toggleAllSegmentBindingSelection = (checked) => {
+    const segmentIds = (selectedTask?.outputSegments || [])
+      .map((item) => String(item?.segmentId || "").trim())
+      .filter((item) => item);
+    setSegmentBindingSelection((prev) => {
+      const next = new Set(prev);
+      segmentIds.forEach((segmentId) => {
+        if (checked) {
+          next.add(segmentId);
+        } else {
+          next.delete(segmentId);
+        }
+      });
+      return next;
+    });
+  };
+
   const handleExportTasks = async (exportAll = false) => {
     if (!exportAll && selectedTaskIds.size === 0) {
       setMessage("请先勾选要导出的投稿任务");
@@ -1206,6 +1328,232 @@ export default function SubmissionSection() {
     }
   };
 
+  const reorderSourceVideos = async (fromIndex, toIndex) => {
+    const taskId = String(selectedTask?.task?.taskId || "").trim();
+    const sources = Array.isArray(selectedTask?.sourceVideos) ? selectedTask.sourceVideos : [];
+    if (!taskId || fromIndex === toIndex || fromIndex < 0 || toIndex < 0) {
+      return;
+    }
+    if (fromIndex >= sources.length || toIndex >= sources.length) {
+      return;
+    }
+    const next = [...sources];
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, moved);
+    const sourceIds = next.map((item) => String(item?.id || "").trim()).filter((item) => item);
+    if (!sourceIds.length) {
+      return;
+    }
+    setSourceReorderSubmitting(true);
+    try {
+      const result = await invokeCommand("submission_reorder_source_videos", {
+        request: {
+          taskId,
+          sourceIds,
+        },
+      });
+      const detail = await fetchTaskDetail(taskId, { log: false });
+      setSelectedTask(detail);
+      setMessage(result || "源视频排序已更新");
+    } catch (error) {
+      setMessage(error?.message || "更新源视频排序失败");
+    } finally {
+      setSourceReorderSubmitting(false);
+    }
+  };
+
+  const resetMergedOrderDraft = () => {
+    const mergedIds = (Array.isArray(selectedTask?.mergedVideos) ? selectedTask.mergedVideos : [])
+      .map((item) => String(item?.id || "").trim())
+      .filter((item) => item);
+    setMergedOrderDraftIds(mergedIds);
+    setMergedOrderDirty(false);
+    mergedDragStateRef.current = { activeId: "", overId: "" };
+    setDraggingMergedId("");
+  };
+
+  const reorderMergedDraft = (sourceId, targetId) => {
+    const normalizedSourceId = String(sourceId || "").trim();
+    const normalizedTargetId = String(targetId || "").trim();
+    if (!normalizedSourceId || !normalizedTargetId || normalizedSourceId === normalizedTargetId) {
+      return;
+    }
+    setMergedOrderDraftIds((prev) => {
+      const fromIndex = prev.findIndex((item) => item === normalizedSourceId);
+      const toIndex = prev.findIndex((item) => item === normalizedTargetId);
+      if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
+        return prev;
+      }
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      setMergedOrderDirty(true);
+      return next;
+    });
+  };
+
+  const handleMergedPointerDown = (event, mergedId) => {
+    if (
+      event.button !== 0 ||
+      mergedReorderSubmitting ||
+      bindingRemoteFile ||
+      deleteMergedSubmitting ||
+      mergedBindSubmitting
+    ) {
+      return;
+    }
+    const normalizedId = String(mergedId || "").trim();
+    if (!normalizedId) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget?.setPointerCapture) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
+    mergedDragStateRef.current = { activeId: normalizedId, overId: normalizedId };
+    setDraggingMergedId(normalizedId);
+  };
+
+  const trackPointerOverMerged = (event) => {
+    const { activeId } = mergedDragStateRef.current;
+    if (!activeId) {
+      return;
+    }
+    const { clientX, clientY } = event;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+      return;
+    }
+    const target = document.elementFromPoint(clientX, clientY);
+    if (!target || typeof target.closest !== "function") {
+      return;
+    }
+    const row = target.closest("tr[data-merged-id]");
+    const overId = String(row?.dataset?.mergedId || "").trim();
+    if (!overId || overId === mergedDragStateRef.current.overId) {
+      return;
+    }
+    mergedDragStateRef.current.overId = overId;
+    reorderMergedDraft(activeId, overId);
+  };
+
+  const endMergedPointerDrag = () => {
+    const { activeId } = mergedDragStateRef.current;
+    if (!activeId) {
+      return;
+    }
+    mergedDragStateRef.current = { activeId: "", overId: "" };
+    setDraggingMergedId("");
+  };
+
+  const submitMergedOrderDraft = async () => {
+    const taskId = String(selectedTask?.task?.taskId || "").trim();
+    if (!taskId || !mergedOrderDirty) {
+      return;
+    }
+    const mergedIds = mergedOrderDraftIds
+      .map((item) => Number(item))
+      .filter((item) => Number.isFinite(item) && item > 0);
+    if (!mergedIds.length) {
+      setMessage("合并视频排序数据为空，无法提交");
+      return;
+    }
+    setMergedReorderSubmitting(true);
+    try {
+      const result = await invokeCommand("submission_reorder_merged_videos", {
+        request: {
+          taskId,
+          mergedIds,
+        },
+      });
+      const detail = await fetchTaskDetail(taskId, { log: false });
+      setSelectedTask(detail);
+      setMergedOrderDirty(false);
+      setMessage(result || "合并视频排序已更新");
+    } catch (error) {
+      setMessage(error?.message || "更新合并视频排序失败");
+    } finally {
+      setMergedReorderSubmitting(false);
+    }
+  };
+
+  const openMergedBindDialog = (mergedVideo) => {
+    const taskId = String(selectedTask?.task?.taskId || "").trim();
+    const mergedId = Number(mergedVideo?.id || 0);
+    if (!taskId || !Number.isFinite(mergedId) || mergedId <= 0) {
+      setMessage("合并视频信息不完整，无法修改绑定");
+      return;
+    }
+    const boundIds = (Array.isArray(mergedVideo?.sourceVideoIds) ? mergedVideo.sourceVideoIds : [])
+      .map((sourceId) => String(sourceId || "").trim())
+      .filter((sourceId) => sourceId);
+    setMergedBindTarget({
+      taskId,
+      mergedId,
+      fileName: mergedVideo?.fileName || "",
+    });
+    setMergedBindSelection(new Set(boundIds));
+    setMergedBindMessage("");
+    setMergedBindDialogOpen(true);
+  };
+
+  const closeMergedBindDialog = (force = false) => {
+    if (!force && mergedBindSubmitting) {
+      return;
+    }
+    setMergedBindDialogOpen(false);
+    setMergedBindTarget(null);
+    setMergedBindSelection(new Set());
+    setMergedBindMessage("");
+  };
+
+  const toggleMergedBindSelection = (sourceId, checked) => {
+    const normalized = String(sourceId || "").trim();
+    if (!normalized) {
+      return;
+    }
+    setMergedBindSelection((prev) => {
+      const next = new Set(prev);
+      if (checked) {
+        next.add(normalized);
+      } else {
+        next.delete(normalized);
+      }
+      return next;
+    });
+  };
+
+  const handleConfirmMergedBindDialog = async () => {
+    if (!mergedBindTarget?.taskId || !mergedBindTarget?.mergedId) {
+      setMergedBindMessage("绑定目标不存在，请重试");
+      return;
+    }
+    const sourceIds = Array.from(mergedBindSelection);
+    if (!sourceIds.length) {
+      setMergedBindMessage("至少保留一个绑定源视频");
+      return;
+    }
+    setMergedBindSubmitting(true);
+    setMergedBindMessage("");
+    try {
+      const result = await invokeCommand("submission_bind_merged_sources", {
+        request: {
+          taskId: mergedBindTarget.taskId,
+          mergedId: mergedBindTarget.mergedId,
+          sourceIds,
+        },
+      });
+      const detail = await fetchTaskDetail(mergedBindTarget.taskId, { log: false });
+      setSelectedTask(detail);
+      setMessage(result || "绑定源视频成功");
+      closeMergedBindDialog(true);
+    } catch (error) {
+      setMergedBindMessage(error?.message || "绑定源视频失败");
+    } finally {
+      setMergedBindSubmitting(false);
+    }
+  };
+
   const openDeleteMergedModal = (mergedVideo) => {
     const taskId = selectedTask?.task?.taskId || "";
     const mergedId = Number(mergedVideo?.id || 0);
@@ -1266,12 +1614,87 @@ export default function SubmissionSection() {
     }
   };
 
+  const handleBatchBindSegmentsMerged = async () => {
+    const taskId = String(selectedTask?.task?.taskId || "").trim();
+    if (!taskId) {
+      setMessage("任务信息不存在，请重新打开详情");
+      return;
+    }
+    const mergedId = Number(segmentBindingMergedId || 0);
+    if (!Number.isFinite(mergedId) || mergedId <= 0) {
+      setMessage("请选择要绑定的合并视频");
+      return;
+    }
+    const segmentIds = (selectedTask?.outputSegments || [])
+      .map((item) => String(item?.segmentId || "").trim())
+      .filter((item) => item && segmentBindingSelection.has(item));
+    if (!segmentIds.length) {
+      setMessage("请先勾选要修改绑定的分段");
+      return;
+    }
+    const targetMerged = (selectedTask?.mergedVideos || []).find(
+      (item) => String(item?.id || "") === String(mergedId),
+    );
+    const mergedDisplay = targetMerged
+      ? resolveSegmentMergedDisplay(targetMerged.id)
+      : `合并视频 ${mergedId}`;
+    const confirmed = await dialogConfirm(
+      `确认将选中的 ${segmentIds.length} 个分段绑定到「${mergedDisplay}」吗？`,
+      {
+        title: "批量更换绑定",
+        kind: "warning",
+      },
+    );
+    if (!confirmed) {
+      return;
+    }
+    setSegmentBindingSubmitting(true);
+    try {
+      const result = await invokeCommand("submission_batch_bind_segments_merged", {
+        request: {
+          taskId,
+          mergedId,
+          segmentIds,
+        },
+      });
+      const detail = await fetchTaskDetail(taskId, { log: false });
+      setSelectedTask(detail);
+      setSegmentBindingSelection(new Set());
+      const hasMerged = (detail?.mergedVideos || []).some(
+        (item) => String(item?.id || "") === String(mergedId),
+      );
+      if (!hasMerged) {
+        const fallbackMergedId =
+          detail?.mergedVideos?.[0]?.id !== undefined && detail?.mergedVideos?.[0]?.id !== null
+            ? String(detail.mergedVideos[0].id)
+            : "";
+        setSegmentBindingMergedId(fallbackMergedId);
+      }
+      setMessage(result || `已更新 ${segmentIds.length} 个分段绑定`);
+    } catch (error) {
+      setMessage(error?.message || "批量绑定合并视频失败");
+    } finally {
+      setSegmentBindingSubmitting(false);
+    }
+  };
+
   useEffect(() => {
     loadPartitions();
     loadCollections();
     loadBaiduSyncSettings();
     loadCurrentUpProfile();
   }, []);
+
+  useEffect(() => {
+    if (!isRemoteImportView) {
+      return;
+    }
+    if (remoteImportPreview) {
+      return;
+    }
+    setSubmissionView("list");
+    setMessage("导入上下文已失效，请重新发起视频导入");
+  }, [isRemoteImportView, remoteImportPreview]);
 
   useEffect(() => {
     if (!isDetailView && !isEditView) {
@@ -2075,12 +2498,14 @@ export default function SubmissionSection() {
   const handleDetail = async (taskId) => {
     setMessage("");
     setEditBaseline(null);
+    resetSegmentBindingState();
     try {
       setSubmissionView("detail");
       setSelectedTask(null);
       const loadPromises = Promise.all([loadPartitions(), loadCollections()]);
       const detail = await fetchTaskDetail(taskId, { log: true });
       setSelectedTask(detail);
+      resetSegmentBindingStateByDetail(detail);
       setDetailTab("basic");
       try {
         const task = detail?.task || {};
@@ -2131,6 +2556,7 @@ export default function SubmissionSection() {
 
   const handleEdit = async (taskId) => {
     setMessage("");
+    resetSegmentBindingState();
     try {
       const previousTaskId = lastEditTaskIdRef.current;
       if (previousTaskId && String(previousTaskId) !== String(taskId)) {
@@ -2696,6 +3122,26 @@ export default function SubmissionSection() {
     };
   }, [draggingSegmentId]);
 
+  useEffect(() => {
+    if (!draggingMergedId) {
+      return undefined;
+    }
+    const handleMove = (event) => {
+      trackPointerOverMerged(event);
+    };
+    const handleUp = () => {
+      endMergedPointerDrag();
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+  }, [draggingMergedId]);
+
   const handleRetrySegmentUpload = async (segmentId) => {
     setMessage("");
     const targetId = String(segmentId || "").trim();
@@ -2738,7 +3184,7 @@ export default function SubmissionSection() {
       return;
     }
     setDeleteTargetId(targetId);
-    setDeleteTaskChecked(true);
+    setDeleteTaskChecked(false);
     setDeleteFilesChecked(true);
     setDeleteFileSelections(new Set());
     setDeletePreview(null);
@@ -2799,7 +3245,7 @@ export default function SubmissionSection() {
       return;
     }
     const deletePaths = deleteFilesChecked ? Array.from(deleteFileSelections) : [];
-    if (deleteFilesChecked && deletePaths.length === 0) {
+    if (deleteFilesChecked && deleteHasFiles && deletePaths.length === 0) {
       setDeleteMessage("请选择要删除的视频文件");
       setDeleteMessageTone("error");
       try {
@@ -3282,6 +3728,97 @@ export default function SubmissionSection() {
     return `${normalizedDir}/${remoteName}`;
   };
 
+  const detailSourceOptionList = (selectedTask?.sourceVideos || []).map((item, index) => {
+    const sourceId = String(item?.id || "").trim();
+    const path = String(item?.sourceFilePath || "").trim();
+    const pathName = path.split(/[\\/]/).pop() || path;
+    return {
+      id: sourceId,
+      label: `${index + 1}. ${pathName || sourceId || "-"}`,
+      path,
+    };
+  });
+  const detailSourceLabelMap = new Map(
+    detailSourceOptionList.map((item) => [item.id, item.label]),
+  );
+
+  const resolveMergedBoundSourceDisplay = (merged) => {
+    if (!merged) {
+      return "-";
+    }
+    const sourceIds = Array.isArray(merged.sourceVideoIds) ? merged.sourceVideoIds : [];
+    const sourcePaths = Array.isArray(merged.sourceVideoPaths) ? merged.sourceVideoPaths : [];
+    const labels = [];
+    sourceIds.forEach((sourceId) => {
+      const normalized = String(sourceId || "").trim();
+      if (!normalized) {
+        return;
+      }
+      labels.push(detailSourceLabelMap.get(normalized) || normalized);
+    });
+    if (labels.length > 0) {
+      return labels.join("，");
+    }
+    const pathLabels = sourcePaths
+      .map((value) => String(value || "").trim())
+      .filter((value) => value)
+      .map((value) => value.split(/[\\/]/).pop() || value);
+    if (pathLabels.length > 0) {
+      return pathLabels.join("，");
+    }
+    return "未绑定";
+  };
+
+  const detailMergedNameMap = (() => {
+    const map = new Map();
+    (selectedTask?.mergedVideos || []).forEach((item) => {
+      const mergedId = String(item?.id ?? "").trim();
+      if (!mergedId) {
+        return;
+      }
+      const fileName = String(item?.fileName || "").trim();
+      const pathName = String(item?.videoPath || "")
+        .split("/")
+        .pop()
+        ?.trim();
+      map.set(mergedId, fileName || pathName || `合并视频 ${mergedId}`);
+    });
+    return map;
+  })();
+
+  const detailMergedSignature = (selectedTask?.mergedVideos || [])
+    .map((item) => String(item?.id || "").trim())
+    .filter((item) => item)
+    .join(",");
+
+  useEffect(() => {
+    resetMergedOrderDraft();
+  }, [selectedTask?.task?.taskId, detailMergedSignature]);
+
+  const detailMergedVideos = (() => {
+    const mergedVideos = Array.isArray(selectedTask?.mergedVideos) ? selectedTask.mergedVideos : [];
+    if (!mergedVideos.length || mergedOrderDraftIds.length !== mergedVideos.length) {
+      return mergedVideos;
+    }
+    const mergedMap = new Map();
+    mergedVideos.forEach((item) => {
+      const mergedId = String(item?.id || "").trim();
+      if (mergedId) {
+        mergedMap.set(mergedId, item);
+      }
+    });
+    const ordered = mergedOrderDraftIds.map((mergedId) => mergedMap.get(mergedId)).filter(Boolean);
+    return ordered.length === mergedVideos.length ? ordered : mergedVideos;
+  })();
+
+  const resolveSegmentMergedDisplay = (mergedId) => {
+    const normalized = String(mergedId || "").trim();
+    if (!normalized) {
+      return "未绑定";
+    }
+    return detailMergedNameMap.get(normalized) || `未找到(ID:${normalized})`;
+  };
+
   const currentUpName = String(currentUpProfile?.name || "").trim() || "-";
   const currentUpUid = Number(currentUpProfile?.uid || 0);
 
@@ -3324,6 +3861,22 @@ export default function SubmissionSection() {
       : 0;
 
   const detailHasOutputSegments = (selectedTask?.outputSegments?.length || 0) > 0;
+  const detailSegmentIds = (selectedTask?.outputSegments || [])
+    .map((item) => String(item?.segmentId || "").trim())
+    .filter((item) => item);
+  const detailSelectedSegmentIds = detailSegmentIds.filter((item) =>
+    segmentBindingSelection.has(item),
+  );
+  const detailAllSegmentsSelected =
+    detailSegmentIds.length > 0 && detailSelectedSegmentIds.length === detailSegmentIds.length;
+  const detailHasMergedVideos = (selectedTask?.mergedVideos?.length || 0) > 0;
+  const canBatchBindSegments =
+    !isEditView &&
+    detailHasOutputSegments &&
+    detailHasMergedVideos &&
+    detailSelectedSegmentIds.length > 0 &&
+    Number(segmentBindingMergedId || 0) > 0 &&
+    !segmentBindingSubmitting;
   const partitionLabel = (() => {
     const exact = partitions.find((item) => String(item.tid) === String(taskForm.partitionId));
     if (exact?.name) {
@@ -4430,6 +4983,16 @@ export default function SubmissionSection() {
         </div>
       ) : null}
 
+      {isRemoteImportView && remoteImportPreview ? (
+        <RemoteImportTaskView
+          initialPreview={remoteImportPreview}
+          partitions={partitions}
+          collections={collections}
+          onBack={backToList}
+          onSaved={handleRemoteImportSaved}
+        />
+      ) : null}
+
       {submissionView === "list" ? (
         <>
           <div className="rounded-2xl bg-white/80 shadow-sm ring-1 ring-black/5">
@@ -4452,6 +5015,12 @@ export default function SubmissionSection() {
               onClick={openCreateView}
             >
               新增投稿任务
+            </button>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+              onClick={openRemoteImportDialog}
+            >
+              视频导入
             </button>
             <button
               className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:cursor-not-allowed disabled:opacity-60"
@@ -4706,12 +5275,14 @@ export default function SubmissionSection() {
                         >
                           视频更新
                         </button>
-                        <button
-                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                          onClick={() => openResegmentModal(task.taskId)}
-                        >
-                          重新分段
-                        </button>
+                        {task.enableSegmentation ? (
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                            onClick={() => openResegmentModal(task.taskId)}
+                          >
+                            重新分段
+                          </button>
+                        ) : null}
                         {task.status === "WAITING_UPLOAD" ? (
                           <button
                             className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:opacity-60"
@@ -4798,6 +5369,49 @@ export default function SubmissionSection() {
           {message ? (
             <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
               {message}
+            </div>
+          ) : null}
+          {remoteImportDialogOpen ? (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+              <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-lg">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-[var(--ink)]">导入已投稿视频</div>
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={closeRemoteImportDialog}
+                    disabled={remoteImportLoading}
+                  >
+                    关闭
+                  </button>
+                </div>
+                <div className="mt-3 text-xs text-[var(--muted)]">
+                  输入视频链接或BVID，系统将校验该视频是否属于当前登录账号。
+                </div>
+                <div className="mt-3">
+                  <input
+                    value={remoteImportInput}
+                    onChange={(event) => setRemoteImportInput(event.target.value)}
+                    placeholder="例如：https://www.bilibili.com/video/BVxxxx 或 BVxxxx"
+                    className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
+                  />
+                </div>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={closeRemoteImportDialog}
+                    disabled={remoteImportLoading}
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={handleRemoteImportConfirm}
+                    disabled={remoteImportLoading}
+                  >
+                    {remoteImportLoading ? "校验中" : "确认"}
+                  </button>
+                </div>
+              </div>
             </div>
           ) : null}
           {resegmentOpen ? (
@@ -5791,12 +6405,13 @@ export default function SubmissionSection() {
                       <th className="px-4 py-2">视频文件路径</th>
                       <th className="px-4 py-2">开始时间</th>
                       <th className="px-4 py-2">结束时间</th>
+                      <th className="px-4 py-2">操作</th>
                     </tr>
                   </thead>
                   <tbody>
                     {selectedTask.sourceVideos.length === 0 ? (
                       <tr>
-                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={4}>
+                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
                           暂无源视频
                         </td>
                       </tr>
@@ -5807,6 +6422,24 @@ export default function SubmissionSection() {
                           <td className="px-4 py-2 text-[var(--ink)]">{item.sourceFilePath}</td>
                           <td className="px-4 py-2 text-[var(--muted)]">{item.startTime || "-"}</td>
                           <td className="px-4 py-2 text-[var(--muted)]">{item.endTime || "-"}</td>
+                          <td className="px-4 py-2">
+                            <div className="flex gap-2">
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                                onClick={() => reorderSourceVideos(index, index - 1)}
+                                disabled={sourceReorderSubmitting || index === 0}
+                              >
+                                上移
+                              </button>
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                                onClick={() => reorderSourceVideos(index, index + 1)}
+                                disabled={sourceReorderSubmitting || index === selectedTask.sourceVideos.length - 1}
+                              >
+                                下移
+                              </button>
+                            </div>
+                          </td>
                         </tr>
                       ))
                     )}
@@ -5817,12 +6450,48 @@ export default function SubmissionSection() {
           ) : null}
           {detailTab === "merged" ? (
             <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/5 px-4 py-3">
+                <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">合并视频</div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-[var(--muted)]">
+                    {mergedOrderDirty ? "排序已调整，点击提交后生效" : "拖动排序手柄可调整顺序"}
+                  </span>
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={resetMergedOrderDraft}
+                    disabled={
+                      !mergedOrderDirty ||
+                      mergedReorderSubmitting ||
+                      bindingRemoteFile ||
+                      deleteMergedSubmitting ||
+                      mergedBindSubmitting
+                    }
+                  >
+                    重置
+                  </button>
+                  <button
+                    className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={submitMergedOrderDraft}
+                    disabled={
+                      !mergedOrderDirty ||
+                      mergedReorderSubmitting ||
+                      bindingRemoteFile ||
+                      deleteMergedSubmitting ||
+                      mergedBindSubmitting
+                    }
+                  >
+                    {mergedReorderSubmitting ? "提交中" : "提交排序"}
+                  </button>
+                </div>
+              </div>
               <table className="w-full text-left text-sm">
                 <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                   <tr>
                     <th className="px-4 py-2">序号</th>
+                    <th className="px-4 py-2">排序</th>
                     <th className="px-4 py-2">文件名</th>
                     <th className="px-4 py-2">文件路径</th>
+                    <th className="px-4 py-2">绑定源视频</th>
                     <th className="px-4 py-2">网盘链接</th>
                     <th className="px-4 py-2">状态</th>
                     <th className="px-4 py-2">创建时间</th>
@@ -5830,25 +6499,41 @@ export default function SubmissionSection() {
                   </tr>
                 </thead>
                 <tbody>
-                  {selectedTask.mergedVideos.length === 0 ? (
+                  {detailMergedVideos.length === 0 ? (
                     <tr>
-                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={7}>
+                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={9}>
                         暂无合并视频
                       </td>
                     </tr>
                   ) : (
-                    selectedTask.mergedVideos.map((item, index) => {
+                    detailMergedVideos.map((item, index) => {
+                      const mergedId = String(item?.id || "").trim();
                       const remotePath = resolveMergedRemotePath(item);
                       const bindingThisItem =
                         bindingRemoteFile && Number(bindingMergedVideo?.mergedId || 0) === Number(item.id);
                       const deletingThisItem =
                         deleteMergedSubmitting &&
                         Number(deleteMergedTarget?.mergedId || 0) === Number(item.id);
+                      const isDragging = draggingMergedId === mergedId;
                       return (
-                        <tr key={item.id} className="border-t border-black/5">
+                        <tr
+                          key={item.id}
+                          data-merged-id={mergedId}
+                          className={`border-t border-black/5 ${isDragging ? "bg-black/5" : ""}`}
+                        >
                           <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                          <td
+                            className="px-4 py-2 cursor-grab select-none text-[var(--muted)]"
+                            onPointerDown={(event) => handleMergedPointerDown(event, mergedId)}
+                            style={{ touchAction: "none" }}
+                          >
+                            ≡
+                          </td>
                           <td className="px-4 py-2 text-[var(--ink)]">{item.fileName}</td>
                           <td className="px-4 py-2 text-[var(--muted)]">{item.videoPath}</td>
+                          <td className="px-4 py-2 text-[var(--muted)]">
+                            {resolveMergedBoundSourceDisplay(item)}
+                          </td>
                           <td className="px-4 py-2 text-[var(--muted)] break-all">{remotePath}</td>
                           <td className="px-4 py-2 text-[var(--muted)]">
                             {formatMergedVideoStatus(item.status)}
@@ -5861,7 +6546,12 @@ export default function SubmissionSection() {
                               <button
                                 className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
                                 onClick={() => openRemoteFilePickerForMerged(item)}
-                                disabled={bindingRemoteFile || deleteMergedSubmitting}
+                                disabled={
+                                  bindingRemoteFile ||
+                                  deleteMergedSubmitting ||
+                                  mergedReorderSubmitting ||
+                                  mergedBindSubmitting
+                                }
                               >
                                 {bindingThisItem
                                   ? "绑定中"
@@ -5870,9 +6560,27 @@ export default function SubmissionSection() {
                                     : "修改绑定"}
                               </button>
                               <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                                onClick={() => openMergedBindDialog(item)}
+                                disabled={
+                                  detailSourceOptionList.length === 0 ||
+                                  bindingRemoteFile ||
+                                  deleteMergedSubmitting ||
+                                  mergedReorderSubmitting ||
+                                  mergedBindSubmitting
+                                }
+                              >
+                                重新绑定
+                              </button>
+                              <button
                                 className="rounded-full border border-red-200 bg-red-50 px-2 py-1 text-xs font-semibold text-red-600 disabled:cursor-not-allowed disabled:opacity-60"
                                 onClick={() => openDeleteMergedModal(item)}
-                                disabled={bindingRemoteFile || deleteMergedSubmitting}
+                                disabled={
+                                  bindingRemoteFile ||
+                                  deleteMergedSubmitting ||
+                                  mergedReorderSubmitting ||
+                                  mergedBindSubmitting
+                                }
                               >
                                 {deletingThisItem ? "删除中" : "删除"}
                               </button>
@@ -5908,6 +6616,7 @@ export default function SubmissionSection() {
                         <th className="px-4 py-2">排序</th>
                         <th className="px-4 py-2">P名称</th>
                         <th className="px-4 py-2">文件路径</th>
+                        <th className="px-4 py-2">绑定合并视频</th>
                         <th className="px-4 py-2">上传状态</th>
                         <th className="px-4 py-2">上传进度</th>
                         <th className="px-4 py-2">操作</th>
@@ -5916,7 +6625,7 @@ export default function SubmissionSection() {
                     <tbody>
                       {editSegments.length === 0 ? (
                         <tr>
-                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={7}>
+                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={8}>
                             暂无分P
                           </td>
                         </tr>
@@ -5975,6 +6684,9 @@ export default function SubmissionSection() {
                                 {item.segmentFilePath}
                               </td>
                               <td className="px-4 py-2 text-[var(--muted)]">
+                                {resolveSegmentMergedDisplay(item.mergedId)}
+                              </td>
+                              <td className="px-4 py-2 text-[var(--muted)]">
                                 {formatSegmentUploadStatus(item.uploadStatus)}
                               </td>
                               <td className="px-4 py-2">
@@ -6015,70 +6727,128 @@ export default function SubmissionSection() {
                   </table>
                 </div>
               ) : detailHasOutputSegments ? (
-                <table className="w-full text-left text-sm">
-                  <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                    <tr>
-                      <th className="px-4 py-2">序号</th>
-                      <th className="px-4 py-2">P名称</th>
-                      <th className="px-4 py-2">文件路径</th>
-                      <th className="px-4 py-2">上传状态</th>
-                      <th className="px-4 py-2">上传进度</th>
-                      <th className="px-4 py-2">操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {selectedTask.outputSegments.length === 0 ? (
+                <div className="w-full">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/5 px-4 py-3">
+                    <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                      上传进度
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs text-[var(--muted)]">
+                        已选 {detailSelectedSegmentIds.length} / {detailSegmentIds.length}
+                      </span>
+                      <select
+                        value={segmentBindingMergedId}
+                        onChange={(event) => setSegmentBindingMergedId(event.target.value)}
+                        disabled={segmentBindingSubmitting || !detailHasMergedVideos}
+                        className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <option value="">选择合并视频</option>
+                        {(selectedTask.mergedVideos || []).map((item) => (
+                          <option key={item.id} value={String(item.id)}>
+                            {resolveSegmentMergedDisplay(item.id)}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                        onClick={handleBatchBindSegmentsMerged}
+                        disabled={!canBatchBindSegments}
+                      >
+                        {segmentBindingSubmitting ? "绑定中" : "批量更换绑定"}
+                      </button>
+                    </div>
+                  </div>
+                  <table className="w-full text-left text-sm">
+                    <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                       <tr>
-                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
-                          暂无输出分段
-                        </td>
+                        <th className="px-4 py-2">
+                          <input
+                            type="checkbox"
+                            checked={detailAllSegmentsSelected}
+                            onChange={(event) =>
+                              toggleAllSegmentBindingSelection(event.target.checked)
+                            }
+                            aria-label="全选分段"
+                          />
+                        </th>
+                        <th className="px-4 py-2">序号</th>
+                        <th className="px-4 py-2">P名称</th>
+                        <th className="px-4 py-2">文件路径</th>
+                        <th className="px-4 py-2">绑定合并视频</th>
+                        <th className="px-4 py-2">上传状态</th>
+                        <th className="px-4 py-2">上传进度</th>
+                        <th className="px-4 py-2">操作</th>
                       </tr>
-                    ) : (
-                      selectedTask.outputSegments.map((item, index) => {
-                        const progress = formatUploadProgress(item.uploadProgress);
-                        const isRetrying = retryingSegmentIds.has(item.segmentId);
-                        return (
-                          <tr key={item.segmentId} className="border-t border-black/5">
-                            <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
-                            <td className="px-4 py-2 text-[var(--ink)]">{item.partName}</td>
-                            <td className="px-4 py-2 text-[var(--muted)]">
-                              {item.segmentFilePath}
-                            </td>
-                            <td className="px-4 py-2 text-[var(--muted)]">
-                              {formatSegmentUploadStatus(item.uploadStatus)}
-                            </td>
-                            <td className="px-4 py-2">
-                              <div className="flex items-center gap-2">
-                                <div className="h-1.5 w-24 rounded-full bg-black/5">
-                                  <div
-                                    className="h-1.5 rounded-full bg-[var(--accent)]"
-                                    style={{ width: `${progress}%` }}
-                                  />
+                    </thead>
+                    <tbody>
+                      {selectedTask.outputSegments.length === 0 ? (
+                        <tr>
+                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={8}>
+                            暂无输出分段
+                          </td>
+                        </tr>
+                      ) : (
+                        selectedTask.outputSegments.map((item, index) => {
+                          const progress = formatUploadProgress(item.uploadProgress);
+                          const isRetrying = retryingSegmentIds.has(item.segmentId);
+                          const segmentId = String(item.segmentId || "").trim();
+                          const isChecked = segmentBindingSelection.has(segmentId);
+                          return (
+                            <tr key={item.segmentId} className="border-t border-black/5">
+                              <td className="px-4 py-2">
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={(event) =>
+                                    toggleSegmentBindingSelection(segmentId, event.target.checked)
+                                  }
+                                  aria-label={`选择分段 ${item.partName || item.segmentId || ""}`}
+                                />
+                              </td>
+                              <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                              <td className="px-4 py-2 text-[var(--ink)]">{item.partName}</td>
+                              <td className="px-4 py-2 text-[var(--muted)]">
+                                {item.segmentFilePath}
+                              </td>
+                              <td className="px-4 py-2 text-[var(--muted)]">
+                                {resolveSegmentMergedDisplay(item.mergedId)}
+                              </td>
+                              <td className="px-4 py-2 text-[var(--muted)]">
+                                {formatSegmentUploadStatus(item.uploadStatus)}
+                              </td>
+                              <td className="px-4 py-2">
+                                <div className="flex items-center gap-2">
+                                  <div className="h-1.5 w-24 rounded-full bg-black/5">
+                                    <div
+                                      className="h-1.5 rounded-full bg-[var(--accent)]"
+                                      style={{ width: `${progress}%` }}
+                                    />
+                                  </div>
+                                  <span className="text-xs text-[var(--muted)]">
+                                    {progress}%
+                                  </span>
                                 </div>
-                                <span className="text-xs text-[var(--muted)]">
-                                  {progress}%
-                                </span>
-                              </div>
-                            </td>
-                            <td className="px-4 py-2">
-                              {item.uploadStatus === "FAILED" ? (
-                                <button
-                                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
-                                  onClick={() => handleRetrySegmentUpload(item.segmentId)}
-                                  disabled={isRetrying}
-                                >
-                                  {isRetrying ? "重试中" : "重试"}
-                                </button>
-                              ) : (
-                                <span className="text-xs text-[var(--muted)]">-</span>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })
-                    )}
-                  </tbody>
-                </table>
+                              </td>
+                              <td className="px-4 py-2">
+                                {item.uploadStatus === "FAILED" ? (
+                                  <button
+                                    className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                                    onClick={() => handleRetrySegmentUpload(item.segmentId)}
+                                    disabled={isRetrying}
+                                  >
+                                    {isRetrying ? "重试中" : "重试"}
+                                  </button>
+                                ) : (
+                                  <span className="text-xs text-[var(--muted)]">-</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
               ) : (
                 <table className="w-full text-left text-sm">
                   <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
@@ -6148,6 +6918,64 @@ export default function SubmissionSection() {
               </button>
             </div>
           ) : null}
+        </div>
+      ) : null}
+      {mergedBindDialogOpen ? (
+        <div className="fixed inset-0 z-[62] flex items-center justify-center bg-black/40 px-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-lg">
+            <div className="text-sm font-semibold text-[var(--ink)]">重新绑定源视频</div>
+            <div className="mt-2 text-xs text-[var(--muted)]">
+              勾选后点击提交完成重绑定，至少保留一个源视频绑定。
+            </div>
+            <div className="mt-3 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-xs text-[var(--ink)]">
+              合并视频：{mergedBindTarget?.fileName || `ID:${mergedBindTarget?.mergedId || "-"}`}
+            </div>
+            <div className="mt-3 max-h-64 space-y-2 overflow-auto rounded-lg border border-black/10 bg-white/80 p-3">
+              {detailSourceOptionList.length === 0 ? (
+                <div className="text-xs text-[var(--muted)]">暂无可选源视频</div>
+              ) : (
+                detailSourceOptionList.map((source) => {
+                  const checked = mergedBindSelection.has(source.id);
+                  return (
+                    <label key={source.id} className="flex items-start gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5"
+                        checked={checked}
+                        onChange={(event) => toggleMergedBindSelection(source.id, event.target.checked)}
+                        disabled={mergedBindSubmitting}
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate text-[var(--ink)]">{source.label}</div>
+                        <div className="truncate text-[var(--muted)]">{source.path || "-"}</div>
+                      </div>
+                    </label>
+                  );
+                })
+              )}
+            </div>
+            {mergedBindMessage ? (
+              <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                {mergedBindMessage}
+              </div>
+            ) : null}
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={closeMergedBindDialog}
+                disabled={mergedBindSubmitting}
+              >
+                取消
+              </button>
+              <button
+                className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                onClick={handleConfirmMergedBindDialog}
+                disabled={mergedBindSubmitting || detailSourceOptionList.length === 0}
+              >
+                {mergedBindSubmitting ? "提交中" : "提交"}
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
       {coverPreviewModalOpen ? (

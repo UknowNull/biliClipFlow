@@ -79,6 +79,7 @@ const INVALID_STREAM_STALL_SECS: u64 = 10;
 const STREAM_URL_REFRESH_LEAD_SECS: u64 = 30;
 const MISSING_SEGMENT_WINDOW_SECS: u64 = 60;
 const TIMESTAMP_JUMP_THRESHOLD_MS: i64 = 500;
+const TIMESTAMP_JUMP_DISCONNECT_THRESHOLD_MS: i64 = 30_000;
 const TIMESTAMP_AUDIO_FALLBACK_MS: i64 = 22;
 const TIMESTAMP_AUDIO_MIN_STEP_MS: i64 = 20;
 const TIMESTAMP_AUDIO_MAX_STEP_MS: i64 = 24;
@@ -644,17 +645,20 @@ fn run_record_loop(
   }
   let enable_timestamp_fix =
     settings.flv_fix_adjust_timestamp_jump || settings.flv_fix_split_on_timestamp_jump;
+  let prefer_split_reconnect = settings.record_mode == 0;
   append_log(
     &context.app_log_path,
     &format!(
-      "record_settings room={} record_mode={} fix_enabled={} fix_adjust={} fix_split={} fix_split_missing={} fix_disable_annexb={}",
+      "record_settings room={} record_mode={} fix_enabled={} fix_adjust={} fix_split={} fix_split_missing={} fix_disable_annexb={} strict_split_reconnect={} jump_disconnect_threshold_ms={}",
       room_id,
       settings.record_mode,
       enable_timestamp_fix,
       settings.flv_fix_adjust_timestamp_jump,
       settings.flv_fix_split_on_timestamp_jump,
       settings.flv_fix_split_on_missing,
-      settings.flv_fix_disable_on_annexb
+      settings.flv_fix_disable_on_annexb,
+      prefer_split_reconnect,
+      TIMESTAMP_JUMP_DISCONNECT_THRESHOLD_MS
     ),
   );
   let base_dir = if settings.record_path.trim().is_empty() {
@@ -744,12 +748,35 @@ fn run_record_loop(
   let mut pipeline = LiveFlvPipeline::new(
     LivePipelineSettings {
       split_on_script_tag: false,
+      split_on_timestamp_jump: settings.flv_fix_split_on_timestamp_jump,
+      disconnect_on_large_timestamp_jump: prefer_split_reconnect,
       disable_split_on_h264_annexb: settings.flv_fix_disable_on_annexb,
     },
     enable_timestamp_fix,
     settings.flv_fix_adjust_timestamp_jump,
   );
   let mut disconnect_retries: usize = 0;
+  macro_rules! rotate_for_reconnect {
+    ($reason:expr) => {
+      let _ = rotate_segment_for_reconnect(
+        &context,
+        &room_id,
+        &room_info,
+        nickname.as_deref(),
+        &settings,
+        &base_dir,
+        &record_start_date,
+        &mut current_title,
+        &mut current_file_path,
+        &mut segment,
+        &mut segment_index,
+        &mut pending_split,
+        &mut pending_title,
+        &mut missing_started_at,
+        $reason,
+      )?;
+    };
+  }
 
   loop {
     if stop_flag.load(Ordering::SeqCst) {
@@ -800,11 +827,13 @@ fn run_record_loop(
               Ok(urls) => urls,
               Err(err) => {
                 append_log(&context.app_log_path, &format!("fetch_stream_url_fallback_error room={} err={}", room_id, err));
+                rotate_for_reconnect!("获取流地址失败，重连前切段");
                 std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
                 continue;
               }
             }
           } else {
+            rotate_for_reconnect!("获取流地址失败，重连前切段");
             std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
             continue;
           }
@@ -832,6 +861,7 @@ fn run_record_loop(
           room_id, expire, now
         ),
       );
+      rotate_for_reconnect!("流地址过期，重连前切段");
       stream_urls.clear();
       std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
       continue;
@@ -904,6 +934,7 @@ fn run_record_loop(
       Ok(resp) => resp,
       Err(err) => {
         append_log(&context.app_log_path, &format!("stream_connect_error room={} err={}", room_id, err));
+        rotate_for_reconnect!("连接流失败，重连前切段");
         stream_urls.clear();
         std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
         continue;
@@ -944,6 +975,7 @@ fn run_record_loop(
         room_id.as_str(),
         "response_status",
       );
+      rotate_for_reconnect!("响应异常，重连前切段");
       stream_urls.clear();
       std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
       continue;
@@ -982,6 +1014,7 @@ fn run_record_loop(
         room_id.as_str(),
         "response_unexpected",
       );
+      rotate_for_reconnect!("响应格式异常，重连前切段");
       stream_urls.clear();
       std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
       continue;
@@ -1026,16 +1059,18 @@ fn run_record_loop(
               }
               return Err("直播流中断超过阈值".to_string());
             }
+            rotate_for_reconnect!("流断开超过窗口，重连前切段");
             std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
             break;
           }
           append_log(
             &context.app_log_path,
             &format!(
-              "stream_read_end_keep_segment room={} elapsed={} window={}",
+              "stream_read_end_rotate_segment room={} elapsed={} window={}",
               room_id, missing_elapsed, MISSING_SEGMENT_WINDOW_SECS
             ),
           );
+          rotate_for_reconnect!("读取结束，重连前切段");
           stream_urls.clear();
           std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
           break;
@@ -1056,6 +1091,7 @@ fn run_record_loop(
                 room_id.as_str(),
                 "invalid_header",
               );
+              rotate_for_reconnect!("流头异常，重连前切段");
               stream_urls.clear();
               std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
               break;
@@ -1230,6 +1266,10 @@ fn run_record_loop(
                 ),
               );
             }
+            let rotate_reason = invalid_reason
+              .as_ref()
+              .map(|reason| format!("流异常（{}），重连前切段", reason))
+              .unwrap_or_else(|| "流异常，重连前切段".to_string());
             stream_urls.clear();
             if disconnect_retries >= 3 {
               if let Some(mut seg) = segment.take() {
@@ -1241,6 +1281,7 @@ fn run_record_loop(
               }
               return Err("流异常超过阈值".to_string());
             }
+            rotate_for_reconnect!(&rotate_reason);
             std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
             break;
           }
@@ -1289,16 +1330,18 @@ fn run_record_loop(
               }
               return Err("读取异常超过阈值".to_string());
             }
+            rotate_for_reconnect!("读取异常超过窗口，重连前切段");
             std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
             break;
           }
           append_log(
             &context.app_log_path,
             &format!(
-              "stream_read_error_keep_segment room={} elapsed={} window={}",
+              "stream_read_error_rotate_segment room={} elapsed={} window={}",
               room_id, missing_elapsed, MISSING_SEGMENT_WINDOW_SECS
             ),
           );
+          rotate_for_reconnect!("读取异常，重连前切段");
           stream_urls.clear();
           std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
           break;
@@ -1308,6 +1351,55 @@ fn run_record_loop(
   }
 
   Ok(())
+}
+
+fn rotate_segment_for_reconnect(
+  context: &LiveContext,
+  room_id: &str,
+  room_info: &LiveRoomInfo,
+  nickname: Option<&str>,
+  settings: &LiveSettings,
+  base_dir: &Path,
+  record_start_date: &str,
+  current_title: &mut String,
+  current_file_path: &mut String,
+  segment: &mut Option<SegmentWriter>,
+  segment_index: &mut i64,
+  pending_split: &mut bool,
+  pending_title: &mut Option<String>,
+  missing_started_at: &mut Option<Instant>,
+  reason: &str,
+) -> Result<bool, String> {
+  if let Some(mut seg) = segment.take() {
+    let record_id = seg.record_id;
+    let file_path = seg.file_path.clone();
+    seg.finish("COMPLETED", Some(reason))?;
+    drop(seg);
+    spawn_segment_remux(context.clone(), record_id, file_path);
+    *segment_index += 1;
+    *current_title = load_current_title(context, room_id, current_title);
+    *current_file_path = build_record_path(
+      &settings.file_name_template,
+      base_dir,
+      room_info,
+      nickname,
+      record_start_date,
+      *segment_index,
+    );
+    update_current_file(context, room_id, current_file_path);
+    *pending_split = false;
+    *pending_title = None;
+    *missing_started_at = None;
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "stream_reconnect_rotate room={} reason={} next_file={}",
+        room_id, reason, current_file_path
+      ),
+    );
+    return Ok(true);
+  }
+  Ok(false)
 }
 
 struct FlvTag {
@@ -1605,6 +1697,8 @@ impl TimestampFixer {
 #[derive(Clone, Copy)]
 struct LivePipelineSettings {
   split_on_script_tag: bool,
+  split_on_timestamp_jump: bool,
+  disconnect_on_large_timestamp_jump: bool,
   disable_split_on_h264_annexb: bool,
 }
 
@@ -1621,6 +1715,14 @@ struct LivePipelineDecision {
   disconnect_reason: Option<String>,
   logs: Vec<String>,
   progressed: bool,
+}
+
+impl LivePipelineDecision {
+  fn request_split_if_safe(&mut self, reason: &'static str) {
+    if self.disconnect_reason.is_none() {
+      self.request_split.get_or_insert(reason);
+    }
+  }
 }
 
 struct LiveFlvPipeline {
@@ -1676,57 +1778,113 @@ impl LiveFlvPipeline {
   fn process_tag(&mut self, tag: &mut FlvTag) -> LivePipelineDecision {
     let mut decision = LivePipelineDecision::default();
 
-    if self.settings.disable_split_on_h264_annexb && tag.tag_type == 9 && is_video_keyframe(tag) {
-      if contains_annexb_signature(tag.data()) {
-        self.annexb_state = match self.annexb_state {
-          PipelineAnnexBState::Unknown => {
-            decision.logs.push("pipeline_annexb_detected state=pending".to_string());
-            PipelineAnnexBState::Pending
-          }
-          PipelineAnnexBState::Pending | PipelineAnnexBState::IsAnnexB => {
-            decision.logs.push("pipeline_annexb_detected state=locked".to_string());
-            PipelineAnnexBState::IsAnnexB
-          }
-        };
+    self.apply_annexb_rule(tag, &mut decision);
+
+    let is_header_tag =
+      tag.tag_type == 18 || is_audio_header_tag(tag.data()) || is_video_header_tag(tag.data());
+    self.apply_timestamp_jump_rule(tag, is_header_tag, &mut decision);
+    self.apply_script_tag_rule(tag, &mut decision);
+    self.apply_header_change_rule(tag, &mut decision);
+
+    self.apply_duplicate_chunk_rule(tag, &mut decision);
+    self.apply_progress_rule(tag, &mut decision);
+
+    decision
+  }
+
+  fn apply_annexb_rule(&mut self, tag: &FlvTag, decision: &mut LivePipelineDecision) {
+    if !(self.settings.disable_split_on_h264_annexb && tag.tag_type == 9 && is_video_keyframe(tag)) {
+      return;
+    }
+    if !contains_annexb_signature(tag.data()) {
+      return;
+    }
+    self.annexb_state = match self.annexb_state {
+      PipelineAnnexBState::Unknown => {
+        decision
+          .logs
+          .push("pipeline_annexb_detected state=pending".to_string());
+        PipelineAnnexBState::Pending
+      }
+      PipelineAnnexBState::Pending | PipelineAnnexBState::IsAnnexB => {
+        decision
+          .logs
+          .push("pipeline_annexb_detected state=locked".to_string());
+        PipelineAnnexBState::IsAnnexB
+      }
+    };
+  }
+
+  fn apply_timestamp_jump_rule(
+    &mut self,
+    tag: &mut FlvTag,
+    is_header_tag: bool,
+    decision: &mut LivePipelineDecision,
+  ) {
+    let Some(jump) = self.timestamp_fixer.fix_tag(tag, is_header_tag) else {
+      return;
+    };
+    let jump_abs = jump.diff.abs();
+    let is_large_jump = jump_abs >= TIMESTAMP_JUMP_DISCONNECT_THRESHOLD_MS;
+    let jump_class = if is_large_jump { "large" } else { "normal" };
+    decision.logs.push(format!(
+      "pipeline_timestamp_jump diff={} abs_diff={} original={} fixed={} offset={} class={}",
+      jump.diff, jump_abs, jump.original, jump.fixed, jump.offset, jump_class
+    ));
+    if self.settings.disconnect_on_large_timestamp_jump && is_large_jump {
+      decision.disconnect_reason.get_or_insert_with(|| {
+        format!("时间戳跳变过大，触发断流重连 diff={}", jump.diff)
+      });
+      return;
+    }
+    if self.settings.split_on_timestamp_jump {
+      decision.request_split_if_safe("timestamp_jump");
+    }
+  }
+
+  fn apply_script_tag_rule(&mut self, tag: &FlvTag, decision: &mut LivePipelineDecision) {
+    if tag.tag_type != 18 {
+      return;
+    }
+    if !self.metadata_received {
+      self.metadata_received = true;
+      return;
+    }
+    if self.settings.split_on_script_tag {
+      decision.request_split_if_safe("script_tag");
+    }
+  }
+
+  fn apply_header_change_rule(&mut self, tag: &FlvTag, decision: &mut LivePipelineDecision) {
+    let audio_changed = is_audio_header_tag(tag.data()) && self.process_header_change(true, tag);
+    if audio_changed {
+      if self.settings.disable_split_on_h264_annexb
+        && self.annexb_state == PipelineAnnexBState::IsAnnexB
+      {
+        decision
+          .logs
+          .push("pipeline_header_changed skip_split=annexb".to_string());
+      } else {
+        decision.request_split_if_safe("audio_header_changed");
       }
     }
 
-    let is_header_tag = tag.tag_type == 18 || is_audio_header_tag(tag.data()) || is_video_header_tag(tag.data());
-    if let Some(jump) = self.timestamp_fixer.fix_tag(tag, is_header_tag) {
-      decision.logs.push(format!(
-        "pipeline_timestamp_jump diff={} original={} fixed={} offset={}",
-        jump.diff, jump.original, jump.fixed, jump.offset
-      ));
-    }
-
-    if tag.tag_type == 18 {
-      if !self.metadata_received {
-        self.metadata_received = true;
-      } else if self.settings.split_on_script_tag {
-        decision.request_split.get_or_insert("script_tag");
+    let video_changed = is_video_header_tag(tag.data()) && self.process_header_change(false, tag);
+    if video_changed {
+      if self.settings.disable_split_on_h264_annexb
+        && self.annexb_state == PipelineAnnexBState::IsAnnexB
+      {
+        decision
+          .logs
+          .push("pipeline_header_changed skip_split=annexb".to_string());
+      } else {
+        decision.request_split_if_safe("video_header_changed");
       }
     }
+  }
 
-    if is_audio_header_tag(tag.data()) {
-      if self.process_header_change(true, tag) {
-        if self.settings.disable_split_on_h264_annexb && self.annexb_state == PipelineAnnexBState::IsAnnexB {
-          decision.logs.push("pipeline_header_changed skip_split=annexb".to_string());
-        } else {
-          decision.request_split.get_or_insert("audio_header_changed");
-        }
-      }
-    }
 
-    if is_video_header_tag(tag.data()) {
-      if self.process_header_change(false, tag) {
-        if self.settings.disable_split_on_h264_annexb && self.annexb_state == PipelineAnnexBState::IsAnnexB {
-          decision.logs.push("pipeline_header_changed skip_split=annexb".to_string());
-        } else {
-          decision.request_split.get_or_insert("video_header_changed");
-        }
-      }
-    }
-
+  fn apply_duplicate_chunk_rule(&mut self, tag: &FlvTag, decision: &mut LivePipelineDecision) {
     let chunk_hash = calculate_tag_hash(&tag.bytes);
     if self.last_chunk_hash == Some(chunk_hash) {
       self.duplicate_chunk_count += 1;
@@ -1741,7 +1899,9 @@ impl LiveFlvPipeline {
         .disconnect_reason
         .get_or_insert_with(|| "连续重复数据块，触发断流重连".to_string());
     }
+  }
 
+  fn apply_progress_rule(&mut self, tag: &FlvTag, decision: &mut LivePipelineDecision) {
     let timestamp = parse_flv_timestamp(tag);
     if let Some(prev) = self.last_progress_timestamp {
       if timestamp > prev {
@@ -1762,12 +1922,10 @@ impl LiveFlvPipeline {
     if self.stagnant_count >= INVALID_STREAM_TAG_LIMIT
       && self.last_progress_at.elapsed().as_secs() >= INVALID_STREAM_STALL_SECS
     {
-      decision
-        .disconnect_reason
-        .get_or_insert_with(|| format!("时间戳停滞，触发断流重连 timestamp={}", timestamp));
+      decision.disconnect_reason.get_or_insert_with(|| {
+        format!("时间戳停滞，触发断流重连 timestamp={}", timestamp)
+      });
     }
-
-    decision
   }
 
   fn process_header_change(&mut self, is_audio: bool, tag: &FlvTag) -> bool {

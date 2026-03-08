@@ -70,11 +70,16 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($rawTag)) {
             throw "release_tag is empty"
           }
-          $version = $rawTag -replace '^[vV]', ''
+          $normalizedTag = $rawTag -replace '^refs/tags/', ''
+          $version = $normalizedTag -replace '^[vV]', ''
           if ([string]::IsNullOrWhiteSpace($version)) {
             throw "invalid release_tag: $rawTag"
           }
-          pnpm run version:bump -- $version
+          $semverPattern = '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$'
+          if ($version -notmatch $semverPattern) {
+            throw "invalid release_tag semver: $rawTag -> $version"
+          }
+          pnpm run version:bump -- "$version"
           Write-Host "Version synced from tag: $rawTag -> $version"
 
       - name: Install WiX

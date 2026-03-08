@@ -499,6 +499,10 @@ pub async fn bilibili_partitions(
   state: State<'_, AppState>,
 ) -> Result<ApiResponse<Vec<Partition>>, String> {
   let auth = load_auth(&state);
+  append_log(
+    &state.app_log_path,
+    &format!("partitions_fetch_start has_auth={}", auth.is_some()),
+  );
   let params = vec![("t".to_string(), format!("{}", Utc::now().timestamp_millis()))];
   let url = "https://member.bilibili.com/x/vupre/web/archive/human/type2/list";
 
@@ -508,41 +512,121 @@ pub async fn bilibili_partitions(
     .await
   {
     Ok(data) => data,
-    Err(_) => return Ok(ApiResponse::success(default_partitions())),
+    Err(err) => {
+      let defaults = default_partitions();
+      append_log(
+        &state.app_log_path,
+        &format!(
+          "partitions_fetch_fail err={} fallback=default count={}",
+          err,
+          defaults.len()
+        ),
+      );
+      return Ok(ApiResponse::success(defaults));
+    }
   };
+  append_log(&state.app_log_path, "partitions_fetch_ok");
 
   let list = data.get("type_list").and_then(|value| value.as_array());
+  if list.is_none() {
+    let data_kind = if data.is_object() {
+      "object"
+    } else if data.is_array() {
+      "array"
+    } else if data.is_string() {
+      "string"
+    } else if data.is_number() {
+      "number"
+    } else if data.is_boolean() {
+      "boolean"
+    } else if data.is_null() {
+      "null"
+    } else {
+      "unknown"
+    };
+    let key_sample = data
+      .as_object()
+      .map(|obj| obj.keys().take(12).cloned().collect::<Vec<_>>().join(","))
+      .unwrap_or_default();
+    append_log(
+      &state.app_log_path,
+      &format!(
+        "partitions_type_list_missing kind={} key_sample={}",
+        data_kind, key_sample
+      ),
+    );
+  }
+
   let mut partitions = Vec::new();
+  let mut total_items = 0usize;
+  let mut skipped_no_name = 0usize;
+  let mut skipped_no_id = 0usize;
+  let mut skipped_invalid_id = 0usize;
   if let Some(list) = list {
     for item in list {
-      if let Some(name) = item.get("name").and_then(|value| value.as_str()) {
-        let raw_id = parse_int_field(item, &["id", "ID"]);
-        let raw_pid = parse_int_field(item, &["pid", "parent_id", "parentId", "parentID"]);
-        let explicit_type_id = parse_int_field(item, &["type_id", "typeId", "tid"]);
-        let explicit_type_pid = parse_int_field(item, &["type_pid", "typePid"]);
+      total_items += 1;
+      let Some(name) = item.get("name").and_then(|value| value.as_str()) else {
+        skipped_no_name += 1;
+        continue;
+      };
+      let raw_id = parse_int_field(item, &["id", "ID"]);
+      let raw_pid = parse_int_field(item, &["pid", "parent_id", "parentId", "parentID"]);
+      let explicit_type_id = parse_int_field(item, &["type_id", "typeId", "tid"]);
+      let explicit_type_pid = parse_int_field(item, &["type_pid", "typePid"]);
 
-        let type_id = explicit_type_id.or(raw_id);
-        let Some(type_id) = type_id else {
-          continue;
-        };
-        let type_pid = explicit_type_pid.or(raw_pid);
+      let type_id = explicit_type_id.or(raw_id);
+      let Some(type_id) = type_id else {
+        skipped_no_id += 1;
+        continue;
+      };
+      let type_pid = explicit_type_pid.or(raw_pid);
 
-        if type_id <= 0 {
-          continue;
-        }
-
-        partitions.push(Partition {
-          tid: type_id,
-          name: name.to_string(),
-          type_pid: type_pid.filter(|value| *value > 0),
-        });
+      if type_id <= 0 {
+        skipped_invalid_id += 1;
+        continue;
       }
+
+      partitions.push(Partition {
+        tid: type_id,
+        name: name.to_string(),
+        type_pid: type_pid.filter(|value| *value > 0),
+      });
     }
   }
 
   if partitions.is_empty() {
-    Ok(ApiResponse::success(default_partitions()))
+    let defaults = default_partitions();
+    append_log(
+      &state.app_log_path,
+      &format!(
+        "partitions_parse_empty total={} no_name={} no_id={} invalid_id={} fallback=default count={}",
+        total_items,
+        skipped_no_name,
+        skipped_no_id,
+        skipped_invalid_id,
+        defaults.len()
+      ),
+    );
+    Ok(ApiResponse::success(defaults))
   } else {
+    let sample = partitions
+      .iter()
+      .take(8)
+      .map(|item| format!("{}:{}", item.tid, item.name))
+      .collect::<Vec<_>>()
+      .join("|");
+    append_log(
+      &state.app_log_path,
+      &format!(
+        "partitions_parse_ok total={} parsed={} no_name={} no_id={} invalid_id={} sample={}",
+        total_items,
+        partitions.len(),
+        skipped_no_name,
+        skipped_no_id,
+        skipped_invalid_id,
+        sample
+      ),
+    );
     Ok(ApiResponse::success(partitions))
   }
 }

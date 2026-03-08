@@ -2,15 +2,33 @@ import fs from "node:fs";
 import path from "node:path";
 
 const root = process.cwd();
-const targetVersion = process.argv[2] || "1.0.0";
+const fallbackVersion = "1.0.0";
+const rawInput = process.argv[2];
 
-if (!process.argv[2]) {
+if (!rawInput) {
   console.warn("未提供版本号，默认使用 1.0.0");
 }
+
+const targetVersion = normalizeSemverVersion(rawInput || fallbackVersion);
 
 const packageJsonPath = path.join(root, "package.json");
 const tauriConfPath = path.join(root, "src-tauri", "tauri.conf.json");
 const cargoTomlPath = path.join(root, "src-tauri", "Cargo.toml");
+
+function normalizeSemverVersion(input) {
+  let value = String(input || "").trim();
+  if (!value) {
+    throw new Error("版本号不能为空");
+  }
+  value = value.replace(/^refs\/tags\//i, "");
+  value = value.replace(/^[vV]/, "");
+  const semverPattern =
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  if (!semverPattern.test(value)) {
+    throw new Error(`版本号不合法（需要 semver）：${input}`);
+  }
+  return value;
+}
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -21,23 +39,18 @@ function writeJson(filePath, data) {
 }
 
 function updateCargoTomlVersion(tomlText, version) {
-  const sectionStart = tomlText.indexOf("[package]");
-  if (sectionStart === -1) {
+  const packageSectionPattern = /(\[package\][\s\S]*?)(?=\n\[|$)/;
+  const sectionMatch = tomlText.match(packageSectionPattern);
+  if (!sectionMatch) {
     throw new Error("Cargo.toml 缺少 [package] 段落");
   }
-  const nextSectionMatch = tomlText.slice(sectionStart + 1).match(/\n\[/);
-  const sectionEnd = nextSectionMatch
-    ? sectionStart + 1 + nextSectionMatch.index
-    : tomlText.length;
-  const section = tomlText.slice(sectionStart, sectionEnd);
-  const updatedSection = section.replace(
-    /^version\s*=\s*\"[^\"]+\"/m,
-    `version = \"${version}\"`,
-  );
-  if (section === updatedSection) {
+  const section = sectionMatch[1];
+  const versionPattern = /^\s*version\s*=\s*\"[^\"]+\"\s*$/m;
+  if (!versionPattern.test(section)) {
     throw new Error("Cargo.toml 未找到 version 字段");
   }
-  return `${tomlText.slice(0, sectionStart)}${updatedSection}${tomlText.slice(sectionEnd)}`;
+  const updatedSection = section.replace(versionPattern, `version = \"${version}\"`);
+  return tomlText.replace(packageSectionPattern, updatedSection);
 }
 
 const packageJson = readJson(packageJsonPath);
