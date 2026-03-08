@@ -3,13 +3,24 @@ import path from "node:path";
 
 const root = process.cwd();
 const fallbackVersion = "1.0.0";
-const rawInput = process.argv[2];
+const rawInput = resolveRawInput(process.argv.slice(2));
 
 if (!rawInput) {
   console.warn("未提供版本号，默认使用 1.0.0");
 }
 
 const targetVersion = normalizeSemverVersion(rawInput || fallbackVersion);
+
+function resolveRawInput(argv) {
+  for (const value of argv) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed || trimmed === "--") {
+      continue;
+    }
+    return trimmed;
+  }
+  return "";
+}
 
 const packageJsonPath = path.join(root, "package.json");
 const tauriConfPath = path.join(root, "src-tauri", "tauri.conf.json");

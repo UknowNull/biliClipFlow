@@ -7,14 +7,6 @@ on:
         required: false
         default: "false"
         type: boolean
-      release_notes_mode:
-        description: "Release notes mode (auto or manual)"
-        required: false
-        default: "auto"
-        type: choice
-        options:
-          - auto
-          - manual
       release_tag:
         description: "Release tag (e.g. v1.0.0) when create_release=true"
         required: false
@@ -24,7 +16,7 @@ on:
         required: false
         type: string
       release_body:
-        description: "Release notes body when release_notes_mode=manual"
+        description: "Release notes body when create_release=true"
         required: false
         type: string
       prerelease:
@@ -79,7 +71,7 @@ jobs:
           if ($version -notmatch $semverPattern) {
             throw "invalid release_tag semver: $rawTag -> $version"
           }
-          pnpm run version:bump -- "$version"
+          node scripts/bump-version.mjs -- "$version"
           Write-Host "Version synced from tag: $rawTag -> $version"
 
       - name: Install WiX
@@ -129,10 +121,10 @@ jobs:
         run: |
           Write-Error "release_tag is required when create_release=true"
           exit 1
-      - name: Validate release notes (manual)
-        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true && inputs.release_notes_mode == 'manual' && inputs.release_body == ''
+      - name: Validate release notes
+        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true && inputs.release_body == ''
         run: |
-          Write-Error "release_body is required when release_notes_mode=manual"
+          Write-Error "release_body is required when create_release=true"
           exit 1
       - name: Package release zips
         shell: bash
@@ -166,18 +158,8 @@ jobs:
             zip -r "dist/release-zips/biliClipFlow-${RELEASE_TAG}-macos-${arch_lower}.zip" "$dir"
           done
 
-      - name: Publish release (auto notes)
-        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true && inputs.release_notes_mode == 'auto'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.release_tag }}
-          name: ${{ inputs.release_name }}
-          prerelease: ${{ inputs.prerelease }}
-          generate_release_notes: true
-          files: dist/release-zips/*.zip
-
-      - name: Publish release (manual notes)
-        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true && inputs.release_notes_mode == 'manual'
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}

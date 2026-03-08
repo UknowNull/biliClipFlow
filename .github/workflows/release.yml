@@ -34,7 +34,7 @@ jobs:
             echo "invalid semver tag: ${RAW_TAG} -> ${VERSION}"
             exit 1
           fi
-          pnpm run version:bump -- "${VERSION}"
+          node scripts/bump-version.mjs -- "${VERSION}"
           echo "Version synced from tag: ${RAW_TAG} -> ${VERSION}"
       - name: Install dependencies
         run: pnpm install
