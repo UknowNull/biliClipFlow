@@ -36,7 +36,13 @@ const statusFilters = [
   { value: "CANCELLED", label: "已取消" },
 ];
 
+const buildSourceId = () =>
+  `source_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+const buildMergeGroupId = () =>
+  `group_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+
 const emptySource = (index) => ({
+  localId: buildSourceId(),
   sourceFilePath: "",
   sortOrder: index + 1,
   startTime: "00:00:00",
@@ -50,6 +56,12 @@ const defaultWorkflowConfig = {
     preserveOriginal: true,
   },
 };
+
+const buildMergeItemsFromSources = (sources) =>
+  (sources || [])
+    .map((item) => item?.localId)
+    .filter((id) => id)
+    .map((id) => ({ id, type: "SOURCE", sourceId: id, standalone: false }));
 
 export default function SubmissionSection() {
   const [taskForm, setTaskForm] = useState({
@@ -73,7 +85,20 @@ export default function SubmissionSection() {
   const [tagInput, setTagInput] = useState("");
   const [tags, setTags] = useState([]);
   const [segmentationEnabled, setSegmentationEnabled] = useState(true);
-  const [sourceVideos, setSourceVideos] = useState([emptySource(0)]);
+  const initialSourcesRef = useRef(null);
+  if (!initialSourcesRef.current) {
+    initialSourcesRef.current = [emptySource(0)];
+  }
+  const [sourceVideos, setSourceVideos] = useState(initialSourcesRef.current);
+  const [mergeItems, setMergeItems] = useState(() =>
+    buildMergeItemsFromSources(initialSourcesRef.current),
+  );
+  const [mergeSelection, setMergeSelection] = useState(() => new Set());
+  const [draggingMergeItemId, setDraggingMergeItemId] = useState("");
+  const [draggingMergeGroupSource, setDraggingMergeGroupSource] = useState({
+    groupId: "",
+    sourceId: "",
+  });
   const [workflowConfig, setWorkflowConfig] = useState(defaultWorkflowConfig);
   const [partitions, setPartitions] = useState([]);
   const [collections, setCollections] = useState([]);
@@ -209,6 +234,8 @@ export default function SubmissionSection() {
   const lastEditTaskIdRef = useRef(null);
   const dragStateRef = useRef({ activeId: "", overId: "" });
   const mergedDragStateRef = useRef({ activeId: "", overId: "" });
+  const mergeDragStateRef = useRef({ activeId: "", overId: "" });
+  const mergeGroupDragStateRef = useRef({ groupId: "", activeId: "", overId: "" });
   const coverProxyCacheRef = useRef(new Map());
   const activityRequestSeqRef = useRef(0);
   const isCreateView = submissionView === "create";
@@ -216,6 +243,7 @@ export default function SubmissionSection() {
   const isEditView = submissionView === "edit";
   const isRemoteImportView = submissionView === "remoteImport";
   const isReadOnly = isDetailView;
+  const groupedSourceIds = buildGroupedSourceIdSet(mergeItems);
   const quickFillPageSize = 10;
   const deleteFiles = deletePreview?.files || [];
   const deleteHasFiles = deleteFiles.length > 0;
@@ -385,6 +413,7 @@ export default function SubmissionSection() {
   };
 
   const resetFormState = () => {
+    const initialSources = [emptySource(0)];
     setTaskForm({
       title: "",
       description: "",
@@ -406,7 +435,11 @@ export default function SubmissionSection() {
     setTagInput("");
     setTags([]);
     setSegmentationEnabled(true);
-    setSourceVideos([emptySource(0)]);
+    setSourceVideos(initialSources);
+    setMergeItems(buildMergeItemsFromSources(initialSources));
+    setMergeSelection(new Set());
+    setDraggingMergeItemId("");
+    setDraggingMergeGroupSource({ groupId: "", sourceId: "" });
     setWorkflowConfig(defaultWorkflowConfig);
   };
 
@@ -1876,6 +1909,496 @@ export default function SubmissionSection() {
     );
   };
 
+  function buildGroupedSourceIdSet(items) {
+    const grouped = new Set();
+    items
+      .filter((item) => item.type === "GROUP")
+      .forEach((item) => {
+        (item.sourceIds || []).forEach((sourceId) => grouped.add(sourceId));
+      });
+    return grouped;
+  }
+
+  const syncMergeItemsWithSources = (sources, prevItems) => {
+    const sourceIds = (sources || [])
+      .map((item) => item?.localId)
+      .filter((id) => id);
+    const sourceIdSet = new Set(sourceIds);
+    const next = [];
+    const used = new Set();
+    for (const item of prevItems || []) {
+      if (item.type === "GROUP") {
+        const nextSourceIds = (item.sourceIds || []).filter((id) => sourceIdSet.has(id));
+        if (nextSourceIds.length > 0) {
+          next.push({ ...item, sourceIds: nextSourceIds });
+          nextSourceIds.forEach((id) => used.add(id));
+        }
+        continue;
+      }
+      if (sourceIdSet.has(item.sourceId)) {
+        next.push(item);
+        used.add(item.sourceId);
+      }
+    }
+    for (const id of sourceIds) {
+      if (!used.has(id)) {
+        next.push({ id, type: "SOURCE", sourceId: id, standalone: false });
+      }
+    }
+    return next;
+  };
+
+  const toggleMergeSelection = (sourceId, checked, items = mergeItems) => {
+    const grouped = buildGroupedSourceIdSet(items);
+    if (grouped.has(sourceId)) {
+      return;
+    }
+    const item = items.find((i) => i.type === "SOURCE" && i.sourceId === sourceId);
+    if (item?.standalone) {
+      return;
+    }
+    setMergeSelection((prev) => {
+      const next = new Set(prev);
+      if (checked) {
+        next.add(sourceId);
+      } else {
+        next.delete(sourceId);
+      }
+      return next;
+    });
+  };
+
+  const toggleMergeStandalone = (sourceId) => {
+    setMergeItems((prev) =>
+      prev.map((item) => {
+        if (item.type !== "SOURCE" || item.sourceId !== sourceId) {
+          return item;
+        }
+        const next = { ...item, standalone: !item.standalone };
+        if (next.standalone) {
+          setMergeSelection((sel) => {
+            const s = new Set(sel);
+            s.delete(sourceId);
+            return s;
+          });
+        }
+        return next;
+      }),
+    );
+  };
+
+  const createMergeGroup = () => {
+    const selected = Array.from(mergeSelection);
+    if (selected.length < 2) {
+      setMessage("请至少选择两个源视频进行合并");
+      return;
+    }
+    const selectedSet = new Set(selected);
+    const orderedSelected = sourceVideos
+      .map((item) => item.localId)
+      .filter((id) => selectedSet.has(id));
+    if (orderedSelected.length < 2) {
+      setMessage("请选择有效的源视频进行合并");
+      return;
+    }
+    const groupId = buildMergeGroupId();
+    setMergeItems((prev) => {
+      const next = [];
+      let inserted = false;
+      for (const item of prev) {
+        if (item.type === "SOURCE" && selectedSet.has(item.sourceId)) {
+          if (!inserted) {
+            next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected });
+            inserted = true;
+          }
+          continue;
+        }
+        next.push(item);
+      }
+      if (!inserted) {
+        next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected });
+      }
+      return next;
+    });
+    setMergeSelection(new Set());
+  };
+
+  const releaseMergeGroup = (groupId) => {
+    const normalizedGroupId = String(groupId || "").trim();
+    if (!normalizedGroupId) {
+      return;
+    }
+    setMergeItems((prev) => {
+      const next = [];
+      const releasedIds = [];
+      for (const item of prev) {
+        if (item.id !== normalizedGroupId || item.type !== "GROUP") {
+          next.push(item);
+          continue;
+        }
+        (item.sourceIds || []).forEach((sourceId) => {
+          releasedIds.push(sourceId);
+          next.push({ id: sourceId, type: "SOURCE", sourceId, standalone: false });
+        });
+      }
+      if (releasedIds.length > 0) {
+        setMergeSelection((selection) => {
+          const filtered = new Set(selection);
+          releasedIds.forEach((id) => filtered.delete(id));
+          return filtered;
+        });
+      }
+      return syncMergeItemsWithSources(sourceVideos, next);
+    });
+  };
+
+  const reorderMergeItems = (sourceId, targetId) => {
+    const normalizedSourceId = String(sourceId || "").trim();
+    const normalizedTargetId = String(targetId || "").trim();
+    if (!normalizedSourceId || !normalizedTargetId || normalizedSourceId === normalizedTargetId) {
+      return;
+    }
+    setMergeItems((prev) => {
+      const fromIndex = prev.findIndex((item) => item.id === normalizedSourceId);
+      const toIndex = prev.findIndex((item) => item.id === normalizedTargetId);
+      if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
+        return prev;
+      }
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+  };
+
+  const handleMergeItemPointerDown = (event, itemId) => {
+    if (event.button !== 0) {
+      return;
+    }
+    const normalizedId = String(itemId || "").trim();
+    if (!normalizedId) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget?.setPointerCapture) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
+    mergeDragStateRef.current = { activeId: normalizedId, overId: normalizedId };
+    setDraggingMergeItemId(normalizedId);
+  };
+
+  const trackPointerOverMergeItem = (event) => {
+    const { activeId } = mergeDragStateRef.current;
+    if (!activeId) {
+      return;
+    }
+    const { clientX, clientY } = event;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+      return;
+    }
+    const target = document.elementFromPoint(clientX, clientY);
+    if (!target || typeof target.closest !== "function") {
+      return;
+    }
+    const row = target.closest("[data-merge-item-id]");
+    const overId = String(row?.dataset?.mergeItemId || "").trim();
+    if (!overId || overId === mergeDragStateRef.current.overId) {
+      return;
+    }
+    mergeDragStateRef.current.overId = overId;
+    reorderMergeItems(activeId, overId);
+  };
+
+  const endMergeItemDrag = () => {
+    const { activeId } = mergeDragStateRef.current;
+    if (!activeId) {
+      return;
+    }
+    mergeDragStateRef.current = { activeId: "", overId: "" };
+    setDraggingMergeItemId("");
+  };
+
+  const reorderMergeGroupSources = (groupId, sourceId, targetId) => {
+    const normalizedGroupId = String(groupId || "").trim();
+    const normalizedSourceId = String(sourceId || "").trim();
+    const normalizedTargetId = String(targetId || "").trim();
+    if (!normalizedGroupId || !normalizedSourceId || !normalizedTargetId) {
+      return;
+    }
+    if (normalizedSourceId === normalizedTargetId) {
+      return;
+    }
+    setMergeItems((prev) =>
+      prev.map((item) => {
+        if (item.type !== "GROUP" || item.id !== normalizedGroupId) {
+          return item;
+        }
+        const sourceIds = [...(item.sourceIds || [])];
+        const fromIndex = sourceIds.findIndex((id) => id === normalizedSourceId);
+        const toIndex = sourceIds.findIndex((id) => id === normalizedTargetId);
+        if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
+          return item;
+        }
+        const [moved] = sourceIds.splice(fromIndex, 1);
+        sourceIds.splice(toIndex, 0, moved);
+        return { ...item, sourceIds };
+      }),
+    );
+  };
+
+  const handleMergeGroupSourcePointerDown = (event, groupId, sourceId) => {
+    if (event.button !== 0) {
+      return;
+    }
+    const normalizedGroupId = String(groupId || "").trim();
+    const normalizedSourceId = String(sourceId || "").trim();
+    if (!normalizedGroupId || !normalizedSourceId) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget?.setPointerCapture) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
+    mergeGroupDragStateRef.current = {
+      groupId: normalizedGroupId,
+      activeId: normalizedSourceId,
+      overId: normalizedSourceId,
+    };
+    setDraggingMergeGroupSource({ groupId: normalizedGroupId, sourceId: normalizedSourceId });
+  };
+
+  const trackPointerOverMergeGroupSource = (event) => {
+    const { groupId, activeId } = mergeGroupDragStateRef.current;
+    if (!groupId || !activeId) {
+      return;
+    }
+    const { clientX, clientY } = event;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+      return;
+    }
+    const target = document.elementFromPoint(clientX, clientY);
+    if (!target || typeof target.closest !== "function") {
+      return;
+    }
+    const row = target.closest("tr[data-merge-group-id][data-merge-source-id]");
+    const overGroupId = String(row?.dataset?.mergeGroupId || "").trim();
+    const overId = String(row?.dataset?.mergeSourceId || "").trim();
+    if (!overGroupId || !overId || overGroupId !== groupId) {
+      return;
+    }
+    if (overId === mergeGroupDragStateRef.current.overId) {
+      return;
+    }
+    mergeGroupDragStateRef.current.overId = overId;
+    reorderMergeGroupSources(groupId, activeId, overId);
+  };
+
+  const endMergeGroupSourceDrag = () => {
+    const { activeId } = mergeGroupDragStateRef.current;
+    if (!activeId) {
+      return;
+    }
+    mergeGroupDragStateRef.current = { groupId: "", activeId: "", overId: "" };
+    setDraggingMergeGroupSource({ groupId: "", sourceId: "" });
+  };
+
+  const buildMergeGroupsPayload = (validSources) => {
+    const hasGroup = mergeItems.some((item) => item.type === "GROUP");
+    const hasStandalone = mergeItems.some((item) => item.type === "SOURCE" && item.standalone);
+    if (!hasGroup && !hasStandalone) {
+      return [];
+    }
+    const sourceMap = new Map(
+      (validSources || [])
+        .filter((item) => item?.localId)
+        .map((item) => [item.localId, item]),
+    );
+    const groups = [];
+    const remainingSources = [];
+    for (const item of mergeItems) {
+      if (item.type === "GROUP") {
+        const groupSources = (item.sourceIds || [])
+          .map((sourceId) => sourceMap.get(sourceId))
+          .filter(Boolean)
+          .map((source, index) => ({
+            sourceFilePath: source.sourceFilePath,
+            startTime: source.startTime || null,
+            endTime: source.endTime || null,
+            sortOrder: index + 1,
+          }));
+        if (groupSources.length > 0) {
+          groups.push({
+            order: groups.length + 1,
+            sources: groupSources,
+          });
+        }
+        continue;
+      }
+      const source = sourceMap.get(item.sourceId);
+      if (!source) {
+        continue;
+      }
+      if (item.standalone) {
+        groups.push({
+          order: groups.length + 1,
+          sources: [
+            {
+              sourceFilePath: source.sourceFilePath,
+              startTime: source.startTime || null,
+              endTime: source.endTime || null,
+              sortOrder: 1,
+            },
+          ],
+        });
+      } else {
+        remainingSources.push({
+          sourceFilePath: source.sourceFilePath,
+          startTime: source.startTime || null,
+          endTime: source.endTime || null,
+        });
+      }
+    }
+    if (remainingSources.length > 0) {
+      groups.push({
+        order: groups.length + 1,
+        sources: remainingSources.map((s, index) => ({ ...s, sortOrder: index + 1 })),
+      });
+    }
+    return groups;
+  };
+
+  const resolveSourceIndexById = (sourceId) =>
+    sourceVideos.findIndex((item) => item.localId === sourceId);
+
+  const renderMergeSourceRow = ({
+    sourceId,
+    displayIndex,
+    groupId = "",
+    mergeItemId = "",
+  }) => {
+    const sourceIndex = resolveSourceIndexById(sourceId);
+    if (sourceIndex < 0) {
+      return null;
+    }
+    const source = sourceVideos[sourceIndex];
+    const isGroupedRow = Boolean(groupId);
+    const activeMergeId = mergeItemId || sourceId;
+    const mergeItem = !isGroupedRow ? mergeItems.find((i) => i.type === "SOURCE" && i.sourceId === sourceId) : null;
+    const isStandalone = mergeItem?.standalone ?? false;
+    const isDragging =
+      isGroupedRow
+        ? draggingMergeGroupSource.groupId === groupId &&
+          draggingMergeGroupSource.sourceId === sourceId
+        : draggingMergeItemId === activeMergeId;
+    const dragHandle = isReadOnly ? null : (
+      <span
+        className="cursor-grab select-none text-[var(--muted)]"
+        onPointerDown={(event) => {
+          if (isGroupedRow) {
+            handleMergeGroupSourcePointerDown(event, groupId, sourceId);
+            return;
+          }
+          handleMergeItemPointerDown(event, activeMergeId);
+        }}
+        style={{ touchAction: "none" }}
+      >
+        ≡
+      </span>
+    );
+
+    return (
+      <tr
+        key={`${groupId || "single"}-${sourceId}`}
+        data-merge-item-id={!isGroupedRow ? activeMergeId : undefined}
+        data-merge-group-id={isGroupedRow ? groupId : undefined}
+        data-merge-source-id={isGroupedRow ? sourceId : undefined}
+        className={`border-t border-black/5 ${isDragging ? "bg-black/5" : ""}`}
+      >
+        <td className="px-4 py-2 text-[var(--muted)]">
+          <div className="flex items-center gap-2">
+            {dragHandle}
+            <span>{displayIndex}</span>
+          </div>
+        </td>
+        <td className="px-4 py-2">
+          <input
+            type="checkbox"
+            checked={mergeSelection.has(sourceId)}
+            onChange={(event) => toggleMergeSelection(sourceId, event.target.checked)}
+            disabled={isReadOnly || groupedSourceIds.has(sourceId) || isStandalone}
+          />
+        </td>
+        <td className="px-4 py-2">
+          {!isGroupedRow ? (
+            <input
+              type="checkbox"
+              title="独立分组"
+              checked={isStandalone}
+              onChange={() => toggleMergeStandalone(sourceId)}
+              disabled={isReadOnly}
+            />
+          ) : (
+            <input type="checkbox" disabled checked={false} title="合并组内不可独立分组" />
+          )}
+        </td>
+        <td className="px-4 py-2">
+          <div className="flex flex-wrap gap-2">
+            <input
+              value={source.sourceFilePath}
+              onChange={(event) => updateSource(sourceIndex, "sourceFilePath", event.target.value)}
+              placeholder="请输入视频文件路径（必填）"
+              readOnly={isReadOnly}
+              className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+            />
+            {!isReadOnly ? (
+              <button
+                className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
+                onClick={() => openFileDialog(sourceIndex)}
+              >
+                选择
+              </button>
+            ) : null}
+          </div>
+        </td>
+        <td className="px-4 py-2">
+          <input
+            value={source.startTime}
+            onChange={(event) => updateSourceTime(sourceIndex, "startTime", event.target.value)}
+            onBlur={() => normalizeSourceTime(sourceIndex, "startTime")}
+            placeholder="00:00:00"
+            readOnly={isReadOnly}
+            className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+          />
+        </td>
+        <td className="px-4 py-2">
+          <input
+            value={source.endTime}
+            onChange={(event) => updateSourceTime(sourceIndex, "endTime", event.target.value)}
+            onBlur={() => normalizeSourceTime(sourceIndex, "endTime")}
+            placeholder="00:00:00"
+            readOnly={isReadOnly}
+            className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+          />
+        </td>
+        <td className="px-4 py-2 text-[var(--muted)]">
+          {groupedSourceIds.has(sourceId) ? "已合并" : "未合并"}
+        </td>
+        <td className="px-4 py-2">
+          {!isReadOnly ? (
+            <button
+              className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+              onClick={() => removeSource(sourceIndex)}
+            >
+              删除
+            </button>
+          ) : null}
+        </td>
+      </tr>
+    );
+  };
+
   const addUpdateSource = () => {
     setUpdateSourceVideos((prev) => [...prev, emptySource(prev.length)]);
   };
@@ -1920,8 +2443,8 @@ export default function SubmissionSection() {
     );
   };
 
-  const buildWorkflowConfig = () => {
-    return {
+  const buildWorkflowConfig = (mergeGroups) => {
+    const config = {
       enableSegmentation: segmentationEnabled,
       segmentationConfig: {
         enabled: segmentationEnabled,
@@ -1929,6 +2452,10 @@ export default function SubmissionSection() {
         preserveOriginal: workflowConfig.segmentationConfig.preserveOriginal,
       },
     };
+    if (Array.isArray(mergeGroups) && mergeGroups.length > 0) {
+      config.mergeGroups = mergeGroups;
+    }
+    return config;
   };
 
   const buildUpdateWorkflowConfig = () => {
@@ -2061,6 +2588,7 @@ export default function SubmissionSection() {
         const parsed = Number(raw);
         return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
       })();
+      const mergeGroups = buildMergeGroupsPayload(validSources);
       const payload = {
         request: {
             task: {
@@ -2087,7 +2615,7 @@ export default function SubmissionSection() {
             startTime: item.startTime || null,
             endTime: item.endTime || null,
           })),
-          workflowConfig: buildWorkflowConfig(),
+          workflowConfig: buildWorkflowConfig(mergeGroups),
         },
       };
       await invokeCommand("submission_create", payload);
@@ -2401,13 +2929,17 @@ export default function SubmissionSection() {
       },
     });
     const sources = (detail?.sourceVideos || []).map((item, index) => ({
+      localId: buildSourceId(),
       sourceFilePath: item.sourceFilePath || "",
       sortOrder: index + 1,
       startTime: item.startTime || "00:00:00",
       endTime: item.endTime || "00:00:00",
       durationSeconds: 0,
     }));
-    setSourceVideos(sources.length ? sources : [emptySource(0)]);
+    const normalizedSources = sources.length ? sources : [emptySource(0)];
+    setSourceVideos(normalizedSources);
+    setMergeItems(buildMergeItemsFromSources(normalizedSources));
+    setMergeSelection(new Set());
   };
 
   const initEditSegments = (detail) => {
@@ -3141,6 +3673,63 @@ export default function SubmissionSection() {
       window.removeEventListener("pointercancel", handleUp);
     };
   }, [draggingMergedId]);
+
+  useEffect(() => {
+    setMergeItems((prev) => {
+      const next = syncMergeItemsWithSources(sourceVideos, prev);
+      const grouped = buildGroupedSourceIdSet(next);
+      setMergeSelection((selection) => {
+        const filtered = new Set();
+        for (const id of selection) {
+          if (!grouped.has(id) && sourceVideos.some((item) => item.localId === id)) {
+            filtered.add(id);
+          }
+        }
+        return filtered;
+      });
+      return next;
+    });
+  }, [sourceVideos]);
+
+  useEffect(() => {
+    if (!draggingMergeItemId) {
+      return undefined;
+    }
+    const handleMove = (event) => {
+      trackPointerOverMergeItem(event);
+    };
+    const handleUp = () => {
+      endMergeItemDrag();
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+  }, [draggingMergeItemId]);
+
+  useEffect(() => {
+    if (!draggingMergeGroupSource.sourceId) {
+      return undefined;
+    }
+    const handleMove = (event) => {
+      trackPointerOverMergeGroupSource(event);
+    };
+    const handleUp = () => {
+      endMergeGroupSourceDrag();
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+  }, [draggingMergeGroupSource]);
 
   const handleRetrySegmentUpload = async (segmentId) => {
     setMessage("");
@@ -4558,12 +5147,21 @@ export default function SubmissionSection() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">源视频配置</div>
           {!isReadOnly ? (
-            <button
-              className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
-              onClick={addSource}
-            >
-              添加视频
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
+                onClick={addSource}
+              >
+                添加视频
+              </button>
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                onClick={createMergeGroup}
+                disabled={mergeSelection.size < 2}
+              >
+                创建合并组
+              </button>
+            </div>
           ) : null}
         </div>
         <div className="mt-3 overflow-hidden rounded-xl border border-black/5">
@@ -4571,71 +5169,96 @@ export default function SubmissionSection() {
             <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
               <tr>
                 <th className="px-4 py-2">序号</th>
+                <th className="px-4 py-2">选择</th>
+                <th className="px-4 py-2">独立分组</th>
                 <th className="px-4 py-2">视频文件（必填）</th>
                 <th className="px-4 py-2">开始时间</th>
                 <th className="px-4 py-2">结束时间</th>
+                <th className="px-4 py-2">合并状态</th>
                 <th className="px-4 py-2">操作</th>
               </tr>
             </thead>
             <tbody>
-              {sourceVideos.map((item, index) => (
-                <tr key={`source-${index}`} className="border-t border-black/5">
-                  <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
-                  <td className="px-4 py-2">
-                    <div className="flex flex-wrap gap-2">
-                      <input
-                        value={item.sourceFilePath}
-                        onChange={(event) =>
-                          updateSource(index, "sourceFilePath", event.target.value)
-                        }
-                        placeholder="请输入视频文件路径（必填）"
-                        readOnly={isReadOnly}
-                        className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                      />
-                      {!isReadOnly ? (
-                        <button
-                          className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
-                          onClick={() => openFileDialog(index)}
-                        >
-                          选择
-                        </button>
-                      ) : null}
-                    </div>
-                  </td>
-                  <td className="px-4 py-2">
-                    <input
-                      value={item.startTime}
-                      onChange={(event) =>
-                        updateSourceTime(index, "startTime", event.target.value)
-                      }
-                      onBlur={() => normalizeSourceTime(index, "startTime")}
-                      placeholder="00:00:00"
-                      readOnly={isReadOnly}
-                      className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                    />
-                  </td>
-                  <td className="px-4 py-2">
-                    <input
-                      value={item.endTime}
-                      onChange={(event) => updateSourceTime(index, "endTime", event.target.value)}
-                      onBlur={() => normalizeSourceTime(index, "endTime")}
-                      placeholder="00:00:00"
-                      readOnly={isReadOnly}
-                      className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                    />
-                  </td>
-                  <td className="px-4 py-2">
-                    {!isReadOnly ? (
-                      <button
-                        className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                        onClick={() => removeSource(index)}
-                      >
-                        删除
-                      </button>
-                    ) : null}
+              {mergeItems.length === 0 ? (
+                <tr>
+                  <td className="px-4 py-3 text-[var(--muted)]" colSpan={8}>
+                    暂无配置
                   </td>
                 </tr>
-              ))}
+              ) : (
+                mergeItems.map((item, index) => {
+                  if (item.type === "GROUP") {
+                    const groupSources = (item.sourceIds || []).filter(
+                      (sourceId) => resolveSourceIndexById(sourceId) >= 0,
+                    );
+                    if (groupSources.length === 0) {
+                      return null;
+                    }
+                    return (
+                      <tr
+                        key={`merge-group-${item.id}`}
+                        data-merge-item-id={item.id}
+                        className="border-t border-black/5"
+                      >
+                        <td className="p-0" colSpan={8}>
+                          <div className="m-2 overflow-hidden rounded-xl border-2 border-[var(--accent)]/40 bg-white/70">
+                            <div
+                              className={`flex items-center justify-between border-b border-[var(--accent)]/30 bg-[var(--accent)]/10 px-3 py-2 text-xs text-[var(--muted)] ${
+                                isReadOnly ? "" : "cursor-grab"
+                              }`}
+                              onPointerDown={
+                                isReadOnly
+                                  ? undefined
+                                  : (event) => handleMergeItemPointerDown(event, item.id)
+                              }
+                              style={{ touchAction: "none" }}
+                            >
+                              <div className="flex items-center gap-2">
+                                {!isReadOnly ? (
+                                  <span className="select-none text-[var(--ink)]">≡</span>
+                                ) : null}
+                                <span className="uppercase tracking-[0.2em]">
+                                  合并组 {index + 1}
+                                </span>
+                                <span>{groupSources.length} 个视频</span>
+                              </div>
+                              {!isReadOnly ? (
+                                <button
+                                  type="button"
+                                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                                  onPointerDown={(event) => event.stopPropagation()}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    releaseMergeGroup(item.id);
+                                  }}
+                                >
+                                  解绑
+                                </button>
+                              ) : null}
+                            </div>
+                            <table className="w-full text-left text-sm whitespace-nowrap">
+                              <tbody>
+                                {groupSources.map((sourceId, innerIndex) =>
+                                  renderMergeSourceRow({
+                                    sourceId,
+                                    displayIndex: `${index + 1}.${innerIndex + 1}`,
+                                    groupId: item.id,
+                                  }),
+                                )}
+                              </tbody>
+                            </table>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  }
+                  return renderMergeSourceRow({
+                    sourceId: item.sourceId,
+                    displayIndex: index + 1,
+                    mergeItemId: item.id,
+                  });
+                })
+              )}
             </tbody>
           </table>
         </div>

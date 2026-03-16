@@ -2058,6 +2058,166 @@ fn task_sources_to_clip_sources(sources: &[TaskSourceVideoRecord]) -> Vec<ClipSo
     .collect()
 }
 
+#[derive(Clone)]
+struct MergeGroupPlan {
+  order: i64,
+  sources: Vec<ClipSource>,
+}
+
+fn extract_merge_groups_from_config(
+  context: &SubmissionContext,
+  config: Option<&Value>,
+) -> Vec<MergeGroupPlan> {
+  let Some(config) = config else {
+    return Vec::new();
+  };
+  let Some(list) = config
+    .get("mergeGroups")
+    .or_else(|| config.get("merge_groups"))
+    .and_then(|value| value.as_array())
+  else {
+    return Vec::new();
+  };
+  let mut groups = Vec::new();
+  for (group_index, group) in list.iter().enumerate() {
+    let Some(source_list) = group
+      .get("sources")
+      .or_else(|| group.get("sourceVideos"))
+      .or_else(|| group.get("source_videos"))
+      .and_then(|value| value.as_array())
+    else {
+      continue;
+    };
+    let mut sources = Vec::new();
+    for (index, item) in source_list.iter().enumerate() {
+      let raw_path = item
+        .get("sourceFilePath")
+        .or_else(|| item.get("source_file_path"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+      if raw_path.is_empty() {
+        continue;
+      }
+      let input_path = to_runtime_submission_path(context, &raw_path);
+      if input_path.trim().is_empty() {
+        continue;
+      }
+      let start_time = item
+        .get("startTime")
+        .or_else(|| item.get("start_time"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+      let end_time = item
+        .get("endTime")
+        .or_else(|| item.get("end_time"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+      let order = item
+        .get("sortOrder")
+        .or_else(|| item.get("sort_order"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or((index + 1) as i64);
+      sources.push(ClipSource {
+        input_path,
+        start_time,
+        end_time,
+        order,
+      });
+    }
+    if sources.is_empty() {
+      continue;
+    }
+    sources.sort_by_key(|item| item.order);
+    let sources = normalize_binding_sources(sources);
+    let order = group
+      .get("order")
+      .or_else(|| group.get("sortOrder"))
+      .or_else(|| group.get("sort_order"))
+      .and_then(|value| value.as_i64())
+      .unwrap_or((group_index + 1) as i64);
+    groups.push(MergeGroupPlan { order, sources });
+  }
+  groups.sort_by_key(|item| item.order);
+  for (index, group) in groups.iter_mut().enumerate() {
+    group.order = (index + 1) as i64;
+  }
+  groups
+}
+
+fn resolve_merge_groups_from_bindings(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Vec<MergeGroupPlan> {
+  let merged_videos = load_merged_videos_by_task(context, task_id).unwrap_or_default();
+  let mut groups = Vec::new();
+  for merged in merged_videos {
+    if let Ok(sources) = load_merged_source_clips(context, task_id, merged.id) {
+      if sources.is_empty() {
+        continue;
+      }
+      let sources = normalize_binding_sources(sources);
+      groups.push(MergeGroupPlan {
+        order: groups.len() as i64 + 1,
+        sources,
+      });
+    }
+  }
+  groups
+}
+
+fn resolve_merge_groups(
+  context: &SubmissionContext,
+  task_id: &str,
+  config: Option<&Value>,
+  fallback_sources: &[ClipSource],
+) -> Vec<MergeGroupPlan> {
+  let mut groups = extract_merge_groups_from_config(context, config);
+  let has_config_groups = !groups.is_empty();
+  if has_config_groups {
+    // 有合并组配置：未被任何组覆盖的源视频各自独立成一组
+    let mut used = HashSet::new();
+    for group in &groups {
+      for source in &group.sources {
+        let key = format!(
+          "{}|{}|{}",
+          source.input_path,
+          source.start_time.as_deref().unwrap_or(""),
+          source.end_time.as_deref().unwrap_or("")
+        );
+        used.insert(key);
+      }
+    }
+    for source in fallback_sources {
+      let key = format!(
+        "{}|{}|{}",
+        source.input_path,
+        source.start_time.as_deref().unwrap_or(""),
+        source.end_time.as_deref().unwrap_or("")
+      );
+      if used.contains(&key) {
+        continue;
+      }
+      groups.push(MergeGroupPlan {
+        order: groups.len() as i64 + 1,
+        sources: normalize_binding_sources(vec![source.clone()]),
+      });
+    }
+    return groups;
+  }
+  // 无合并组配置：所有源视频合并为一个合并视频
+  if !fallback_sources.is_empty() {
+    groups.push(MergeGroupPlan {
+      order: 1,
+      sources: normalize_binding_sources(fallback_sources.to_vec()),
+    });
+  }
+  groups
+}
+
 fn resolve_reprocess_sources(
   context: &SubmissionContext,
   detail: &SubmissionTaskDetail,
@@ -10203,6 +10363,381 @@ async fn run_submission_workflow(
     return Err("No source videos".to_string());
   }
 
+  let merge_groups = if !is_update_workflow {
+    resolve_merge_groups(&context, &task_id, workflow_config.as_ref(), &sources)
+  } else {
+    Vec::new()
+  };
+  let has_merge_groups_config = workflow_config
+    .as_ref()
+    .and_then(|config| config.get("mergeGroups"))
+    .and_then(|value| value.as_array())
+    .map(|list| !list.is_empty())
+    .unwrap_or(false);
+  if !is_update_workflow && (merge_groups.len() > 1 || has_merge_groups_config) {
+    let mut prepared_groups = Vec::new();
+    for group in merge_groups {
+      let normalized = match ensure_sources_ready(
+        &context,
+        &task_id,
+        &group.sources,
+        &workflow_instance_id,
+      )
+      .await
+      {
+        Ok(value) => value,
+        Err(err) if err == "WORKFLOW_SUPERSEDED" => return Ok(()),
+        Err(err) => return Err(err),
+      };
+      prepared_groups.push(MergeGroupPlan {
+        order: group.order,
+        sources: normalized,
+      });
+    }
+    if !is_workflow_instance_latest(&context, &task_id, &workflow_instance_id)? {
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "submission_workflow_superseded task_id={} instance_id={}",
+          task_id, workflow_instance_id
+        ),
+      );
+      return Ok(());
+    }
+    let _ = wait_for_workflow_ready(&context, &task_id).await?;
+    let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("CLIPPING"), 0.0);
+    update_submission_status(&context, &task_id, "CLIPPING")?;
+
+    let base_dir = resolve_submission_base_dir(&context, &task_id);
+    let workflow_dir = base_dir
+      .join("runs")
+      .join(sanitize_filename(&workflow_instance_id));
+    let clip_dir = workflow_dir.join("cut");
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_clip_start task_id={} groups={} output_dir={}",
+        task_id,
+        prepared_groups.len(),
+        clip_dir.to_string_lossy()
+      ),
+    );
+    let mut all_clip_outputs: Vec<PathBuf> = Vec::new();
+    let mut all_clip_sources: Vec<ClipSource> = Vec::new();
+    let mut group_clip_outputs: Vec<Vec<PathBuf>> = Vec::new();
+    for (index, group) in prepared_groups.iter().enumerate() {
+      for source in &group.sources {
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_clip_source task_id={} order={} input={} start={} end={}",
+            task_id,
+            source.order,
+            source.input_path,
+            source.start_time.as_deref().unwrap_or(""),
+            source.end_time.as_deref().unwrap_or("")
+          ),
+        );
+      }
+      // 每组独立判断是否可以 stream copy，单源视频组直接走 copy 模式
+      let group_use_copy = if group.sources.len() == 1 {
+        true
+      } else {
+        match decide_clip_copy(&group.sources) {
+          Ok(decision) => {
+            if let Some(reason) = decision.reason.as_deref() {
+              append_log(
+                &context.app_log_path,
+                &format!(
+                  "submission_clip_copy_decision task_id={} group={} use_copy={} reason={}",
+                  task_id, index + 1, decision.use_copy, reason
+                ),
+              );
+            }
+            decision.use_copy
+          }
+          Err(err) => {
+            append_log(
+              &context.app_log_path,
+              &format!("submission_clip_copy_check_err task_id={} group={} err={}", task_id, index + 1, err),
+            );
+            false
+          }
+        }
+      };
+      let group_clip_dir = clip_dir.join(format!("group_{:03}", index + 1));
+      let sources_clone = group.sources.clone();
+      let clip_dir_clone = group_clip_dir.clone();
+      let clip_outputs = match tauri::async_runtime::spawn_blocking(move || {
+        clip_sources(&sources_clone, &clip_dir_clone, group_use_copy)
+      })
+      .await
+      {
+        Ok(Ok(outputs)) => outputs,
+        Ok(Err(err)) => {
+          append_log(
+            &context.app_log_path,
+            &format!("submission_clip_fail task_id={} err={}", task_id, err),
+          );
+          return Err(err);
+        }
+        Err(_) => {
+          append_log(
+            &context.app_log_path,
+            &format!("submission_clip_fail task_id={} err=spawn_blocking_failed", task_id),
+          );
+          return Err("Failed to clip videos".to_string());
+        }
+      };
+      all_clip_outputs.extend(clip_outputs.clone());
+      all_clip_sources.extend(group.sources.clone());
+      group_clip_outputs.push(clip_outputs);
+    }
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_clip_done task_id={} outputs={} output_dir={}",
+        task_id,
+        all_clip_outputs.len(),
+        clip_dir.to_string_lossy()
+      ),
+    );
+
+    if !ensure_workflow_instance_latest(
+      &context,
+      &task_id,
+      &workflow_instance_id,
+      "POST_CLIP",
+    )? {
+      return Ok(());
+    }
+
+    let _ = wait_for_workflow_ready(&context, &task_id).await?;
+    save_video_clips(
+      &context,
+      &task_id,
+      &all_clip_sources,
+      &all_clip_outputs,
+      true,
+    )?;
+
+    update_submission_status(&context, &task_id, "MERGING")?;
+    let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("MERGING"), 40.0);
+    let merge_stamp = sanitize_filename(&now_rfc3339());
+    let mut merged_outputs: Vec<(i64, PathBuf)> = Vec::new();
+    for (index, group) in prepared_groups.iter().enumerate() {
+      let merge_output = build_merge_output_path_for_group(
+        &workflow_dir,
+        &task_id,
+        &merge_stamp,
+        index + 1,
+      );
+      let merge_list_path = merge_output.with_extension("txt");
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "submission_merge_start task_id={} inputs={} output={} list={} mode=concat_copy group={}",
+          task_id,
+          group_clip_outputs
+            .get(index)
+            .map(|value| value.len())
+            .unwrap_or(0),
+          merge_output.to_string_lossy(),
+          merge_list_path.to_string_lossy(),
+          index + 1
+        ),
+      );
+      if let Some(paths) = group_clip_outputs.get(index) {
+        for path in paths {
+          append_log(
+            &context.app_log_path,
+            &format!(
+              "submission_merge_input task_id={} path={} group={}",
+              task_id,
+              path.to_string_lossy(),
+              index + 1
+            ),
+          );
+        }
+      }
+      let merge_output_clone = merge_output.clone();
+      let merge_inputs = group_clip_outputs
+        .get(index)
+        .cloned()
+        .unwrap_or_default();
+      tauri::async_runtime::spawn_blocking(move || merge_files(&merge_inputs, &merge_output_clone))
+        .await
+        .map_err(|_| "Failed to merge videos".to_string())??;
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "submission_merge_done task_id={} output={} group={}",
+          task_id,
+          merge_output.to_string_lossy(),
+          index + 1
+        ),
+      );
+      let merged_id = save_merged_video_with_sort_order(
+        &context,
+        &task_id,
+        &merge_output,
+        Some((index + 1) as i64),
+      )?;
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "submission_merge_saved task_id={} merged_id={} path={} group={}",
+          task_id,
+          merged_id,
+          merge_output.to_string_lossy(),
+          index + 1
+        ),
+      );
+      if let Err(err) = save_merged_source_bindings(&context, &task_id, merged_id, &group.sources) {
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_merge_bind_sources_fail task_id={} merged_id={} err={}",
+            task_id, merged_id, err
+          ),
+        );
+      }
+      merged_outputs.push((merged_id, merge_output));
+    }
+
+    if !ensure_workflow_instance_latest(
+      &context,
+      &task_id,
+      &workflow_instance_id,
+      "POST_MERGE",
+    )? {
+      return Ok(());
+    }
+
+    if let Err(err) = baidu_sync::enqueue_submission_sync(
+      context.db.as_ref(),
+      context.app_log_path.as_ref(),
+      &task_id,
+    ) {
+      append_log(
+        &context.app_log_path,
+        &format!("baidu_sync_enqueue_fail task_id={} err={}", task_id, err),
+      );
+    }
+
+    let workflow_settings = load_workflow_settings(&context, &task_id);
+    let mut next_part_order: i64 = 1;
+    let mut next_name_index: usize = 1;
+    let _ = context.db.with_conn(|conn| {
+      conn.execute("DELETE FROM task_output_segment WHERE task_id = ?1", [&task_id])?;
+      Ok(())
+    });
+
+    if workflow_settings.enable_segmentation {
+      let _ = wait_for_workflow_ready(&context, &task_id).await?;
+      update_submission_status(&context, &task_id, "SEGMENTING")?;
+      let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("SEGMENTING"), 70.0);
+      for (index, (merged_id, merged_path)) in merged_outputs.iter().enumerate() {
+        let segment_dir = workflow_dir.join("output").join(format!("group_{:03}", index + 1));
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_segment_start task_id={} input={} output_dir={} segment_seconds={} mode=segment_copy group={}",
+            task_id,
+            merged_path.to_string_lossy(),
+            segment_dir.to_string_lossy(),
+            workflow_settings.segment_duration_seconds,
+            index + 1
+          ),
+        );
+        let segment_dir_clone = segment_dir.clone();
+        let merged_path_clone = merged_path.clone();
+        let segment_outputs = tauri::async_runtime::spawn_blocking(move || {
+          segment_file(
+            &merged_path_clone,
+            &segment_dir_clone,
+            workflow_settings.segment_duration_seconds,
+          )
+        })
+        .await
+        .map_err(|_| "Failed to segment video".to_string())??;
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_segment_done task_id={} outputs={} output_dir={} group={}",
+            task_id,
+            segment_outputs.len(),
+            segment_dir.to_string_lossy(),
+            index + 1
+          ),
+        );
+        append_output_segments(
+          &context,
+          &task_id,
+          &segment_outputs,
+          Some(*merged_id),
+          workflow_settings.segment_prefix.as_deref(),
+          next_part_order,
+          next_name_index,
+        )?;
+        next_part_order += segment_outputs.len() as i64;
+        next_name_index += segment_outputs.len();
+      }
+
+      if !ensure_workflow_instance_latest(
+        &context,
+        &task_id,
+        &workflow_instance_id,
+        "POST_SEGMENT",
+      )? {
+        return Ok(());
+      }
+    } else {
+      let task = load_task_record(&context, &task_id)?;
+      if is_non_segmented_task(&task) {
+        for (index, (merged_id, merged_path)) in merged_outputs.iter().enumerate() {
+          append_output_segments(
+            &context,
+            &task_id,
+            &[merged_path.clone()],
+            Some(*merged_id),
+            workflow_settings.segment_prefix.as_deref(),
+            next_part_order,
+            next_name_index,
+          )?;
+          next_part_order += 1;
+          next_name_index += 1;
+          append_log(
+            &context.app_log_path,
+            &format!(
+              "submission_non_segmented_append task_id={} merged_id={} group={}",
+              task_id,
+              merged_id,
+              index + 1
+            ),
+          );
+        }
+      }
+    }
+
+    if !ensure_workflow_instance_latest(
+      &context,
+      &task_id,
+      &workflow_instance_id,
+      "PRE_WAITING_UPLOAD",
+    )? {
+      return Ok(());
+    }
+
+    update_submission_status(&context, &task_id, "WAITING_UPLOAD")?;
+    let workflow_status = match load_integrated_download_stats(&context, &task_id)? {
+      Some(stats) if stats.completed < stats.total => "VIDEO_DOWNLOADING",
+      _ => "COMPLETED",
+    };
+    let _ = update_workflow_status(&context, &task_id, workflow_status, None, 100.0);
+    return Ok(());
+  }
+
   let sources = match ensure_sources_ready(&context, &task_id, &sources, &workflow_instance_id).await {
     Ok(value) => value,
     Err(err) if err == "WORKFLOW_SUPERSEDED" => return Ok(()),
@@ -14547,6 +15082,29 @@ fn save_merged_video(
     .map_err(|err| err.to_string())
 }
 
+fn save_merged_video_with_sort_order(
+  context: &SubmissionContext,
+  task_id: &str,
+  merged_path: &Path,
+  sort_order: Option<i64>,
+) -> Result<i64, String> {
+  let merged_id = save_merged_video(context, task_id, merged_path)?;
+  let Some(sort_order) = sort_order else {
+    return Ok(merged_id);
+  };
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE merged_video SET sort_order = ?1 WHERE id = ?2",
+        (sort_order, merged_id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| err.to_string())?;
+  Ok(merged_id)
+}
+
 fn load_output_segment_stats(
   context: &SubmissionContext,
   task_id: &str,
@@ -16030,6 +16588,19 @@ fn build_merge_output_path(workflow_dir: &Path, task_id: &str) -> PathBuf {
   workflow_dir
     .join("merge")
     .join(format!("{}_merged_{}.mp4", task, stamp))
+}
+
+fn build_merge_output_path_for_group(
+  workflow_dir: &Path,
+  task_id: &str,
+  stamp: &str,
+  group_index: usize,
+) -> PathBuf {
+  let task = sanitize_filename(task_id);
+  let safe_stamp = sanitize_filename(stamp);
+  workflow_dir
+    .join("merge")
+    .join(format!("{}_merged_{}_g{:02}.mp4", task, safe_stamp, group_index))
 }
 
 fn resolve_target_merged_video(

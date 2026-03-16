@@ -57,52 +57,63 @@ impl WbiSigner {
 
   async fn ensure_keys(&self, client: &Client) -> Result<(), String> {
     let now = Utc::now().timestamp();
-    let should_update = {
+    let (should_update, has_keys) = {
       let last_update = self.last_update.lock().map_err(|_| "Failed to lock WBI keys".to_string())?;
-      now - *last_update >= Duration::minutes(10).num_seconds()
+      let img_key = self.img_key.lock().map_err(|_| "Failed to lock WBI keys".to_string())?;
+      let expired = now - *last_update >= Duration::hours(4).num_seconds();
+      let has_keys = !img_key.is_empty();
+      (expired, has_keys)
     };
 
     if !should_update {
       return Ok(());
     }
 
-    let response = client
-      .get("https://api.bilibili.com/x/web-interface/nav")
-      .send()
-      .await
-      .map_err(|err| format!("Failed to fetch WBI keys: {}", err))?
-      .text()
-      .await
-      .map_err(|err| format!("Failed to read WBI response: {}", err))?;
+    let fetch_result: Result<(String, String), String> = async {
+      let response = client
+        .get("https://api.bilibili.com/x/web-interface/nav")
+        .send()
+        .await
+        .map_err(|err| format!("Failed to fetch WBI keys: {}", err))?
+        .text()
+        .await
+        .map_err(|err| format!("Failed to read WBI response: {}", err))?;
+      let value: Value = serde_json::from_str(&response)
+        .map_err(|err| format!("Failed to parse WBI response: {}", err))?;
+      let img_url = value
+        .get("data")
+        .and_then(|data| data.get("wbi_img"))
+        .and_then(|data| data.get("img_url"))
+        .and_then(|data| data.as_str())
+        .ok_or_else(|| "WBI response missing img_url".to_string())?;
+      let sub_url = value
+        .get("data")
+        .and_then(|data| data.get("wbi_img"))
+        .and_then(|data| data.get("sub_url"))
+        .and_then(|data| data.as_str())
+        .ok_or_else(|| "WBI response missing sub_url".to_string())?;
+      Ok((extract_key_from_url(img_url), extract_key_from_url(sub_url)))
+    }.await;
 
-    let value: Value = serde_json::from_str(&response)
-      .map_err(|err| format!("Failed to parse WBI response: {}", err))?;
-    let img_url = value
-      .get("data")
-      .and_then(|data| data.get("wbi_img"))
-      .and_then(|data| data.get("img_url"))
-      .and_then(|data| data.as_str())
-      .ok_or_else(|| "WBI response missing img_url".to_string())?;
-    let sub_url = value
-      .get("data")
-      .and_then(|data| data.get("wbi_img"))
-      .and_then(|data| data.get("sub_url"))
-      .and_then(|data| data.as_str())
-      .ok_or_else(|| "WBI response missing sub_url".to_string())?;
-
-    let img_key = extract_key_from_url(img_url);
-    let sub_key = extract_key_from_url(sub_url);
-
-    {
-      let mut img_key_lock = self.img_key.lock().map_err(|_| "Failed to lock WBI keys".to_string())?;
-      let mut sub_key_lock = self.sub_key.lock().map_err(|_| "Failed to lock WBI keys".to_string())?;
-      let mut last_update = self.last_update.lock().map_err(|_| "Failed to lock WBI keys".to_string())?;
-      *img_key_lock = img_key;
-      *sub_key_lock = sub_key;
-      *last_update = now;
+    match fetch_result {
+      Ok((img_key, sub_key)) => {
+        let mut img_key_lock = self.img_key.lock().map_err(|_| "Failed to lock WBI keys".to_string())?;
+        let mut sub_key_lock = self.sub_key.lock().map_err(|_| "Failed to lock WBI keys".to_string())?;
+        let mut last_update = self.last_update.lock().map_err(|_| "Failed to lock WBI keys".to_string())?;
+        *img_key_lock = img_key;
+        *sub_key_lock = sub_key;
+        *last_update = now;
+        Ok(())
+      }
+      Err(err) => {
+        if has_keys {
+          // 已有缓存 key，沿用旧 key 继续，不中断录制
+          Ok(())
+        } else {
+          Err(err)
+        }
+      }
     }
-
-    Ok(())
   }
 
   fn mixin_key(&self) -> String {
