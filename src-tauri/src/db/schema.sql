@@ -12,6 +12,21 @@ CREATE TABLE IF NOT EXISTS anchor (
 
 CREATE INDEX IF NOT EXISTS idx_anchor_uid ON anchor (uid);
 
+CREATE TABLE IF NOT EXISTS anchor_submission_config (
+  room_id       TEXT PRIMARY KEY,
+  title         TEXT NOT NULL,
+  description   TEXT,
+  partition_id  INTEGER NOT NULL,
+  collection_id INTEGER,
+  tags          TEXT,
+  topic_id      INTEGER,
+  mission_id    INTEGER,
+  activity_title TEXT,
+  video_type    TEXT NOT NULL,
+  create_time   TEXT NOT NULL,
+  update_time   TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS login_info (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL UNIQUE,
@@ -57,7 +72,8 @@ CREATE TABLE IF NOT EXISTS submission_task (
   import_mode TEXT DEFAULT 'NON_SEGMENTED',
   baidu_sync_enabled INTEGER DEFAULT 0,
   baidu_sync_path TEXT,
-  baidu_sync_filename TEXT
+  baidu_sync_filename TEXT,
+  source_type TEXT DEFAULT 'NORMAL'
 );
 
 CREATE INDEX IF NOT EXISTS idx_submission_task_bilibili_uid ON submission_task (bilibili_uid);
@@ -489,6 +505,36 @@ CREATE TABLE IF NOT EXISTS baidu_sync_task (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS live_clip_task (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id       TEXT NOT NULL,
+  record_ids    TEXT NOT NULL,
+  date_label    TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  clip_count    INTEGER DEFAULT 0,
+  error_message TEXT,
+  create_time   TEXT NOT NULL,
+  update_time   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_clip_task_room_id ON live_clip_task (room_id);
+
+CREATE TABLE IF NOT EXISTS live_clip_item (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id       INTEGER NOT NULL,
+  room_id       TEXT NOT NULL,
+  source_file_path TEXT,
+  status        TEXT NOT NULL DEFAULT 'SUCCESS',
+  file_path     TEXT NOT NULL,
+  start_offset  INTEGER NOT NULL,
+  end_offset    INTEGER NOT NULL,
+  duration      INTEGER NOT NULL,
+  peak_count    INTEGER DEFAULT 0,
+  create_time   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_clip_item_task_id ON live_clip_item (task_id);
 
 INSERT OR IGNORE INTO workflow_configurations (
   config_id,

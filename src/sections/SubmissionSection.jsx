@@ -36,6 +36,11 @@ const statusFilters = [
   { value: "CANCELLED", label: "已取消" },
 ];
 
+const sourceFilters = [
+  { value: "NORMAL", label: "其他投稿" },
+  { value: "CLIP", label: "切片投稿" },
+];
+
 const buildSourceId = () =>
   `source_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
 const buildMergeGroupId = () =>
@@ -117,6 +122,7 @@ export default function SubmissionSection() {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [statusFilter, setStatusFilter] = useState("ALL");
+  const [sourceFilter, setSourceFilter] = useState("NORMAL");
   const [message, setMessage] = useState("");
   const [refreshingRemote, setRefreshingRemote] = useState(false);
   const [submissionView, setSubmissionView] = useState("list");
@@ -1023,6 +1029,7 @@ export default function SubmissionSection() {
     size = pageSize,
     refreshRemote = false,
     keyword = taskSearch,
+    sourceType = sourceFilter,
     source = "auto",
   ) => {
     try {
@@ -1030,6 +1037,9 @@ export default function SubmissionSection() {
       const trimmedKeyword = keyword?.trim();
       if (trimmedKeyword) {
         payload.query = trimmedKeyword;
+      }
+      if (sourceType && sourceType !== "ALL") {
+        payload.sourceType = sourceType;
       }
       if (source === "page_size_change") {
         try {
@@ -1211,7 +1221,7 @@ export default function SubmissionSection() {
           filePath: selected,
         },
       });
-      await loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, "import");
+      await loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter, "import");
       const summary = `总数 ${result?.totalTasks ?? 0}，导入 ${result?.importedTasks ?? 0}，跳过 ${result?.skippedTasks ?? 0}，失败 ${result?.failedTasks ?? 0}`;
       await dialogMessage(summary, {
         title: "导入完成",
@@ -1763,26 +1773,26 @@ export default function SubmissionSection() {
     if (submissionView !== "list") {
       return undefined;
     }
-    loadTasks(statusFilter, currentPage, pageSize);
+    loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter);
     return undefined;
-    }, [submissionView, statusFilter, currentPage, pageSize, taskSearch]);
+    }, [submissionView, statusFilter, sourceFilter, currentPage, pageSize, taskSearch]);
 
   useEffect(() => {
     if (submissionView !== "list") {
       return;
     }
     setSelectedTaskIds(new Set());
-  }, [submissionView, statusFilter, taskSearch]);
+  }, [submissionView, statusFilter, sourceFilter, taskSearch]);
 
   useEffect(() => {
     if (submissionView !== "list") {
       return undefined;
     }
     const timer = setInterval(() => {
-      loadTasks(statusFilter, currentPage, pageSize);
+      loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter);
     }, 3000);
     return () => clearInterval(timer);
-  }, [submissionView, statusFilter, currentPage, pageSize, taskSearch]);
+  }, [submissionView, statusFilter, sourceFilter, currentPage, pageSize, taskSearch]);
 
   useEffect(() => {
     if (!quickFillOpen) {
@@ -3213,6 +3223,9 @@ export default function SubmissionSection() {
       setMessage(result || "已提交重新投稿");
       closeRepostModal();
       await loadTasks(statusFilter, currentPage, pageSize);
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("anchor-clip-list-refresh"));
+      }
     } catch (error) {
       setMessage(error.message);
       await showErrorDialog(error);
@@ -5689,6 +5702,27 @@ export default function SubmissionSection() {
             </select>
           </div>
         </div>
+        <div className="flex flex-wrap items-center gap-2 border-b border-black/5 px-6 py-2">
+          {sourceFilters.map((item) => {
+            const active = sourceFilter === item.value;
+            return (
+              <button
+                key={item.value}
+                className={`tab-btn ${active ? "active" : ""}`}
+                onClick={() => {
+                  if (sourceFilter === item.value) {
+                    return;
+                  }
+                  setSourceFilter(item.value);
+                  setCurrentPage(1);
+                  loadTasks(statusFilter, 1, pageSize, false, taskSearch, item.value, "tab");
+                }}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
         <div className="overflow-x-auto">
           <table className="w-full min-w-max table-auto text-left text-sm whitespace-nowrap">
             <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)] whitespace-nowrap">
@@ -5962,7 +5996,7 @@ export default function SubmissionSection() {
                   return;
                 }
                 setPageSize(nextSize);
-                loadTasks(statusFilter, currentPage, nextSize, false, taskSearch, "page_size_change");
+                loadTasks(statusFilter, currentPage, nextSize, false, taskSearch, sourceFilter, "page_size_change");
               }}
               className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
             >

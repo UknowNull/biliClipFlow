@@ -153,6 +153,7 @@ pub struct SubmissionTaskInput {
   pub baidu_sync_enabled: Option<bool>,
   pub baidu_sync_path: Option<String>,
   pub baidu_sync_filename: Option<String>,
+  pub source_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -515,6 +516,7 @@ pub struct SubmissionTaskRecord {
   pub updated_at: String,
   pub segment_prefix: Option<String>,
   pub import_mode: String,
+  pub source_type: String,
   pub enable_segmentation: bool,
   pub baidu_sync_enabled: bool,
   pub baidu_sync_path: Option<String>,
@@ -950,9 +952,16 @@ pub async fn submission_create(
     );
     let normalized_baidu_sync_filename =
       normalize_baidu_sync_filename(request.task.baidu_sync_filename.as_deref());
+    let source_type = request
+      .task
+      .source_type
+      .clone()
+      .unwrap_or_else(|| "NORMAL".to_string())
+      .trim()
+      .to_ascii_uppercase();
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, cover_local_path, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
-       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, cover_local_path, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename, source_type) \
+       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
       params![
         &task_id,
         if request.task.priority.unwrap_or(false) { 1 } else { 0 },
@@ -979,6 +988,7 @@ pub async fn submission_create(
         },
         request.task.baidu_sync_path.as_deref(),
         normalized_baidu_sync_filename.as_deref(),
+        source_type.as_str(),
       ],
     )?;
     append_log(
@@ -5271,6 +5281,8 @@ pub async fn submission_list(
   pageSize: Option<i64>,
   query: Option<String>,
   refresh_remote: Option<bool>,
+  source_type: Option<String>,
+  sourceType: Option<String>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
   let context = SubmissionContext::new(&state);
   let page = page.unwrap_or(1).max(1);
@@ -5295,7 +5307,15 @@ pub async fn submission_list(
       );
     }
   }
-  let response = match load_tasks(&context, None, page, page_size, query, bilibili_uid) {
+  let response = match load_tasks(
+    &context,
+    None,
+    page,
+    page_size,
+    query,
+    bilibili_uid,
+    source_type.or(sourceType),
+  ) {
     Ok(result) => ApiResponse::success(result),
     Err(err) => ApiResponse::error(format!("Failed to load tasks: {}", err)),
   };
@@ -5312,6 +5332,8 @@ pub async fn submission_list_by_status(
   pageSize: Option<i64>,
   query: Option<String>,
   refresh_remote: Option<bool>,
+  source_type: Option<String>,
+  sourceType: Option<String>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
   let context = SubmissionContext::new(&state);
   let page = page.unwrap_or(1).max(1);
@@ -5346,6 +5368,7 @@ pub async fn submission_list_by_status(
     page_size,
     query,
     bilibili_uid,
+    source_type.or(sourceType),
   ) {
     Ok(result) => ApiResponse::success(result),
     Err(err) => ApiResponse::error(format!("Failed to load tasks: {}", err)),
@@ -9189,9 +9212,9 @@ pub fn submission_remote_import_save(
   let save_result = context.db.with_conn_mut(|conn| {
     let tx = conn.transaction()?;
     tx.execute(
-      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, remote_state, reject_reason, created_at, updated_at, bilibili_uid, import_mode, baidu_sync_enabled) \
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11, ?12, 0, NULL, ?13, ?14, ?15, ?16, 0)",
-      (
+      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, remote_state, reject_reason, created_at, updated_at, bilibili_uid, import_mode, baidu_sync_enabled, source_type) \
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11, ?12, 0, NULL, ?13, ?14, ?15, ?16, 0, ?17)",
+      params![
         &task_id,
         "COMPLETED",
         0i64,
@@ -9208,7 +9231,8 @@ pub fn submission_remote_import_save(
         &now,
         current_uid,
         &import_mode,
-      ),
+        "NORMAL",
+      ],
     )?;
     if segment_prefix.is_some() {
       tx.execute(
@@ -9419,6 +9443,7 @@ fn load_tasks(
   page_size: i64,
   query: Option<String>,
   bilibili_uid: i64,
+  source_type: Option<String>,
 ) -> Result<PaginatedSubmissionTasks, String> {
   context
     .db
@@ -9432,23 +9457,53 @@ fn load_tasks(
         }
       });
       let like_query = query.as_ref().map(|value| format!("%{}%", value));
-      let total = match (status.as_ref(), like_query.as_ref()) {
-        (Some(status), Some(pattern)) => conn.query_row(
+      let source_type = source_type
+        .and_then(|value| {
+          let trimmed = value.trim().to_string();
+          if trimmed.is_empty() {
+            None
+          } else {
+            Some(trimmed)
+          }
+        })
+        .map(|value| value.to_ascii_uppercase());
+      let total = match (status.as_ref(), like_query.as_ref(), source_type.as_ref()) {
+        (Some(status), Some(pattern), Some(source_type)) => conn.query_row(
+          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND status = ?2 AND COALESCE(source_type, 'NORMAL') = ?3 AND (title LIKE ?4 COLLATE NOCASE OR bvid LIKE ?4 COLLATE NOCASE)",
+          (bilibili_uid, status, source_type, pattern),
+          |row| row.get(0),
+        )?,
+        (Some(status), Some(pattern), None) => conn.query_row(
           "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND status = ?2 AND (title LIKE ?3 COLLATE NOCASE OR bvid LIKE ?3 COLLATE NOCASE)",
           (bilibili_uid, status, pattern),
           |row| row.get(0),
         )?,
-        (Some(status), None) => conn.query_row(
+        (Some(status), None, Some(source_type)) => conn.query_row(
+          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND status = ?2 AND COALESCE(source_type, 'NORMAL') = ?3",
+          (bilibili_uid, status, source_type),
+          |row| row.get(0),
+        )?,
+        (Some(status), None, None) => conn.query_row(
           "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND status = ?2",
           (bilibili_uid, status),
           |row| row.get(0),
         )?,
-        (None, Some(pattern)) => conn.query_row(
+        (None, Some(pattern), Some(source_type)) => conn.query_row(
+          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND COALESCE(source_type, 'NORMAL') = ?2 AND (title LIKE ?3 COLLATE NOCASE OR bvid LIKE ?3 COLLATE NOCASE)",
+          (bilibili_uid, source_type, pattern),
+          |row| row.get(0),
+        )?,
+        (None, Some(pattern), None) => conn.query_row(
           "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND (title LIKE ?2 COLLATE NOCASE OR bvid LIKE ?2 COLLATE NOCASE)",
           (bilibili_uid, pattern),
           |row| row.get(0),
         )?,
-        (None, None) => conn.query_row(
+        (None, None, Some(source_type)) => conn.query_row(
+          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND COALESCE(source_type, 'NORMAL') = ?2",
+          (bilibili_uid, source_type),
+          |row| row.get(0),
+        )?,
+        (None, None, None) => conn.query_row(
           "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1",
           [bilibili_uid],
           |row| row.get(0),
@@ -9487,9 +9542,19 @@ fn load_tasks(
           ELSE 0 \
         END DESC, \
         st.created_at DESC";
-      let sql = match (status.as_ref(), like_query.as_ref()) {
-        (Some(_), Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+      let sql = match (status.as_ref(), like_query.as_ref(), source_type.as_ref()) {
+        (Some(_), Some(_), Some(_)) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
+                  wi.status, wi.current_step, wi.progress, wi.error_message \
+           FROM submission_task st \
+           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
+           WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND COALESCE(st.source_type, 'NORMAL') = ?3 AND (st.title LIKE ?4 COLLATE NOCASE OR st.bvid LIKE ?4 COLLATE NOCASE) {} LIMIT ?5 OFFSET ?6",
+          order_by
+        ),
+        (Some(_), Some(_), None) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -9498,8 +9563,18 @@ fn load_tasks(
            WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND (st.title LIKE ?3 COLLATE NOCASE OR st.bvid LIKE ?3 COLLATE NOCASE) {} LIMIT ?4 OFFSET ?5",
           order_by
         ),
-        (Some(_), None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+        (Some(_), None, Some(_)) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
+                  wi.status, wi.current_step, wi.progress, wi.error_message \
+           FROM submission_task st \
+           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
+           WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND COALESCE(st.source_type, 'NORMAL') = ?3 {} LIMIT ?4 OFFSET ?5",
+          order_by
+        ),
+        (Some(_), None, None) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -9508,8 +9583,18 @@ fn load_tasks(
            WHERE st.bilibili_uid = ?1 AND st.status = ?2 {} LIMIT ?3 OFFSET ?4",
           order_by
         ),
-        (None, Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+        (None, Some(_), Some(_)) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
+                  wi.status, wi.current_step, wi.progress, wi.error_message \
+           FROM submission_task st \
+           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
+           WHERE st.bilibili_uid = ?1 AND COALESCE(st.source_type, 'NORMAL') = ?2 AND (st.title LIKE ?3 COLLATE NOCASE OR st.bvid LIKE ?3 COLLATE NOCASE) {} LIMIT ?4 OFFSET ?5",
+          order_by
+        ),
+        (None, Some(_), None) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -9518,8 +9603,18 @@ fn load_tasks(
            WHERE st.bilibili_uid = ?1 AND (st.title LIKE ?2 COLLATE NOCASE OR st.bvid LIKE ?2 COLLATE NOCASE) {} LIMIT ?3 OFFSET ?4",
           order_by
         ),
-        (None, None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+        (None, None, Some(_)) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
+                  wi.status, wi.current_step, wi.progress, wi.error_message \
+           FROM submission_task st \
+           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
+           WHERE st.bilibili_uid = ?1 AND COALESCE(st.source_type, 'NORMAL') = ?2 {} LIMIT ?3 OFFSET ?4",
+          order_by
+        ),
+        (None, None, None) => format!(
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -9531,17 +9626,31 @@ fn load_tasks(
       };
 
       let mut stmt = conn.prepare(&sql)?;
-      let rows = match (status, like_query) {
-        (Some(status), Some(pattern)) => {
+      let rows = match (status, like_query, source_type) {
+        (Some(status), Some(pattern), Some(source_type)) => stmt.query_map(
+          (bilibili_uid, status, source_type, pattern, page_size, offset),
+          map_submission_task,
+        )?,
+        (Some(status), Some(pattern), None) => {
           stmt.query_map((bilibili_uid, status, pattern, page_size, offset), map_submission_task)?
         }
-        (Some(status), None) => {
+        (Some(status), None, Some(source_type)) => {
+          stmt.query_map((bilibili_uid, status, source_type, page_size, offset), map_submission_task)?
+        }
+        (Some(status), None, None) => {
           stmt.query_map((bilibili_uid, status, page_size, offset), map_submission_task)?
         }
-        (None, Some(pattern)) => {
+        (None, Some(pattern), Some(source_type)) => stmt.query_map(
+          (bilibili_uid, source_type, pattern, page_size, offset),
+          map_submission_task,
+        )?,
+        (None, Some(pattern), None) => {
           stmt.query_map((bilibili_uid, pattern, page_size, offset), map_submission_task)?
         }
-        (None, None) => stmt.query_map((bilibili_uid, page_size, offset), map_submission_task)?,
+        (None, None, Some(source_type)) => {
+          stmt.query_map((bilibili_uid, source_type, page_size, offset), map_submission_task)?
+        }
+        (None, None, None) => stmt.query_map((bilibili_uid, page_size, offset), map_submission_task)?,
       };
 
       let list = rows.collect::<Result<Vec<_>, _>>()?;
@@ -9558,15 +9667,21 @@ fn load_tasks(
 fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTaskRecord> {
   let import_mode_raw: Option<String> = row.get(21)?;
   let import_mode = normalize_import_mode(import_mode_raw.as_deref());
-  let workflow_config_raw: Option<String> = row.get(22)?;
+  let source_type_raw: Option<String> = row.get(22)?;
+  let source_type = source_type_raw
+    .as_deref()
+    .unwrap_or("NORMAL")
+    .trim()
+    .to_string();
+  let workflow_config_raw: Option<String> = row.get(23)?;
   let workflow_settings = parse_workflow_settings(
     workflow_config_raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),
   );
-  let has_integrated_downloads: i64 = row.get(26)?;
-  let workflow_status = row.get::<_, Option<String>>(27)?;
-  let workflow_step = row.get::<_, Option<String>>(28)?;
-  let workflow_progress: Option<f64> = row.get(29)?;
-  let workflow_error_message: Option<String> = row.get(30)?;
+  let has_integrated_downloads: i64 = row.get(27)?;
+  let workflow_status = row.get::<_, Option<String>>(28)?;
+  let workflow_step = row.get::<_, Option<String>>(29)?;
+  let workflow_progress: Option<f64> = row.get(30)?;
+  let workflow_error_message: Option<String> = row.get(31)?;
   let workflow_status = workflow_status.map(|status| WorkflowStatusRecord {
     status,
     current_step: workflow_step,
@@ -9599,10 +9714,11 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
     updated_at: row.get(19)?,
     segment_prefix: row.get(20)?,
     import_mode,
+    source_type,
     enable_segmentation,
-    baidu_sync_enabled: row.get::<_, i64>(23)? != 0,
-    baidu_sync_path: row.get(24)?,
-    baidu_sync_filename: row.get(25)?,
+    baidu_sync_enabled: row.get::<_, i64>(24)? != 0,
+    baidu_sync_path: row.get(25)?,
+    baidu_sync_filename: row.get(26)?,
     has_integrated_downloads: has_integrated_downloads != 0,
     workflow_status,
   })
@@ -9616,7 +9732,7 @@ fn load_task_record(
     .db
     .with_conn(|conn| {
       conn.query_row(
-        "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+        "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                 wi.status, wi.current_step, wi.progress, wi.error_message \
          FROM submission_task st \
@@ -17214,6 +17330,7 @@ mod tests {
       updated_at: "2026-03-10 09:18:11".to_string(),
       segment_prefix: None,
       import_mode: import_mode.to_string(),
+      source_type: "NORMAL".to_string(),
       enable_segmentation,
       baidu_sync_enabled: false,
       baidu_sync_path: None,

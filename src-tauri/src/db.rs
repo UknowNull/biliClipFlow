@@ -121,6 +121,22 @@ impl Db {
       "ALTER TABLE live_room_settings ADD COLUMN baidu_sync_enabled INTEGER DEFAULT 0",
       [],
     );
+    let _ = conn.execute(
+      "ALTER TABLE live_clip_item ADD COLUMN source_file_path TEXT",
+      [],
+    );
+    let _ = conn.execute(
+      "ALTER TABLE live_clip_item ADD COLUMN status TEXT DEFAULT 'SUCCESS'",
+      [],
+    );
+    let _ = conn.execute(
+      "ALTER TABLE anchor_submission_config ADD COLUMN activity_title TEXT",
+      [],
+    );
+    let _ = conn.execute(
+      "ALTER TABLE submission_task ADD COLUMN source_type TEXT DEFAULT 'NORMAL'",
+      [],
+    );
     let _ = conn.execute("ALTER TABLE baidu_sync_task ADD COLUMN baidu_uid TEXT", []);
     conn.execute_batch(include_str!("db/schema.sql"))?;
     let _ = conn.execute(
