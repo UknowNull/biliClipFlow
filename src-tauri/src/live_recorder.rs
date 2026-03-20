@@ -641,6 +641,7 @@ fn run_record_loop(
   let enable_timestamp_fix =
     settings.flv_fix_adjust_timestamp_jump || settings.flv_fix_split_on_timestamp_jump;
   let prefer_split_reconnect = settings.record_mode == 0;
+  let apply_timestamp_fix = enable_timestamp_fix;
   append_log(
     &context.app_log_path,
     &format!(
@@ -743,12 +744,10 @@ fn run_record_loop(
   let mut pipeline = LiveFlvPipeline::new(
     LivePipelineSettings {
       split_on_script_tag: false,
-      split_on_timestamp_jump: settings.flv_fix_split_on_timestamp_jump,
-      split_on_large_timestamp_jump: prefer_split_reconnect,
       disable_split_on_h264_annexb: settings.flv_fix_disable_on_annexb,
     },
     enable_timestamp_fix,
-    settings.flv_fix_adjust_timestamp_jump,
+    apply_timestamp_fix,
   );
   let mut disconnect_retries: usize = 0;
   macro_rules! rotate_for_reconnect {
@@ -1692,8 +1691,6 @@ impl TimestampFixer {
 #[derive(Clone, Copy)]
 struct LivePipelineSettings {
   split_on_script_tag: bool,
-  split_on_timestamp_jump: bool,
-  split_on_large_timestamp_jump: bool,
   disable_split_on_h264_annexb: bool,
 }
 
@@ -1826,15 +1823,10 @@ impl LiveFlvPipeline {
       "pipeline_timestamp_jump diff={} abs_diff={} original={} fixed={} offset={} class={}",
       jump.diff, jump_abs, jump.original, jump.fixed, jump.offset, jump_class
     ));
-    if is_large_jump {
-      if self.settings.split_on_large_timestamp_jump {
-        decision.request_split_if_safe("large_timestamp_jump");
-      }
-      return;
-    }
-    if self.settings.split_on_timestamp_jump {
-      decision.request_split_if_safe("timestamp_jump");
-    }
+    decision.logs.push(format!(
+      "pipeline_timestamp_jump_handled mode=adjust_only class={}",
+      jump_class
+    ));
   }
 
   fn apply_script_tag_rule(&mut self, tag: &FlvTag, decision: &mut LivePipelineDecision) {
