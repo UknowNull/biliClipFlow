@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -139,6 +140,128 @@ impl Db {
     );
     let _ = conn.execute("ALTER TABLE baidu_sync_task ADD COLUMN baidu_uid TEXT", []);
     conn.execute_batch(include_str!("db/schema.sql"))?;
+    let _ = conn.execute(
+      "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES ('active_bilibili_uid', '', datetime('now'))",
+      [],
+    );
+    let _ = conn.execute(
+      "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES ('primary_bilibili_uid', '', datetime('now'))",
+      [],
+    );
+    let _ = conn.execute(
+      "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES ('active_baidu_uid', '', datetime('now'))",
+      [],
+    );
+    let _ = conn.execute(
+      "INSERT INTO baidu_account_info (uid, status, username, login_type, login_time, last_check_time, create_time, update_time) \
+       SELECT uid, status, username, login_type, login_time, last_check_time, create_time, update_time \
+       FROM baidu_login_info \
+       WHERE uid IS NOT NULL AND TRIM(uid) <> '' \
+       ON CONFLICT(uid) DO UPDATE SET \
+         status = excluded.status, \
+         username = excluded.username, \
+         login_type = excluded.login_type, \
+         login_time = excluded.login_time, \
+         last_check_time = excluded.last_check_time, \
+         update_time = excluded.update_time",
+      [],
+    );
+    let legacy_baidu_uid = conn
+      .query_row(
+        "SELECT uid FROM baidu_login_info WHERE uid IS NOT NULL AND TRIM(uid) <> '' LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+      )
+      .optional()?;
+    if let Some(uid) = legacy_baidu_uid.as_deref() {
+      let _ = conn.execute(
+        "INSERT INTO baidu_account_credential (baidu_uid, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error, create_time, update_time) \
+         SELECT ?1, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error, create_time, update_time \
+         FROM baidu_login_credential WHERE id = 1 \
+         ON CONFLICT(baidu_uid) DO UPDATE SET \
+           login_type = excluded.login_type, \
+           cookie = excluded.cookie, \
+           bduss = excluded.bduss, \
+           stoken = excluded.stoken, \
+           last_attempt_time = excluded.last_attempt_time, \
+           last_attempt_error = excluded.last_attempt_error, \
+           update_time = excluded.update_time",
+        [uid],
+      );
+    }
+    let active_bilibili_uid = conn
+      .query_row(
+        "SELECT value FROM app_settings WHERE key = 'active_bilibili_uid'",
+        [],
+        |row| row.get::<_, String>(0),
+      )
+      .optional()?
+      .unwrap_or_default();
+    if active_bilibili_uid.trim().is_empty() {
+      if let Some(uid) = conn
+        .query_row(
+          "SELECT CAST(user_id AS TEXT) FROM login_info ORDER BY login_time DESC LIMIT 1",
+          [],
+          |row| row.get::<_, String>(0),
+        )
+        .optional()?
+      {
+        let _ = conn.execute(
+          "UPDATE app_settings SET value = ?1, updated_at = datetime('now') WHERE key = 'active_bilibili_uid'",
+          [uid],
+        );
+      }
+    }
+    let primary_bilibili_uid = conn
+      .query_row(
+        "SELECT value FROM app_settings WHERE key = 'primary_bilibili_uid'",
+        [],
+        |row| row.get::<_, String>(0),
+      )
+      .optional()?
+      .unwrap_or_default();
+    if primary_bilibili_uid.trim().is_empty() {
+      let fallback_uid = if !active_bilibili_uid.trim().is_empty() {
+        Some(active_bilibili_uid.clone())
+      } else {
+        conn
+          .query_row(
+            "SELECT CAST(user_id AS TEXT) FROM login_info ORDER BY login_time DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+          )
+          .optional()?
+      };
+      if let Some(uid) = fallback_uid {
+        let _ = conn.execute(
+          "UPDATE app_settings SET value = ?1, updated_at = datetime('now') WHERE key = 'primary_bilibili_uid'",
+          [uid],
+        );
+      }
+    }
+    let active_baidu_uid = conn
+      .query_row(
+        "SELECT value FROM app_settings WHERE key = 'active_baidu_uid'",
+        [],
+        |row| row.get::<_, String>(0),
+      )
+      .optional()?
+      .unwrap_or_default();
+    if active_baidu_uid.trim().is_empty() {
+      if let Some(uid) = conn
+        .query_row(
+          "SELECT uid FROM baidu_account_info ORDER BY login_time DESC, update_time DESC LIMIT 1",
+          [],
+          |row| row.get::<_, String>(0),
+        )
+        .optional()?
+      {
+        let _ = conn.execute(
+          "UPDATE app_settings SET value = ?1, updated_at = datetime('now') WHERE key = 'active_baidu_uid'",
+          [uid],
+        );
+      }
+    }
     let _ = conn.execute(
       "UPDATE submission_task SET import_mode = 'SEGMENTED' \
        WHERE import_mode IS NULL OR TRIM(import_mode) = ''",

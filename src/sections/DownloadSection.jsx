@@ -129,7 +129,11 @@ const extractVideoInputs = (input) => {
     .filter(Boolean);
 };
 
-export default function DownloadSection() {
+export default function DownloadSection({
+  activeBilibiliUid = "",
+  onAuthChange,
+  onRefreshBaiduStatus,
+}) {
   const [mainTab, setMainTab] = useState("download");
   const [downloadStep, setDownloadStep] = useState("select");
   const [recordTab, setRecordTab] = useState("pending");
@@ -146,6 +150,9 @@ export default function DownloadSection() {
   const [loadingDownloads, setLoadingDownloads] = useState(false);
   const [submitSubmitting, setSubmitSubmitting] = useState(false);
   const [defaultBaiduSyncPath, setDefaultBaiduSyncPath] = useState("/录播");
+  const [currentUpProfile, setCurrentUpProfile] = useState({ uid: 0, name: "" });
+  const [bilibiliAccounts, setBilibiliAccounts] = useState([]);
+  const [selectedBilibiliUid, setSelectedBilibiliUid] = useState("");
 
   const [integrationEnabled, setIntegrationEnabled] = useState(false);
   const [segmentationEnabled, setSegmentationEnabled] = useState(true);
@@ -234,7 +241,91 @@ export default function DownloadSection() {
   const hasVideo = videoItems.length > 0;
   const hasSelection = selectedCount > 0;
   const isMultiVideo = videoItems.length > 1;
+  const allVideosSelected =
+    hasVideo &&
+    videoItems.every(
+      (item) => item.parts.length > 0 && item.selectedParts.length === item.parts.length,
+    );
   const submitGroupedSourceIds = buildGroupedSourceIdSet(submitMergeItems);
+  const normalizedActiveBilibiliUid = String(activeBilibiliUid || "").trim();
+
+  const extractCurrentAuthProfile = (auth) => {
+    if (!auth?.loggedIn) {
+      return { uid: 0, name: "" };
+    }
+    const userInfo = auth?.userInfo || {};
+    const level1 = userInfo?.data || userInfo;
+    const level2 = level1?.data || level1;
+    const uid = Number(
+      level2?.mid ||
+        level1?.mid ||
+        userInfo?.mid ||
+        level2?.user_id ||
+        level1?.user_id ||
+        userInfo?.user_id ||
+        0,
+    );
+    const name = String(
+      level2?.name ||
+        level1?.name ||
+        userInfo?.name ||
+        level2?.uname ||
+        level1?.uname ||
+        userInfo?.uname ||
+        level2?.username ||
+        level1?.username ||
+        userInfo?.username ||
+        level2?.nickname ||
+        level1?.nickname ||
+        userInfo?.nickname ||
+        "",
+    ).trim();
+    return {
+      uid: Number.isFinite(uid) ? uid : 0,
+      name,
+    };
+  };
+
+  const loadCurrentUpProfile = async () => {
+    try {
+      const auth = await invokeCommand("auth_status");
+      const profile = extractCurrentAuthProfile(auth);
+      setCurrentUpProfile(profile);
+      setBilibiliAccounts(Array.isArray(auth?.accounts) ? auth.accounts : []);
+      setSelectedBilibiliUid((prev) => {
+        const nextUid = String(auth?.activeAccount?.userId || profile.uid || "");
+        return prev || nextUid;
+      });
+      return { auth, profile };
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const handleBilibiliAccountChange = async (nextUid) => {
+    const normalized = String(nextUid || "").trim();
+    if (!normalized || normalized === selectedBilibiliUid) {
+      return;
+    }
+    setMessage("");
+    try {
+      const auth = await invokeCommand("auth_account_switch", {
+        userId: Number(normalized),
+      });
+      onAuthChange?.(auth || { loggedIn: false });
+      await onRefreshBaiduStatus?.();
+      const profile = extractCurrentAuthProfile(auth);
+      setCurrentUpProfile(profile);
+      setBilibiliAccounts(Array.isArray(auth?.accounts) ? auth.accounts : []);
+      const nextSelectedUid = String(auth?.activeAccount?.userId || profile.uid || normalized);
+      setSelectedBilibiliUid(nextSelectedUid);
+      if (integrationEnabled) {
+        await Promise.all([loadPartitions(nextSelectedUid), loadCollections(nextSelectedUid)]);
+      }
+    } catch (error) {
+      setMessage(error?.message || "切换投稿账号失败");
+    }
+  };
 
   useEffect(() => {
     setSubmitMergeItems((prev) => {
@@ -362,6 +453,19 @@ export default function DownloadSection() {
   }, []);
 
   useEffect(() => {
+    loadCurrentUpProfile();
+  }, []);
+
+  useEffect(() => {
+    if (!normalizedActiveBilibiliUid) {
+      return;
+    }
+    setSelectedBilibiliUid((prev) =>
+      prev === normalizedActiveBilibiliUid ? prev : normalizedActiveBilibiliUid,
+    );
+  }, [normalizedActiveBilibiliUid]);
+
+  useEffect(() => {
     const loadBaiduSyncSettings = async () => {
       try {
         const data = await invokeCommand("baidu_sync_settings");
@@ -437,7 +541,7 @@ export default function DownloadSection() {
     }
     loadPartitions();
     loadCollections();
-  }, [integrationEnabled]);
+  }, [integrationEnabled, selectedBilibiliUid]);
 
   useEffect(() => {
     if (!integrationEnabled) {
@@ -456,6 +560,7 @@ export default function DownloadSection() {
     integrationEnabled,
     submissionConfig.partitionId,
     partitions,
+    selectedBilibiliUid,
   ]);
 
   useEffect(() => {
@@ -464,7 +569,7 @@ export default function DownloadSection() {
     }
     loadQuickFillTasks(quickFillPage);
     return undefined;
-  }, [quickFillOpen, quickFillPage, quickFillSearch]);
+  }, [quickFillOpen, quickFillPage, quickFillSearch, selectedBilibiliUid]);
 
   useEffect(() => {
     setVideoItems((prev) => {
@@ -503,9 +608,17 @@ export default function DownloadSection() {
     });
   }, [downloadConfig.downloadPath, downloadConfig.downloadName, defaultDownloadPath]);
 
-  const loadPartitions = async () => {
+  const loadPartitions = async (bilibiliUidOverride = "") => {
     try {
-      const data = await invokeCommand("bilibili_partitions");
+      const currentBilibiliUid = Number(
+        bilibiliUidOverride || selectedBilibiliUid || currentUpProfile?.uid || 0,
+      );
+      const data = await invokeCommand("bilibili_partitions", {
+        bilibiliUid:
+          Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0
+            ? currentBilibiliUid
+            : null,
+      });
       setPartitions(data || []);
       if ((data || []).length) {
         setSubmissionConfig((prev) => {
@@ -523,9 +636,18 @@ export default function DownloadSection() {
     }
   };
 
-  const loadCollections = async () => {
+  const loadCollections = async (bilibiliUidOverride = "") => {
     try {
-      const data = await invokeCommand("bilibili_collections", { mid: 0 });
+      const currentBilibiliUid = Number(
+        bilibiliUidOverride || selectedBilibiliUid || currentUpProfile?.uid || 0,
+      );
+      const data = await invokeCommand("bilibili_collections", {
+        mid: currentBilibiliUid || 0,
+        bilibiliUid:
+          Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0
+            ? currentBilibiliUid
+            : null,
+      });
       const mapped = (data || []).map((item) => ({
         ...item,
         seasonId: item.season_id ?? item.seasonId,
@@ -783,6 +905,24 @@ export default function DownloadSection() {
     });
   };
 
+  const toggleSelectAllVideos = () => {
+    setVideoItems((prev) => {
+      const isMulti = prev.length > 1;
+      const nextAllSelected =
+        prev.length > 0 &&
+        prev.every((item) => item.parts.length > 0 && item.selectedParts.length === item.parts.length);
+      return prev.map((item) => {
+        const nextSelected = nextAllSelected ? [] : [...item.parts];
+        const nextConfigs = buildSelectedPartsConfig(item, nextSelected, isMulti);
+        return {
+          ...item,
+          selectedParts: nextSelected,
+          selectedPartsConfig: nextConfigs,
+        };
+      });
+    });
+  };
+
   const updatePartConfig = (partKey, field, value) => {
     setVideoItems((prev) =>
       prev.map((item) => {
@@ -877,12 +1017,19 @@ export default function DownloadSection() {
     }
   };
 
-  const loadActivities = async (partitionId) => {
+  const loadActivities = async (partitionId, bilibiliUidOverride = "") => {
     setActivityLoading(true);
     setActivityMessage("");
     try {
+      const currentBilibiliUid = Number(
+        bilibiliUidOverride || selectedBilibiliUid || currentUpProfile?.uid || 0,
+      );
       const data = await invokeCommand("bilibili_topics", {
         partitionId: partitionId ? Number(partitionId) : null,
+        bilibiliUid:
+          Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0
+            ? currentBilibiliUid
+            : null,
       });
       const mapped = normalizeActivityOptions(data);
       setActivityOptions(mapped);
@@ -920,6 +1067,10 @@ export default function DownloadSection() {
         });
       } catch (_) {}
       const payload = { page, page_size: quickFillPageSize, pageSize: quickFillPageSize };
+      const currentBilibiliUid = Number(selectedBilibiliUid || currentUpProfile?.uid || 0);
+      if (Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0) {
+        payload.bilibiliUid = currentBilibiliUid;
+      }
       const trimmedKeyword = keyword?.trim();
       if (trimmedKeyword) {
         payload.query = trimmedKeyword;
@@ -1979,6 +2130,11 @@ export default function DownloadSection() {
                         已选 {selectedCount} 个分P / {videoItems.length} 个视频
                       </div>
                       <div className="flex flex-wrap gap-2">
+                        {isMultiVideo ? (
+                          <button className="h-8 px-3 rounded-lg" onClick={toggleSelectAllVideos}>
+                            {allVideosSelected ? "取消全选全部视频" : "全选全部视频"}
+                          </button>
+                        ) : null}
                         <button
                           className="h-8 px-3 rounded-lg bg-[var(--primary-color)] text-[var(--primary-text)]"
                           onClick={() => handleStartConfig(false)}
@@ -2303,9 +2459,24 @@ export default function DownloadSection() {
               <div className="panel p-4 space-y-4">
                 <div className="flex items-center justify-between gap-3">
                   <div className="text-sm font-semibold text-[var(--content-color)]">投稿信息</div>
-                  <button className="h-7 px-3 rounded-lg text-xs" onClick={openQuickFill}>
-                    一键填写
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      value={selectedBilibiliUid}
+                      onChange={(event) => handleBilibiliAccountChange(event.target.value)}
+                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    >
+                      <option value="">选择投稿账号</option>
+                      {bilibiliAccounts.map((account) => (
+                        <option key={account.userId} value={account.userId}>
+                          {(account.nickname || account.username || `UID ${account.userId}`) +
+                            (account.isActive ? "（当前）" : "")}
+                        </option>
+                      ))}
+                    </select>
+                    <button className="h-7 px-3 rounded-lg text-xs" onClick={openQuickFill}>
+                      一键填写
+                    </button>
+                  </div>
                 </div>
                 <div className="grid gap-3 lg:grid-cols-[1.2fr_0.8fr]">
                   <div className="space-y-3">
@@ -2437,6 +2608,7 @@ export default function DownloadSection() {
                             onClick={() =>
                               loadActivities(
                                 submissionConfig.partitionId,
+                                selectedBilibiliUid,
                               )
                             }
                             disabled={activityLoading || !submissionConfig.partitionId}

@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE, USER_AGENT};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::State;
@@ -16,7 +17,7 @@ use url::Url;
 use crate::api::ApiResponse;
 use crate::bilibili::client::BilibiliClient;
 use crate::login_refresh;
-use crate::login_store::AuthInfo;
+use crate::login_store::{AuthInfo, BilibiliAccountSummary};
 use crate::AppState;
 
 const QR_CODE_GENERATE_PATH: &str = "/x/passport-login/web/qrcode/generate";
@@ -27,6 +28,13 @@ pub struct PollResult {
   pub code: i32,
   pub message: String,
   pub data: Option<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountBindingRecord {
+  pub bilibili_uid: i64,
+  pub baidu_uid: String,
 }
 
 #[tauri::command]
@@ -262,6 +270,159 @@ pub async fn auth_refresh(
 }
 
 #[tauri::command]
+pub fn auth_accounts_list(
+  state: State<'_, AppState>,
+) -> ApiResponse<Vec<BilibiliAccountSummary>> {
+  match state.login_store.list_accounts(&state.db) {
+    Ok(accounts) => ApiResponse::success(accounts),
+    Err(err) => ApiResponse::error(format!("读取账号列表失败: {}", err)),
+  }
+}
+
+#[tauri::command]
+pub async fn auth_account_switch(
+  state: State<'_, AppState>,
+  user_id: i64,
+) -> Result<ApiResponse<HashMap<String, Value>>, String> {
+  match state.login_store.set_active_account(&state.db, user_id) {
+    Ok(()) => match build_auth_status(&state).await {
+      Ok(data) => Ok(ApiResponse::success(data)),
+      Err(err) => Ok(ApiResponse::error(err)),
+    },
+    Err(err) => Ok(ApiResponse::error(format!("切换账号失败: {}", err))),
+  }
+}
+
+#[tauri::command]
+pub async fn auth_account_set_primary(
+  state: State<'_, AppState>,
+  user_id: i64,
+) -> Result<ApiResponse<HashMap<String, Value>>, String> {
+  match state.login_store.set_primary_account(&state.db, user_id) {
+    Ok(()) => match build_auth_status(&state).await {
+      Ok(data) => Ok(ApiResponse::success(data)),
+      Err(err) => Ok(ApiResponse::error(err)),
+    },
+    Err(err) => Ok(ApiResponse::error(format!("设置主账号失败: {}", err))),
+  }
+}
+
+#[tauri::command]
+pub async fn auth_account_logout(
+  state: State<'_, AppState>,
+  user_id: i64,
+) -> Result<ApiResponse<HashMap<String, Value>>, String> {
+  match state.login_store.logout_by_uid(&state.db, user_id) {
+    Ok(()) => match build_auth_status(&state).await {
+      Ok(data) => Ok(ApiResponse::success(data)),
+      Err(err) => Ok(ApiResponse::error(err)),
+    },
+    Err(err) => Ok(ApiResponse::error(format!("退出账号失败: {}", err))),
+  }
+}
+
+#[tauri::command]
+pub fn account_binding_list(
+  state: State<'_, AppState>,
+) -> ApiResponse<Vec<AccountBindingRecord>> {
+  let result = state.db.with_conn(|conn| {
+    let mut stmt = conn.prepare(
+      "SELECT bilibili_uid, baidu_uid FROM bilibili_baidu_binding ORDER BY bilibili_uid ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+      Ok(AccountBindingRecord {
+        bilibili_uid: row.get(0)?,
+        baidu_uid: row.get(1)?,
+      })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+  });
+  match result {
+    Ok(records) => ApiResponse::success(records),
+    Err(err) => ApiResponse::error(format!("读取账号绑定失败: {}", err)),
+  }
+}
+
+#[tauri::command]
+pub fn account_binding_get(
+  state: State<'_, AppState>,
+  bilibili_uid: i64,
+) -> ApiResponse<Option<AccountBindingRecord>> {
+  let result = state.db.with_conn(|conn| {
+    conn
+      .query_row(
+        "SELECT bilibili_uid, baidu_uid FROM bilibili_baidu_binding WHERE bilibili_uid = ?1",
+        [bilibili_uid],
+        |row| {
+          Ok(AccountBindingRecord {
+            bilibili_uid: row.get(0)?,
+            baidu_uid: row.get(1)?,
+          })
+        },
+      )
+      .optional()
+  });
+  match result {
+    Ok(record) => ApiResponse::success(record),
+    Err(err) => ApiResponse::error(format!("读取账号绑定失败: {}", err)),
+  }
+}
+
+#[tauri::command]
+pub fn account_binding_set(
+  state: State<'_, AppState>,
+  bilibili_uid: i64,
+  baidu_uid: String,
+) -> ApiResponse<AccountBindingRecord> {
+  let trimmed_baidu_uid = baidu_uid.trim().to_string();
+  if trimmed_baidu_uid.is_empty() {
+    return ApiResponse::error("网盘账号不能为空");
+  }
+  let bilibili_exists = state
+    .db
+    .with_conn(|conn| {
+      conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM login_info WHERE user_id = ?1)",
+        [bilibili_uid],
+        |row| row.get::<_, i64>(0),
+      )
+    })
+    .map(|value| value != 0);
+  match bilibili_exists {
+    Ok(true) => {}
+    Ok(false) => return ApiResponse::error("B站账号不存在"),
+    Err(err) => return ApiResponse::error(format!("校验B站账号失败: {}", err)),
+  }
+  let baidu_exists = state
+    .db
+    .with_conn(|conn| {
+      conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM baidu_account_info WHERE uid = ?1)",
+        [trimmed_baidu_uid.as_str()],
+        |row| row.get::<_, i64>(0),
+      )
+    })
+    .map(|value| value != 0);
+  match baidu_exists {
+    Ok(true) => {}
+    Ok(false) => return ApiResponse::error("网盘账号不存在"),
+    Err(err) => return ApiResponse::error(format!("校验网盘账号失败: {}", err)),
+  }
+  let result = crate::account_store::set_account_binding(
+    &state.db,
+    bilibili_uid,
+    trimmed_baidu_uid.as_str(),
+  );
+  match result {
+    Ok(()) => ApiResponse::success(AccountBindingRecord {
+      bilibili_uid,
+      baidu_uid: trimmed_baidu_uid,
+    }),
+    Err(err) => ApiResponse::error(format!("保存账号绑定失败: {}", err)),
+  }
+}
+
+#[tauri::command]
 pub async fn auth_client_log(
   state: State<'_, AppState>,
   message: String,
@@ -274,8 +435,15 @@ pub async fn auth_client_log(
 }
 
 #[tauri::command]
-pub async fn auth_logout(state: State<'_, AppState>) -> Result<ApiResponse<String>, String> {
-  match state.login_store.logout(&state.db) {
+pub async fn auth_logout(
+  state: State<'_, AppState>,
+  user_id: Option<i64>,
+) -> Result<ApiResponse<String>, String> {
+  let result = match user_id {
+    Some(user_id) => state.login_store.logout_by_uid(&state.db, user_id),
+    None => state.login_store.logout(&state.db),
+  };
+  match result {
     Ok(()) => Ok(ApiResponse::success("Logged out".to_string())),
     Err(err) => Ok(ApiResponse::error(format!("Failed to logout: {}", err))),
   }
@@ -513,7 +681,44 @@ async fn build_auth_status(state: &AppState) -> Result<HashMap<String, Value>, S
       return Err(format!("Failed to load login info: {}", err));
     }
   };
+  let active_uid = state
+    .login_store
+    .get_active_account_uid(&state.db)
+    .map_err(|err| format!("Failed to load active account: {}", err))?;
+  let primary_uid = state
+    .login_store
+    .get_primary_account_uid(&state.db)
+    .map_err(|err| format!("Failed to load primary account: {}", err))?;
+  let accounts = state
+    .login_store
+    .list_accounts(&state.db)
+    .map_err(|err| format!("Failed to load account list: {}", err))?;
   let mut data = HashMap::new();
+  data.insert("accounts".to_string(), serde_json::to_value(&accounts).unwrap_or_else(|_| Value::Array(Vec::new())));
+  data.insert(
+    "activeAccountUserId".to_string(),
+    active_uid.map(Value::from).unwrap_or(Value::Null),
+  );
+  data.insert(
+    "primaryAccountUserId".to_string(),
+    primary_uid.map(Value::from).unwrap_or(Value::Null),
+  );
+  if let Some(account) = accounts.iter().find(|item| item.is_active) {
+    data.insert(
+      "activeAccount".to_string(),
+      serde_json::to_value(account).unwrap_or(Value::Null),
+    );
+  } else {
+    data.insert("activeAccount".to_string(), Value::Null);
+  }
+  if let Some(account) = accounts.iter().find(|item| item.is_primary) {
+    data.insert(
+      "primaryAccount".to_string(),
+      serde_json::to_value(account).unwrap_or(Value::Null),
+    );
+  } else {
+    data.insert("primaryAccount".to_string(), Value::Null);
+  }
   if let Some(info) = auth_info {
     let mut user_info = info.data.clone();
     if !has_basic_profile(&user_info) || needs_profile_refresh(&user_info) {
@@ -526,7 +731,7 @@ async fn build_auth_status(state: &AppState) -> Result<HashMap<String, Value>, S
     }
     data.insert("loggedIn".to_string(), Value::Bool(true));
     data.insert("userInfo".to_string(), user_info);
-    if let Ok(meta) = load_login_meta(&state.db) {
+    if let Ok(meta) = load_login_meta(&state.db, info.user_id) {
       if let Some(meta) = meta {
         data.insert("loginMeta".to_string(), meta);
       }
@@ -657,22 +862,31 @@ async fn fetch_profile(bilibili: &BilibiliClient, cookie: &str) -> Result<Value,
   }))
 }
 
-fn load_login_meta(db: &crate::db::Db) -> Result<Option<Value>, String> {
+fn load_login_meta(db: &crate::db::Db, user_id: Option<i64>) -> Result<Option<Value>, String> {
   db.with_conn(|conn| {
-    let mut stmt = conn.prepare(
-      "SELECT login_time, expire_time FROM login_info ORDER BY login_time DESC LIMIT 1",
-    )?;
-    let mut rows = stmt.query([])?;
-    if let Some(row) = rows.next()? {
-      let login_time: Option<String> = row.get(0)?;
-      let expire_time: Option<String> = row.get(1)?;
-      Ok(Some(json!({
+    let record = if let Some(user_id) = user_id {
+      conn
+        .query_row(
+          "SELECT login_time, expire_time FROM login_info WHERE user_id = ?1",
+          [user_id],
+          |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+    } else {
+      conn
+        .query_row(
+          "SELECT login_time, expire_time FROM login_info ORDER BY login_time DESC LIMIT 1",
+          [],
+          |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+    };
+    Ok(record.map(|(login_time, expire_time)| {
+      json!({
         "loginTime": login_time,
         "expireTime": expire_time,
-      })))
-    } else {
-      Ok(None)
-    }
+      })
+    }))
   })
   .map_err(|err| err.to_string())
 }

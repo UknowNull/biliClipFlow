@@ -10,7 +10,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::{
   HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, REFERER, USER_AGENT,
@@ -29,6 +29,7 @@ use crate::commands::settings::{
 use crate::config::{default_download_dir, resolve_ffmpeg_path};
 use crate::db::Db;
 use crate::ffmpeg::run_ffmpeg;
+use crate::ffmpeg::run_ffprobe_json;
 use crate::login_store::{AuthInfo, LoginStore};
 use crate::baidu_sync;
 use crate::utils::{append_log, apply_no_window, now_rfc3339, sanitize_filename};
@@ -182,7 +183,13 @@ pub fn recover_stale_recordings(context: LiveContext) {
     };
 
     let file_size = file_meta.len();
-    let end_time = now_rfc3339();
+    let fallback_end_time = now_rfc3339();
+    let metadata_path = path.with_extension("metadata.json");
+    let end_time = derive_recovered_record_end_time(
+      &path,
+      metadata_path.to_string_lossy().as_ref(),
+      &fallback_end_time,
+    );
     let (status, error_message) = if file_size == 0 {
       ("FAILED", Some("录制恢复失败: 空文件"))
     } else {
@@ -204,7 +211,6 @@ pub fn recover_stale_recordings(context: LiveContext) {
       continue;
     }
 
-    let metadata_path = path.with_extension("metadata.json");
     if metadata_path.exists() {
       if let Err(err) =
         update_metadata_file(metadata_path.to_string_lossy().as_ref(), &end_time, file_size)
@@ -355,7 +361,13 @@ async fn recover_idle_recordings(context: LiveContext) {
       }
     };
 
-    let end_time = now_rfc3339();
+    let fallback_end_time = now_rfc3339();
+    let metadata_path = path.with_extension("metadata.json");
+    let end_time = derive_recovered_record_end_time(
+      &path,
+      metadata_path.to_string_lossy().as_ref(),
+      &fallback_end_time,
+    );
     let (status, error_message) = if file_size == 0 {
       ("FAILED", Some("录制恢复失败: 空文件"))
     } else if live_status == 1 {
@@ -379,7 +391,6 @@ async fn recover_idle_recordings(context: LiveContext) {
       continue;
     }
 
-    let metadata_path = path.with_extension("metadata.json");
     if metadata_path.exists() {
       if let Err(err) =
         update_metadata_file(metadata_path.to_string_lossy().as_ref(), &end_time, file_size)
@@ -737,7 +748,11 @@ fn run_record_loop(
     ))
     .build()
     .map_err(|err| format!("Failed to build client: {}", err))?;
-  let auth = context.login_store.load_auth_info(&context.db).ok().flatten();
+  let auth = context
+    .login_store
+    .load_primary_auth_info(&context.db)
+    .ok()
+    .flatten();
   let mut stream_urls: Vec<String> = Vec::new();
   let mut stream_url_index: usize = 0;
   let mut force_no_qn_until: Option<i64> = None;
@@ -2677,6 +2692,48 @@ fn update_metadata_file(path: &str, end_time: &str, file_size: u64) -> Result<()
   Ok(())
 }
 
+fn derive_recovered_record_end_time(file_path: &Path, metadata_path: &str, fallback: &str) -> String {
+  if let Some(value) = derive_end_time_from_media_duration(file_path, metadata_path) {
+    return value;
+  }
+  if let Ok(modified) = std::fs::metadata(file_path).and_then(|meta| meta.modified()) {
+    let modified_time: DateTime<Utc> = modified.into();
+    return modified_time.to_rfc3339();
+  }
+  fallback.to_string()
+}
+
+fn derive_end_time_from_media_duration(file_path: &Path, metadata_path: &str) -> Option<String> {
+  let content = std::fs::read_to_string(metadata_path).ok()?;
+  let value = serde_json::from_str::<Value>(&content).ok()?;
+  let start_time = value.get("startTime")?.as_str()?;
+  let start_at = DateTime::parse_from_rfc3339(start_time).ok()?.with_timezone(&Utc);
+  let duration_secs = probe_media_duration_seconds(file_path)?;
+  let duration_ms = (duration_secs * 1000.0).round() as i64;
+  let end_at = start_at.checked_add_signed(ChronoDuration::milliseconds(duration_ms))?;
+  Some(end_at.to_rfc3339())
+}
+
+fn probe_media_duration_seconds(file_path: &Path) -> Option<f64> {
+  let args = vec![
+    "-v".to_string(),
+    "error".to_string(),
+    "-show_entries".to_string(),
+    "format=duration".to_string(),
+    "-of".to_string(),
+    "json".to_string(),
+    file_path.to_string_lossy().to_string(),
+  ];
+  let data = run_ffprobe_json(&args).ok()?;
+  data
+    .get("format")?
+    .get("duration")?
+    .as_str()?
+    .parse::<f64>()
+    .ok()
+    .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
 fn download_cover(target_file: &str, cover_url: &str) -> Result<(), String> {
   let response = Client::new()
     .get(cover_url)
@@ -3284,7 +3341,11 @@ async fn run_danmaku_loop(
     }
   }
 
-  let auth = context.login_store.load_auth_info(&context.db).ok().flatten();
+  let auth = context
+    .login_store
+    .load_primary_auth_info(&context.db)
+    .ok()
+    .flatten();
   let uid = auth.as_ref().and_then(|info| info.user_id).unwrap_or(0);
   loop {
     if stop_flag.load(Ordering::SeqCst) {

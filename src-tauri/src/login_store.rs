@@ -3,6 +3,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use rusqlite::OptionalExtension;
+use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 use url::Url;
@@ -28,6 +30,19 @@ pub struct AuthInfo {
   pub data: Value,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BilibiliAccountSummary {
+  pub user_id: i64,
+  pub username: Option<String>,
+  pub nickname: Option<String>,
+  pub avatar_url: Option<String>,
+  pub login_time: String,
+  pub expire_time: Option<String>,
+  pub is_active: bool,
+  pub is_primary: bool,
+}
+
 pub struct LoginStore {
   file_path: PathBuf,
 }
@@ -38,83 +53,89 @@ impl LoginStore {
   }
 
   pub fn load_auth_info(&self, db: &Db) -> Result<Option<AuthInfo>, LoginStoreError> {
-    let file_auth = match self.load_from_file() {
-      Ok(auth) => auth,
-      Err(_) => None,
+    let auth_info = if let Some(user_id) = self.get_active_account_uid(db)? {
+      self.load_from_db_by_uid(db, user_id)?
+    } else {
+      self.load_from_db(db)?
     };
-    if let Some(auth_info) = file_auth {
-      return Ok(Some(auth_info));
-    }
-
-    let auth_info = self.load_from_db(db)?;
     if let Some(ref auth_info) = auth_info {
-      let login_time_ms = Utc::now().timestamp_millis();
-      let file_value = json!({
-        "loginTime": login_time_ms,
-        "data": auth_info.data,
-      });
-      let serialized = serde_json::to_string(&file_value)?;
-      fs::write(&self.file_path, serialized)?;
+      self.write_cache(&auth_info.data)?;
     }
 
     Ok(auth_info)
   }
 
   pub fn load_login_data(&self, db: &Db) -> Result<Option<Value>, LoginStoreError> {
-    if let Some(data) = self.load_login_data_from_file()? {
-      return Ok(Some(data));
+    if let Some(user_id) = self.get_active_account_uid(db)? {
+      return self.load_login_data_by_uid(db, user_id);
     }
+    self.load_login_data_from_latest(db)
+  }
 
+  pub fn load_login_data_by_uid(
+    &self,
+    db: &Db,
+    user_id: i64,
+  ) -> Result<Option<Value>, LoginStoreError> {
     let record = db.with_conn(|conn| {
-      let mut stmt =
-        conn.prepare("SELECT cookie_info FROM login_info ORDER BY login_time DESC LIMIT 1")?;
-      let mut rows = stmt.query([])?;
-      if let Some(row) = rows.next()? {
-        let cookie_info: String = row.get(0)?;
-        Ok(Some(cookie_info))
-      } else {
-        Ok(None)
-      }
+      conn
+        .query_row(
+          "SELECT cookie_info FROM login_info WHERE user_id = ?1",
+          [user_id],
+          |row| row.get::<_, String>(0),
+        )
+        .optional()
     })?;
-
-    let cookie_info = match record {
-      Some(info) => info,
-      None => return Ok(None),
-    };
-    let data: Value = serde_json::from_str(&cookie_info)?;
-    Ok(Some(data))
+    Ok(match record {
+      Some(info) => Some(serde_json::from_str(&info)?),
+      None => None,
+    })
   }
 
   pub fn load_refresh_token(&self, db: &Db) -> Result<Option<String>, LoginStoreError> {
-    if let Some(data) = self.load_login_data(db)? {
+    if let Some(user_id) = self.get_active_account_uid(db)? {
+      return self.load_refresh_token_by_uid(db, user_id);
+    }
+    if let Some(data) = self.load_login_data_from_latest(db)? {
       if let Some(token) = extract_refresh_token(&data) {
         return Ok(Some(token));
       }
     }
-
     let record = db.with_conn(|conn| {
-      let mut stmt =
-        conn.prepare("SELECT refresh_token FROM login_info ORDER BY login_time DESC LIMIT 1")?;
-      let mut rows = stmt.query([])?;
-      if let Some(row) = rows.next()? {
-        let refresh_token: Option<String> = row.get(0)?;
-        Ok(refresh_token)
-      } else {
-        Ok(None)
-      }
+      conn
+        .query_row(
+          "SELECT refresh_token FROM login_info ORDER BY login_time DESC LIMIT 1",
+          [],
+          |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
     })?;
+    Ok(record.flatten())
+  }
 
-    Ok(record)
+  pub fn load_refresh_token_by_uid(
+    &self,
+    db: &Db,
+    user_id: i64,
+  ) -> Result<Option<String>, LoginStoreError> {
+    if let Some(data) = self.load_login_data_by_uid(db, user_id)? {
+      if let Some(token) = extract_refresh_token(&data) {
+        return Ok(Some(token));
+      }
+    }
+    let record = db.with_conn(|conn| {
+      conn
+        .query_row(
+          "SELECT refresh_token FROM login_info WHERE user_id = ?1",
+          [user_id],
+          |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+    })?;
+    Ok(record.flatten())
   }
 
   pub fn save_login_info(&self, db: &Db, login_data: &Value) -> Result<Option<i64>, LoginStoreError> {
-    let login_time_ms = Utc::now().timestamp_millis();
-    let file_value = json!({
-      "loginTime": login_time_ms,
-      "data": login_data,
-    });
-    fs::write(&self.file_path, serde_json::to_string(&file_value)?)?;
-
     let user_id = extract_user_id(login_data);
     if user_id.is_none() {
       return Ok(None);
@@ -124,9 +145,9 @@ impl LoginStore {
     let expire_time = extract_expire_time(login_data)
       .unwrap_or_else(|| now + Duration::hours(24));
 
-    let username = extract_string(login_data, &["uname", "username"]);
-    let nickname = extract_string(login_data, &["nickname"]);
-    let avatar_url = extract_string(login_data, &["avatar", "avatar_url"]);
+    let username = extract_string(login_data, &["uname", "username", "name"]);
+    let nickname = extract_string(login_data, &["nickname", "uname", "username", "name"]);
+    let avatar_url = extract_string(login_data, &["avatar", "avatar_url", "face"]);
 
     let access_token = extract_url_param(login_data, "SESSDATA");
     let refresh_token = extract_refresh_token(login_data);
@@ -169,66 +190,239 @@ impl LoginStore {
       )?;
       Ok(())
     })?;
+    self.set_active_account(db, user_id_value)?;
+    self.ensure_primary_account(db, Some(user_id_value))?;
+    self.write_cache(login_data)?;
 
     Ok(Some(user_id_value))
   }
 
   pub fn logout(&self, db: &Db) -> Result<(), LoginStoreError> {
-    if self.file_path.exists() {
-      fs::remove_file(&self.file_path)?;
+    if let Some(user_id) = self.get_active_account_uid(db)? {
+      self.logout_by_uid(db, user_id)?;
+    } else {
+      self.clear_active_account(db)?;
+      self.clear_cache()?;
     }
-    db.with_conn(|conn| {
-      conn.execute("DELETE FROM login_info", [])?;
-      Ok(())
+    Ok(())
+  }
+
+  pub fn load_auth_info_by_uid(
+    &self,
+    db: &Db,
+    user_id: i64,
+  ) -> Result<Option<AuthInfo>, LoginStoreError> {
+    self.load_from_db_by_uid(db, user_id)
+  }
+
+  pub fn load_primary_auth_info(&self, db: &Db) -> Result<Option<AuthInfo>, LoginStoreError> {
+    let auth_info = if let Some(user_id) = self.get_primary_account_uid(db)? {
+      match self.load_from_db_by_uid(db, user_id)? {
+        Some(info) => Some(info),
+        None => {
+          if let Some(active_uid) = self.get_active_account_uid(db)? {
+            self.load_from_db_by_uid(db, active_uid)?
+          } else {
+            self.load_from_db(db)?
+          }
+        }
+      }
+    } else if let Some(user_id) = self.get_active_account_uid(db)? {
+      self.load_from_db_by_uid(db, user_id)?
+    } else {
+      self.load_from_db(db)?
+    };
+    Ok(auth_info)
+  }
+
+  pub fn list_accounts(&self, db: &Db) -> Result<Vec<BilibiliAccountSummary>, LoginStoreError> {
+    let active_uid = self.get_active_account_uid(db)?;
+    let primary_uid = self.get_primary_account_uid(db)?;
+    let records = db.with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT user_id, username, nickname, avatar_url, login_time, expire_time, cookie_info \
+         FROM login_info ORDER BY login_time DESC",
+      )?;
+      let rows = stmt.query_map([], |row| {
+        Ok((
+          row.get::<_, i64>(0)?,
+          row.get::<_, Option<String>>(1)?,
+          row.get::<_, Option<String>>(2)?,
+          row.get::<_, Option<String>>(3)?,
+          row.get::<_, String>(4)?,
+          row.get::<_, Option<String>>(5)?,
+          row.get::<_, Option<String>>(6)?,
+        ))
+      })?;
+      rows.collect::<Result<Vec<_>, _>>()
+    })?;
+    Ok(records
+      .into_iter()
+      .map(
+        |(user_id, username, nickname, avatar_url, login_time, expire_time, cookie_info)| {
+          let parsed_cookie_info = cookie_info
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+          let fallback_name = parsed_cookie_info
+            .as_ref()
+            .and_then(|data| extract_string(data, &["nickname", "uname", "username", "name"]));
+          let fallback_avatar = parsed_cookie_info
+            .as_ref()
+            .and_then(|data| extract_string(data, &["avatar", "avatar_url", "face"]));
+          BilibiliAccountSummary {
+            user_id,
+            username: username.or_else(|| fallback_name.clone()),
+            nickname: nickname.or(fallback_name),
+            avatar_url: avatar_url.filter(|value| !value.trim().is_empty()).or(fallback_avatar),
+            login_time,
+            expire_time,
+            is_active: active_uid == Some(user_id),
+            is_primary: primary_uid == Some(user_id),
+          }
+        },
+      )
+      .collect())
+  }
+
+  pub fn get_active_account_uid(&self, db: &Db) -> Result<Option<i64>, LoginStoreError> {
+    crate::account_store::get_active_bilibili_uid(db).map_err(|err| {
+      LoginStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err))
+    })
+  }
+
+  pub fn set_active_account(&self, db: &Db, user_id: i64) -> Result<(), LoginStoreError> {
+    let exists = db.with_conn(|conn| {
+      conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM login_info WHERE user_id = ?1)",
+        [user_id],
+        |row| row.get::<_, i64>(0),
+      )
+    })?;
+    if exists == 0 {
+      return Ok(());
+    }
+    crate::account_store::set_active_bilibili_uid(db, Some(user_id)).map_err(|err| {
+      LoginStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err))
+    })?;
+    if let Some(data) = self.load_login_data_by_uid(db, user_id)? {
+      self.write_cache(&data)?;
+    }
+    Ok(())
+  }
+
+  pub fn get_primary_account_uid(&self, db: &Db) -> Result<Option<i64>, LoginStoreError> {
+    crate::account_store::get_primary_bilibili_uid(db).map_err(|err| {
+      LoginStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err))
+    })
+  }
+
+  pub fn set_primary_account(&self, db: &Db, user_id: i64) -> Result<(), LoginStoreError> {
+    let exists = db.with_conn(|conn| {
+      conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM login_info WHERE user_id = ?1)",
+        [user_id],
+        |row| row.get::<_, i64>(0),
+      )
+    })?;
+    if exists == 0 {
+      return Ok(());
+    }
+    crate::account_store::set_primary_bilibili_uid(db, Some(user_id)).map_err(|err| {
+      LoginStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err))
     })?;
     Ok(())
   }
 
-  fn load_from_file(&self) -> Result<Option<AuthInfo>, LoginStoreError> {
-    if !self.file_path.exists() {
-      return Ok(None);
+  pub fn logout_by_uid(&self, db: &Db, user_id: i64) -> Result<(), LoginStoreError> {
+    db.with_conn(|conn| {
+      conn.execute("DELETE FROM login_info WHERE user_id = ?1", [user_id])?;
+      Ok(())
+    })?;
+    let active_uid = self.get_active_account_uid(db)?;
+    let primary_uid = self.get_primary_account_uid(db)?;
+    if active_uid == Some(user_id) {
+      let next_uid = db.with_conn(|conn| {
+        conn
+          .query_row(
+            "SELECT user_id FROM login_info ORDER BY login_time DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+          )
+          .optional()
+      })?;
+      match next_uid {
+        Some(next_uid) => self.set_active_account(db, next_uid)?,
+        None => {
+          self.clear_active_account(db)?;
+          self.clear_cache()?;
+        }
+      }
     }
-
-    let content = fs::read_to_string(&self.file_path)?;
-    let root: Value = serde_json::from_str(&content)?;
-    let login_time = root.get("loginTime").and_then(|value| value.as_i64());
-    let data = match root.get("data") {
-      Some(data) => data,
-      None => return Ok(None),
-    };
-
-    let auth_info = build_auth_info(data, login_time);
-    Ok(auth_info)
+    if primary_uid == Some(user_id) {
+      let next_primary_uid = if let Some(active_uid) = self.get_active_account_uid(db)? {
+        Some(active_uid)
+      } else {
+        db.with_conn(|conn| {
+          conn
+            .query_row(
+              "SELECT user_id FROM login_info ORDER BY login_time DESC LIMIT 1",
+              [],
+              |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        })?
+      };
+      crate::account_store::set_primary_bilibili_uid(db, next_primary_uid).map_err(|err| {
+        LoginStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err))
+      })?;
+    }
+    Ok(())
   }
 
-  fn load_login_data_from_file(&self) -> Result<Option<Value>, LoginStoreError> {
-    if !self.file_path.exists() {
-      return Ok(None);
-    }
-
-    let content = fs::read_to_string(&self.file_path)?;
-    let root: Value = serde_json::from_str(&content)?;
-    let data = root.get("data").cloned();
-    Ok(data)
+  fn load_login_data_from_latest(&self, db: &Db) -> Result<Option<Value>, LoginStoreError> {
+    let record = db.with_conn(|conn| {
+      conn
+        .query_row(
+          "SELECT cookie_info FROM login_info ORDER BY login_time DESC LIMIT 1",
+          [],
+          |row| row.get::<_, String>(0),
+        )
+        .optional()
+    })?;
+    Ok(match record {
+      Some(info) => Some(serde_json::from_str(&info)?),
+      None => None,
+    })
   }
 
   fn load_from_db(&self, db: &Db) -> Result<Option<AuthInfo>, LoginStoreError> {
+    let user_id = db.with_conn(|conn| {
+      conn
+        .query_row(
+          "SELECT user_id FROM login_info ORDER BY login_time DESC LIMIT 1",
+          [],
+          |row| row.get::<_, i64>(0),
+        )
+        .optional()
+    })?;
+    match user_id {
+      Some(user_id) => self.load_from_db_by_uid(db, user_id),
+      None => Ok(None),
+    }
+  }
+
+  fn load_from_db_by_uid(&self, db: &Db, user_id: i64) -> Result<Option<AuthInfo>, LoginStoreError> {
     let record = db.with_conn(|conn| {
-      let mut stmt = conn.prepare(
-        "SELECT user_id, cookie_info, expire_time FROM login_info ORDER BY login_time DESC LIMIT 1",
-      )?;
-      let mut rows = stmt.query([])?;
-      if let Some(row) = rows.next()? {
-        let user_id: i64 = row.get(0)?;
-        let cookie_info: String = row.get(1)?;
-        let expire_time: Option<String> = row.get(2)?;
-        Ok(Some((user_id, cookie_info, expire_time)))
-      } else {
-        Ok(None)
-      }
+      conn
+        .query_row(
+          "SELECT cookie_info, expire_time FROM login_info WHERE user_id = ?1",
+          [user_id],
+          |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
     })?;
 
-    let (user_id, cookie_info, expire_time) = match record {
+    let (cookie_info, expire_time) = match record {
       Some(record) => record,
       None => return Ok(None),
     };
@@ -246,8 +440,56 @@ impl LoginStore {
       auth_info.user_id = Some(user_id);
       return Ok(Some(auth_info));
     }
-
     Ok(None)
+  }
+
+  fn write_cache(&self, login_data: &Value) -> Result<(), LoginStoreError> {
+    let login_time_ms = Utc::now().timestamp_millis();
+    let file_value = json!({
+      "loginTime": login_time_ms,
+      "data": login_data,
+    });
+    fs::write(&self.file_path, serde_json::to_string(&file_value)?)?;
+    Ok(())
+  }
+
+  fn clear_cache(&self) -> Result<(), LoginStoreError> {
+    if self.file_path.exists() {
+      fs::remove_file(&self.file_path)?;
+    }
+    Ok(())
+  }
+
+  fn clear_active_account(&self, db: &Db) -> Result<(), LoginStoreError> {
+    crate::account_store::set_active_bilibili_uid(db, None).map_err(|err| {
+      LoginStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err))
+    })?;
+    Ok(())
+  }
+
+  pub fn ensure_primary_account(&self, db: &Db, fallback_user_id: Option<i64>) -> Result<(), LoginStoreError> {
+    if self.get_primary_account_uid(db)?.is_some() {
+      return Ok(());
+    }
+    let target_uid = if let Some(user_id) = fallback_user_id {
+      Some(user_id)
+    } else if let Some(active_uid) = self.get_active_account_uid(db)? {
+      Some(active_uid)
+    } else {
+      db.with_conn(|conn| {
+        conn
+          .query_row(
+            "SELECT user_id FROM login_info ORDER BY login_time DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+          )
+          .optional()
+      })?
+    };
+    crate::account_store::set_primary_bilibili_uid(db, target_uid).map_err(|err| {
+      LoginStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err))
+    })?;
+    Ok(())
   }
 }
 

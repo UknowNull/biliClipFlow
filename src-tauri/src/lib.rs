@@ -7,6 +7,7 @@ use tokio::time::{sleep, Duration};
 use tauri::Manager;
 
 mod api;
+mod account_store;
 mod app_log;
 mod baidu_sync;
 mod bilibili;
@@ -186,6 +187,13 @@ pub fn run() {
             commands::auth::auth_pwd_login,
             commands::auth::auth_status,
             commands::auth::auth_refresh,
+            commands::auth::auth_accounts_list,
+            commands::auth::auth_account_switch,
+            commands::auth::auth_account_set_primary,
+            commands::auth::auth_account_logout,
+            commands::auth::account_binding_list,
+            commands::auth::account_binding_get,
+            commands::auth::account_binding_set,
             commands::auth::auth_client_log,
             commands::auth::auth_logout,
             commands::auth::auth_perform_qrcode_login,
@@ -238,6 +246,9 @@ pub fn run() {
             commands::submission::submission_queue_prioritize,
             commands::baidu_sync::baidu_sync_settings,
             commands::baidu_sync::baidu_sync_status,
+            commands::baidu_sync::baidu_accounts_list,
+            commands::baidu_sync::baidu_account_switch,
+            commands::baidu_sync::baidu_account_logout,
             commands::baidu_sync::baidu_sync_login,
             commands::baidu_sync::baidu_sync_logout,
             commands::baidu_sync::baidu_sync_web_login,

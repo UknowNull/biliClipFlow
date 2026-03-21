@@ -3965,7 +3965,11 @@ fn build_ffmpeg_headers(context: &DownloadContext) -> Option<String> {
 }
 
 fn load_auth(context: &DownloadContext) -> Option<AuthInfo> {
-  context.login_store.load_auth_info(&context.db).ok().flatten()
+  context
+    .login_store
+    .load_primary_auth_info(&context.db)
+    .ok()
+    .flatten()
 }
 
 fn update_download_status(

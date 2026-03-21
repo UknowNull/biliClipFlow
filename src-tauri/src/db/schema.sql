@@ -488,6 +488,41 @@ CREATE TABLE IF NOT EXISTS baidu_login_credential (
   update_time TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS baidu_account_info (
+  uid TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  username TEXT,
+  login_type TEXT,
+  login_time TEXT,
+  last_check_time TEXT,
+  create_time TEXT NOT NULL,
+  update_time TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS baidu_account_credential (
+  baidu_uid TEXT PRIMARY KEY,
+  login_type TEXT NOT NULL,
+  cookie TEXT,
+  bduss TEXT,
+  stoken TEXT,
+  last_attempt_time TEXT,
+  last_attempt_error TEXT,
+  create_time TEXT NOT NULL,
+  update_time TEXT NOT NULL,
+  FOREIGN KEY (baidu_uid) REFERENCES baidu_account_info (uid) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS bilibili_baidu_binding (
+  bilibili_uid INTEGER PRIMARY KEY,
+  baidu_uid TEXT NOT NULL,
+  create_time TEXT NOT NULL,
+  update_time TEXT NOT NULL,
+  FOREIGN KEY (baidu_uid) REFERENCES baidu_account_info (uid) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_bilibili_baidu_binding_baidu_uid
+  ON bilibili_baidu_binding (baidu_uid);
+
 CREATE TABLE IF NOT EXISTS baidu_sync_task (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   source_type TEXT NOT NULL,

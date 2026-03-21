@@ -167,7 +167,12 @@ export default function AnchorSection() {
 
   const loadConfigPartitions = async () => {
     try {
-      const data = await invokeCommand("bilibili_partitions");
+      const auth = await invokeCommand("auth_status");
+      const profile = extractCurrentAuthProfile(auth);
+      setConfigUpProfile(profile);
+      const data = await invokeCommand("bilibili_partitions", {
+        bilibiliUid: profile?.uid ? Number(profile.uid) : null,
+      });
       setConfigPartitions(data || []);
     } catch (error) {
       setSubmissionConfigMessage(error.message);
@@ -183,7 +188,10 @@ export default function AnchorSection() {
         setConfigCollections([]);
         return;
       }
-      const data = await invokeCommand("bilibili_collections", { mid: profile.uid });
+      const data = await invokeCommand("bilibili_collections", {
+        mid: profile.uid,
+        bilibiliUid: Number(profile.uid),
+      });
       const mapped = (data || []).map((item) => ({
         ...item,
         seasonId: item.season_id ?? item.seasonId,
@@ -201,9 +209,13 @@ export default function AnchorSection() {
     setConfigActivityMessage("");
     try {
       const normalizedKeyword = String(keyword || "").trim();
+      const auth = await invokeCommand("auth_status");
+      const profile = extractCurrentAuthProfile(auth);
+      setConfigUpProfile(profile);
       const data = await invokeCommand("bilibili_topics", {
         partitionId: partitionId ? Number(partitionId) : null,
         title: normalizedKeyword || null,
+        bilibiliUid: profile?.uid ? Number(profile.uid) : null,
       });
       if (requestSeq !== configActivityRequestSeqRef.current) {
         return;

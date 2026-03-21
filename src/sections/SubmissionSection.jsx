@@ -68,7 +68,11 @@ const buildMergeItemsFromSources = (sources) =>
     .filter((id) => id)
     .map((id) => ({ id, type: "SOURCE", sourceId: id, standalone: false }));
 
-export default function SubmissionSection() {
+export default function SubmissionSection({
+  activeBilibiliUid = "",
+  onAuthChange,
+  onRefreshBaiduStatus,
+}) {
   const [taskForm, setTaskForm] = useState({
     title: "",
     description: "",
@@ -114,6 +118,8 @@ export default function SubmissionSection() {
   const [activityDropdownOpen, setActivityDropdownOpen] = useState(false);
   const [tasks, setTasks] = useState([]);
   const [currentUpProfile, setCurrentUpProfile] = useState({ uid: 0, name: "" });
+  const [bilibiliAccounts, setBilibiliAccounts] = useState([]);
+  const [selectedBilibiliUid, setSelectedBilibiliUid] = useState("");
   const [selectedTaskIds, setSelectedTaskIds] = useState(() => new Set());
   const [totalTasks, setTotalTasks] = useState(0);
   const [taskSearch, setTaskSearch] = useState("");
@@ -172,6 +178,7 @@ export default function SubmissionSection() {
   const [createSubmitting, setCreateSubmitting] = useState(false);
   const [exportingTasks, setExportingTasks] = useState(false);
   const [importingTasks, setImportingTasks] = useState(false);
+  const normalizedActiveBilibiliUid = String(activeBilibiliUid || "").trim();
 
   const [repostMode, setRepostMode] = useState("SPECIFIED");
   const [repostMergedVideos, setRepostMergedVideos] = useState([]);
@@ -716,7 +723,12 @@ export default function SubmissionSection() {
 
   const loadPartitions = async () => {
     try {
-      const data = await invokeCommand("bilibili_partitions");
+      const currentBilibiliUid = Number(selectedBilibiliUid || currentUpProfile?.uid || 0);
+      const data = await invokeCommand("bilibili_partitions", {
+        bilibiliUid: Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0
+          ? currentBilibiliUid
+          : null,
+      });
       setPartitions(data || []);
       if ((data || []).length) {
         setTaskForm((prev) => {
@@ -746,15 +758,23 @@ export default function SubmissionSection() {
       if (!auth?.loggedIn) {
         setCollections([]);
         setCurrentUpProfile({ uid: 0, name: "" });
+        setBilibiliAccounts(Array.isArray(auth?.accounts) ? auth.accounts : []);
+        setSelectedBilibiliUid("");
         return;
       }
       const profile = extractCurrentAuthProfile(auth);
       setCurrentUpProfile(profile);
-      const mid = profile.uid || 0;
+      setBilibiliAccounts(Array.isArray(auth?.accounts) ? auth.accounts : []);
+      const effectiveUid = String(selectedBilibiliUid || auth?.activeAccount?.userId || profile.uid || "");
+      setSelectedBilibiliUid((prev) => prev || effectiveUid);
+      const mid = Number(effectiveUid || profile.uid || 0);
       await invokeCommand("auth_client_log", {
         message: `collections_mid=${mid || 0}`,
       });
-      const data = await invokeCommand("bilibili_collections", { mid: mid || 0 });
+      const data = await invokeCommand("bilibili_collections", {
+        mid: mid || 0,
+        bilibiliUid: mid || null,
+      });
       const mapped = (data || []).map((item) => ({
         ...item,
         seasonId: item.season_id ?? item.seasonId,
@@ -814,8 +834,48 @@ export default function SubmissionSection() {
   const loadCurrentUpProfile = async () => {
     try {
       const auth = await invokeCommand("auth_status");
-      setCurrentUpProfile(extractCurrentAuthProfile(auth));
+      const profile = extractCurrentAuthProfile(auth);
+      setCurrentUpProfile(profile);
+      setBilibiliAccounts(Array.isArray(auth?.accounts) ? auth.accounts : []);
+      setSelectedBilibiliUid((prev) => {
+        const nextUid = String(auth?.activeAccount?.userId || profile.uid || "");
+        return prev || nextUid;
+      });
     } catch (_) {}
+  };
+
+  const handleBilibiliAccountChange = async (nextUid) => {
+    const normalized = String(nextUid || "").trim();
+    if (!normalized || normalized === selectedBilibiliUid) {
+      return;
+    }
+    setMessage("");
+    try {
+      const auth = await invokeCommand("auth_account_switch", {
+        userId: Number(normalized),
+      });
+      onAuthChange?.(auth || { loggedIn: false });
+      await onRefreshBaiduStatus?.();
+      const profile = extractCurrentAuthProfile(auth);
+      setCurrentUpProfile(profile);
+      setBilibiliAccounts(Array.isArray(auth?.accounts) ? auth.accounts : []);
+      const nextSelectedUid = String(auth?.activeAccount?.userId || profile.uid || normalized);
+      setSelectedBilibiliUid(nextSelectedUid);
+      await loadCollections();
+      await loadTasks(
+        statusFilter,
+        1,
+        pageSize,
+        false,
+        taskSearch,
+        sourceFilter,
+        "account_switch",
+        nextSelectedUid,
+      );
+      setCurrentPage(1);
+    } catch (error) {
+      setMessage(error.message || "切换投稿账号失败");
+    }
   };
 
   const loadBaiduSyncSettings = async () => {
@@ -932,9 +992,14 @@ export default function SubmissionSection() {
     setActivityMessage("");
     try {
       const normalizedKeyword = String(keyword || "").trim();
+      const currentBilibiliUid = Number(selectedBilibiliUid || currentUpProfile?.uid || 0);
       const data = await invokeCommand("bilibili_topics", {
         partitionId: partitionId ? Number(partitionId) : null,
         title: normalizedKeyword || null,
+        bilibiliUid:
+          Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0
+            ? currentBilibiliUid
+            : null,
       });
       if (requestSeq !== activityRequestSeqRef.current) {
         return;
@@ -1031,9 +1096,16 @@ export default function SubmissionSection() {
     keyword = taskSearch,
     sourceType = sourceFilter,
     source = "auto",
+    bilibiliUidOverride = "",
   ) => {
     try {
       const payload = { page, page_size: size, pageSize: size };
+      const currentBilibiliUid = Number(
+        bilibiliUidOverride || selectedBilibiliUid || currentUpProfile?.uid || 0,
+      );
+      if (Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0) {
+        payload.bilibiliUid = currentBilibiliUid;
+      }
       const trimmedKeyword = keyword?.trim();
       if (trimmedKeyword) {
         payload.query = trimmedKeyword;
@@ -1729,6 +1801,15 @@ export default function SubmissionSection() {
   }, []);
 
   useEffect(() => {
+    if (!normalizedActiveBilibiliUid) {
+      return;
+    }
+    setSelectedBilibiliUid((prev) =>
+      prev === normalizedActiveBilibiliUid ? prev : normalizedActiveBilibiliUid,
+    );
+  }, [normalizedActiveBilibiliUid]);
+
+  useEffect(() => {
     if (!isRemoteImportView) {
       return;
     }
@@ -1775,14 +1856,14 @@ export default function SubmissionSection() {
     }
     loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter);
     return undefined;
-    }, [submissionView, statusFilter, sourceFilter, currentPage, pageSize, taskSearch]);
+    }, [submissionView, statusFilter, sourceFilter, currentPage, pageSize, taskSearch, selectedBilibiliUid]);
 
   useEffect(() => {
     if (submissionView !== "list") {
       return;
     }
     setSelectedTaskIds(new Set());
-  }, [submissionView, statusFilter, sourceFilter, taskSearch]);
+  }, [submissionView, statusFilter, sourceFilter, taskSearch, selectedBilibiliUid]);
 
   useEffect(() => {
     if (submissionView !== "list") {
@@ -1792,7 +1873,7 @@ export default function SubmissionSection() {
       loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter);
     }, 3000);
     return () => clearInterval(timer);
-  }, [submissionView, statusFilter, sourceFilter, currentPage, pageSize, taskSearch]);
+  }, [submissionView, statusFilter, sourceFilter, currentPage, pageSize, taskSearch, selectedBilibiliUid]);
 
   useEffect(() => {
     if (!quickFillOpen) {
@@ -2570,11 +2651,17 @@ export default function SubmissionSection() {
         setMessage("请先登录B站账号");
         return;
       }
+      const targetBilibiliUid = Number(selectedBilibiliUid || auth?.activeAccount?.userId || 0);
+      if (!Number.isFinite(targetBilibiliUid) || targetBilibiliUid <= 0) {
+        setMessage("请选择投稿账号");
+        return;
+      }
       if (taskForm.baiduSyncEnabled) {
-        const baiduStatus = await invokeCommand("baidu_sync_status");
-        const baiduUid = String(baiduStatus?.uid || "").trim();
-        if (baiduStatus?.status !== "LOGGED_IN" || !baiduUid) {
-          setMessage("请先登录网盘账号");
+        const binding = await invokeCommand("account_binding_get", {
+          bilibiliUid: targetBilibiliUid,
+        });
+        if (!binding?.baiduUid) {
+          setMessage("当前投稿账号未绑定网盘账号");
           return;
         }
       }
@@ -2613,6 +2700,7 @@ export default function SubmissionSection() {
             missionId: taskForm.activityMissionId ? Number(taskForm.activityMissionId) : null,
             activityTitle: taskForm.activityTitle || null,
             videoType: taskForm.videoType,
+            bilibiliUid: selectedBilibiliUid ? Number(selectedBilibiliUid) : null,
             segmentPrefix: taskForm.segmentPrefix || null,
             priority: Boolean(taskForm.priority),
             baiduSyncEnabled: Boolean(taskForm.baiduSyncEnabled),
@@ -4830,6 +4918,15 @@ export default function SubmissionSection() {
               </button>
             </div>
             <div className="mt-4 space-y-3">
+              <div className="rounded-xl bg-white/70 px-3 py-2 text-sm text-[var(--content-color)]">
+                当前投稿账号：
+                <span className="ml-2 font-semibold">
+                  {currentUpProfile?.name || "未选择"}
+                </span>
+                <span className="ml-2 text-xs text-[var(--muted)]">
+                  UID {currentUpProfile?.uid || "—"}
+                </span>
+              </div>
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-xs text-[var(--muted)]">
                   <div>
@@ -5637,6 +5734,19 @@ export default function SubmissionSection() {
             投稿任务列表
           </div>
           <div className="flex flex-wrap gap-2">
+            <select
+              value={selectedBilibiliUid}
+              onChange={(event) => handleBilibiliAccountChange(event.target.value)}
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+            >
+              <option value="">选择投稿账号</option>
+              {bilibiliAccounts.map((account) => (
+                <option key={account.userId} value={account.userId}>
+                  {(account.nickname || account.username || `UID ${account.userId}`) +
+                    (account.isActive ? "（当前）" : "")}
+                </option>
+              ))}
+            </select>
             <input
               value={taskSearch}
               onChange={(event) => {

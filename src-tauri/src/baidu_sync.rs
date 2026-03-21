@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use tokio::time::{sleep, Duration};
 
@@ -39,8 +40,21 @@ pub struct BaiduLoginInfo {
   pub last_check_time: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaiduAccountSummary {
+  pub uid: String,
+  pub status: String,
+  pub username: Option<String>,
+  pub login_type: Option<String>,
+  pub login_time: Option<String>,
+  pub last_check_time: Option<String>,
+  pub is_active: bool,
+}
+
 #[derive(Clone)]
 struct BaiduLoginCredential {
+  baidu_uid: String,
   login_type: String,
   cookie: Option<String>,
   bduss: Option<String>,
@@ -148,44 +162,50 @@ pub fn load_baidu_sync_settings(db: &Db) -> Result<BaiduSyncSettings, String> {
 }
 
 pub fn load_baidu_login_info(db: &Db) -> Result<Option<BaiduLoginInfo>, String> {
+  if let Some(uid) = get_active_baidu_uid(db)? {
+    return load_baidu_login_info_by_uid(db, &uid);
+  }
   db.with_conn(|conn| {
-    let mut stmt = conn.prepare(
-      "SELECT status, uid, username, login_type, login_time, last_check_time FROM baidu_login_info WHERE id = 1",
-    )?;
-    let mut rows = stmt.query([])?;
-    if let Some(row) = rows.next()? {
-      Ok(Some(BaiduLoginInfo {
-        status: row.get(0)?,
-        uid: row.get(1)?,
-        username: row.get(2)?,
-        login_type: row.get(3)?,
-        login_time: row.get(4)?,
-        last_check_time: row.get(5)?,
-      }))
-    } else {
-      Ok(None)
-    }
+    conn
+      .query_row(
+        "SELECT status, uid, username, login_type, login_time, last_check_time \
+         FROM baidu_account_info ORDER BY login_time DESC, update_time DESC LIMIT 1",
+        [],
+        |row| {
+          Ok(BaiduLoginInfo {
+            status: row.get(0)?,
+            uid: row.get(1)?,
+            username: row.get(2)?,
+            login_type: row.get(3)?,
+            login_time: row.get(4)?,
+            last_check_time: row.get(5)?,
+          })
+        },
+      )
+      .optional()
   })
   .map_err(|err| err.to_string())
 }
 
 pub fn upsert_baidu_login_info(db: &Db, info: &BaiduLoginInfo) -> Result<(), String> {
+  let Some(uid) = info.uid.as_deref().map(|value| value.trim()).filter(|value| !value.is_empty()) else {
+    return Ok(());
+  };
   let now = now_rfc3339();
   db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO baidu_login_info (id, status, uid, username, login_type, login_time, last_check_time, create_time, update_time) \
-       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-       ON CONFLICT(id) DO UPDATE SET \
-       status = excluded.status, \
-       uid = excluded.uid, \
-       username = excluded.username, \
-       login_type = excluded.login_type, \
-       login_time = excluded.login_time, \
-       last_check_time = excluded.last_check_time, \
-       update_time = excluded.update_time",
+      "INSERT INTO baidu_account_info (uid, status, username, login_type, login_time, last_check_time, create_time, update_time) \
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+       ON CONFLICT(uid) DO UPDATE SET \
+         status = excluded.status, \
+         username = excluded.username, \
+         login_type = excluded.login_type, \
+         login_time = excluded.login_time, \
+         last_check_time = excluded.last_check_time, \
+         update_time = excluded.update_time",
       (
+        uid,
         info.status.as_str(),
-        info.uid.as_deref(),
         info.username.as_deref(),
         info.login_type.as_deref(),
         info.login_time.as_deref(),
@@ -196,7 +216,68 @@ pub fn upsert_baidu_login_info(db: &Db, info: &BaiduLoginInfo) -> Result<(), Str
     )?;
     Ok(())
   })
+  .map_err(|err| err.to_string())?;
+  set_active_baidu_uid(db, Some(uid))?;
+  Ok(())
+}
+
+pub fn load_baidu_login_info_by_uid(db: &Db, uid: &str) -> Result<Option<BaiduLoginInfo>, String> {
+  let trimmed_uid = uid.trim();
+  if trimmed_uid.is_empty() {
+    return Ok(None);
+  }
+  db.with_conn(|conn| {
+    conn
+      .query_row(
+        "SELECT status, uid, username, login_type, login_time, last_check_time \
+         FROM baidu_account_info WHERE uid = ?1",
+        [trimmed_uid],
+        |row| {
+          Ok(BaiduLoginInfo {
+            status: row.get(0)?,
+            uid: row.get(1)?,
+            username: row.get(2)?,
+            login_type: row.get(3)?,
+            login_time: row.get(4)?,
+            last_check_time: row.get(5)?,
+          })
+        },
+      )
+      .optional()
+  })
   .map_err(|err| err.to_string())
+}
+
+pub fn list_baidu_accounts(db: &Db) -> Result<Vec<BaiduAccountSummary>, String> {
+  let active_uid = crate::account_store::get_active_baidu_uid(db)?;
+  db.with_conn(|conn| {
+    let mut stmt = conn.prepare(
+      "SELECT uid, status, username, login_type, login_time, last_check_time \
+       FROM baidu_account_info ORDER BY login_time DESC, update_time DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+      let uid: String = row.get(0)?;
+      Ok(BaiduAccountSummary {
+        is_active: active_uid.as_deref() == Some(uid.as_str()),
+        uid,
+        status: row.get(1)?,
+        username: row.get(2)?,
+        login_type: row.get(3)?,
+        login_time: row.get(4)?,
+        last_check_time: row.get(5)?,
+      })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn get_active_baidu_uid(db: &Db) -> Result<Option<String>, String> {
+  crate::account_store::get_active_baidu_uid(db)
+}
+
+pub fn set_active_baidu_uid(db: &Db, uid: Option<&str>) -> Result<(), String> {
+  crate::account_store::set_active_baidu_uid(db, uid)
 }
 
 pub fn update_baidu_sync_settings(db: &Db, settings: &BaiduSyncSettings) -> Result<(), String> {
@@ -804,9 +885,10 @@ fn check_baidu_login_internal(db: &Db, allow_auto_relogin: bool) -> Result<Baidu
   let settings = load_baidu_sync_settings(db)?;
   let exec_path = resolve_baidu_exec_path(&settings.exec_path);
   let now = now_rfc3339();
+  let active_uid = get_active_baidu_uid(db)?;
   let previous = load_baidu_login_info(db)?.unwrap_or(BaiduLoginInfo {
     status: "LOGGED_OUT".to_string(),
-    uid: None,
+    uid: active_uid.clone(),
     username: None,
     login_type: None,
     login_time: None,
@@ -831,6 +913,7 @@ fn check_baidu_login_internal(db: &Db, allow_auto_relogin: bool) -> Result<Baidu
     return Ok(info);
   }
   let (logged_in, uid, username) = parse_who_output(&who_output.stdout);
+  let current_uid = uid.clone().or(active_uid.clone());
   if !logged_in && allow_auto_relogin {
     if let Some(credential) = load_baidu_login_credential(db)? {
       if should_attempt_relogin(&credential, &now) {
@@ -844,7 +927,7 @@ fn check_baidu_login_internal(db: &Db, allow_auto_relogin: bool) -> Result<Baidu
   }
   let info = BaiduLoginInfo {
     status: if logged_in { "LOGGED_IN" } else { "LOGGED_OUT" }.to_string(),
-    uid,
+    uid: current_uid,
     username,
     login_type: previous.login_type,
     login_time: previous.login_time,
@@ -873,7 +956,12 @@ pub fn login_baidu_with_cookie(db: &Db, cookie: &str) -> Result<BaiduLoginInfo, 
     next.login_time = Some(now_rfc3339());
   }
   upsert_baidu_login_info(db, &next)?;
+  let baidu_uid = next
+    .uid
+    .clone()
+    .ok_or_else(|| "未识别到网盘账号 UID".to_string())?;
   let credential = BaiduLoginCredential {
+    baidu_uid,
     login_type: "cookie".to_string(),
     cookie: Some(cookie),
     bduss: None,
@@ -967,7 +1055,12 @@ pub fn login_baidu_with_bduss(
     next.login_time = Some(now_rfc3339());
   }
   upsert_baidu_login_info(db, &next)?;
+  let baidu_uid = next
+    .uid
+    .clone()
+    .ok_or_else(|| "未识别到网盘账号 UID".to_string())?;
   let credential = BaiduLoginCredential {
+    baidu_uid,
     login_type: "bduss".to_string(),
     cookie: None,
     bduss: Some(bduss),
@@ -1024,40 +1117,104 @@ pub fn logout_baidu(db: &Db) -> Result<(), String> {
   let settings = load_baidu_sync_settings(db)?;
   let exec_path = resolve_baidu_exec_path(&settings.exec_path);
   let _ = run_baidu_pcs_command(&exec_path, &["logout".to_string()]);
-  let info = BaiduLoginInfo {
-    status: "LOGGED_OUT".to_string(),
-    uid: None,
-    username: None,
-    login_type: None,
-    login_time: None,
-    last_check_time: Some(now_rfc3339()),
-  };
-  upsert_baidu_login_info(db, &info)?;
-  let _ = clear_baidu_login_credential(db);
+  if let Some(uid) = get_active_baidu_uid(db)? {
+    db.with_conn(|conn| {
+      conn.execute("DELETE FROM baidu_account_info WHERE uid = ?1", [uid.as_str()])?;
+      conn.execute(
+        "DELETE FROM baidu_account_credential WHERE baidu_uid = ?1",
+        [uid.as_str()],
+      )?;
+      conn.execute(
+        "DELETE FROM bilibili_baidu_binding WHERE baidu_uid = ?1",
+        [uid.as_str()],
+      )?;
+      Ok(())
+    })
+    .map_err(|err| err.to_string())?;
+  }
+  let next_active = db
+    .with_conn(|conn| {
+      conn
+        .query_row(
+          "SELECT uid FROM baidu_account_info ORDER BY login_time DESC, update_time DESC LIMIT 1",
+          [],
+          |row| row.get::<_, String>(0),
+        )
+        .optional()
+    })
+    .map_err(|err| err.to_string())?;
+  set_active_baidu_uid(db, next_active.as_deref())?;
   Ok(())
 }
 
-fn load_baidu_login_credential(db: &Db) -> Result<Option<BaiduLoginCredential>, String> {
+pub fn switch_baidu_account(db: &Db, baidu_uid: &str) -> Result<Option<BaiduLoginInfo>, String> {
+  let trimmed_uid = baidu_uid.trim();
+  if trimmed_uid.is_empty() {
+    return Ok(None);
+  }
+  set_active_baidu_uid(db, Some(trimmed_uid))?;
+  if let Some(credential) = load_baidu_login_credential_by_uid(db, trimmed_uid)? {
+    let settings = load_baidu_sync_settings(db)?;
+    let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+    let _ = relogin_with_credential(db, &exec_path, &credential);
+  }
+  load_baidu_login_info_by_uid(db, trimmed_uid)
+}
+
+pub fn logout_baidu_by_uid(db: &Db, baidu_uid: &str) -> Result<(), String> {
+  let trimmed_uid = baidu_uid.trim();
+  if trimmed_uid.is_empty() {
+    return Ok(());
+  }
+  let active_uid = get_active_baidu_uid(db)?;
+  if active_uid.as_deref() == Some(trimmed_uid) {
+    return logout_baidu(db);
+  }
   db.with_conn(|conn| {
-    let mut stmt = conn.prepare(
-      "SELECT login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error \
-       FROM baidu_login_credential WHERE id = 1",
+    conn.execute("DELETE FROM baidu_account_info WHERE uid = ?1", [trimmed_uid])?;
+    conn.execute(
+      "DELETE FROM baidu_account_credential WHERE baidu_uid = ?1",
+      [trimmed_uid],
     )?;
-    let result = stmt.query_row([], |row| {
-      Ok(BaiduLoginCredential {
-        login_type: row.get(0)?,
-        cookie: row.get(1)?,
-        bduss: row.get(2)?,
-        stoken: row.get(3)?,
-        last_attempt_time: row.get(4)?,
-        last_attempt_error: row.get(5)?,
-      })
-    });
-    match result {
-      Ok(value) => Ok(Some(value)),
-      Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-      Err(err) => Err(err),
-    }
+    conn.execute(
+      "DELETE FROM bilibili_baidu_binding WHERE baidu_uid = ?1",
+      [trimmed_uid],
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+fn load_baidu_login_credential(db: &Db) -> Result<Option<BaiduLoginCredential>, String> {
+  let Some(uid) = get_active_baidu_uid(db)? else {
+    return Ok(None);
+  };
+  load_baidu_login_credential_by_uid(db, &uid)
+}
+
+fn load_baidu_login_credential_by_uid(
+  db: &Db,
+  baidu_uid: &str,
+) -> Result<Option<BaiduLoginCredential>, String> {
+  db.with_conn(|conn| {
+    conn
+      .query_row(
+        "SELECT baidu_uid, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error \
+         FROM baidu_account_credential WHERE baidu_uid = ?1",
+        [baidu_uid],
+        |row| {
+          Ok(BaiduLoginCredential {
+            baidu_uid: row.get(0)?,
+            login_type: row.get(1)?,
+            cookie: row.get(2)?,
+            bduss: row.get(3)?,
+            stoken: row.get(4)?,
+            last_attempt_time: row.get(5)?,
+            last_attempt_error: row.get(6)?,
+          })
+        },
+      )
+      .optional()
   })
   .map_err(|err| err.to_string())
 }
@@ -1066,10 +1223,19 @@ fn upsert_baidu_login_credential(db: &Db, credential: &BaiduLoginCredential) -> 
   let now = now_rfc3339();
   db.with_conn(|conn| {
     conn.execute(
-      "INSERT OR REPLACE INTO baidu_login_credential \
-       (id, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error, create_time, update_time) \
-       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+      "INSERT INTO baidu_account_credential \
+       (baidu_uid, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error, create_time, update_time) \
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+       ON CONFLICT(baidu_uid) DO UPDATE SET \
+         login_type = excluded.login_type, \
+         cookie = excluded.cookie, \
+         bduss = excluded.bduss, \
+         stoken = excluded.stoken, \
+         last_attempt_time = excluded.last_attempt_time, \
+         last_attempt_error = excluded.last_attempt_error, \
+         update_time = excluded.update_time",
       (
+        &credential.baidu_uid,
         &credential.login_type,
         &credential.cookie,
         &credential.bduss,
@@ -1080,14 +1246,6 @@ fn upsert_baidu_login_credential(db: &Db, credential: &BaiduLoginCredential) -> 
         &now,
       ),
     )?;
-    Ok(())
-  })
-  .map_err(|err| err.to_string())
-}
-
-fn clear_baidu_login_credential(db: &Db) -> Result<(), String> {
-  db.with_conn(|conn| {
-    conn.execute("DELETE FROM baidu_login_credential WHERE id = 1", [])?;
     Ok(())
   })
   .map_err(|err| err.to_string())

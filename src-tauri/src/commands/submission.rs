@@ -154,6 +154,7 @@ pub struct SubmissionTaskInput {
   pub baidu_sync_path: Option<String>,
   pub baidu_sync_filename: Option<String>,
   pub source_type: Option<String>,
+  pub bilibili_uid: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -901,13 +902,14 @@ pub async fn submission_create(
   request: SubmissionCreateRequest,
 ) -> Result<ApiResponse<TaskCreationResult>, String> {
   let context = SubmissionContext::new(&state);
-  let bilibili_uid = match require_current_bilibili_uid(&state) {
+  let bilibili_uid = match resolve_requested_bilibili_uid(&state, request.task.bilibili_uid) {
     Ok(value) => value,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
   let task_baidu_uid = if request.task.baidu_sync_enabled.unwrap_or(false) {
-    match require_logged_baidu_uid(context.db.as_ref()) {
-      Ok(value) => Some(value),
+    match resolve_bound_baidu_uid(context.db.as_ref(), bilibili_uid) {
+      Ok(Some(value)) => Some(value),
+      Ok(None) => return Ok(ApiResponse::error("当前B站账号未绑定网盘账号")),
       Err(err) => return Ok(ApiResponse::error(err)),
     }
   } else {
@@ -5283,11 +5285,17 @@ pub async fn submission_list(
   refresh_remote: Option<bool>,
   source_type: Option<String>,
   sourceType: Option<String>,
+  bilibili_uid: Option<i64>,
+  bilibiliUid: Option<i64>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
   let context = SubmissionContext::new(&state);
   let page = page.unwrap_or(1).max(1);
   let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
-  let bilibili_uid = match resolve_submission_list_bilibili_uid(&state, &context)? {
+  let bilibili_uid = match resolve_submission_list_bilibili_uid(
+    &state,
+    &context,
+    bilibili_uid.or(bilibiliUid),
+  )? {
     Some(value) => value,
     None => {
       return Ok(ApiResponse::success(PaginatedSubmissionTasks {
@@ -5334,11 +5342,17 @@ pub async fn submission_list_by_status(
   refresh_remote: Option<bool>,
   source_type: Option<String>,
   sourceType: Option<String>,
+  bilibili_uid: Option<i64>,
+  bilibiliUid: Option<i64>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
   let context = SubmissionContext::new(&state);
   let page = page.unwrap_or(1).max(1);
   let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
-  let bilibili_uid = match resolve_submission_list_bilibili_uid(&state, &context)? {
+  let bilibili_uid = match resolve_submission_list_bilibili_uid(
+    &state,
+    &context,
+    bilibili_uid.or(bilibiliUid),
+  )? {
     Some(value) => value,
     None => {
       return Ok(ApiResponse::success(PaginatedSubmissionTasks {
@@ -6381,7 +6395,13 @@ pub async fn submission_edit_add_segment(
     ),
   );
   let upload_context = UploadContext::new(&state);
-  let auth = match load_auth_or_refresh(&upload_context, "submission_edit_add_segment").await {
+  let auth = match load_auth_or_refresh_for_task(
+    &upload_context,
+    &task_id,
+    "submission_edit_add_segment",
+  )
+  .await
+  {
     Ok(auth) => auth,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
@@ -6529,7 +6549,13 @@ pub async fn submission_edit_reupload_segment(
     Err(err) => return Ok(ApiResponse::error(err)),
   };
   let upload_context = UploadContext::new(&state);
-  let auth = match load_auth_or_refresh(&upload_context, "submission_edit_reupload").await {
+  let auth = match load_auth_or_refresh_for_task(
+    &upload_context,
+    &task_id,
+    "submission_edit_reupload",
+  )
+  .await
+  {
     Ok(auth) => auth,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
@@ -6826,7 +6852,13 @@ pub async fn submission_edit_submit(
   }
   if sync_remote_update {
     let upload_context = UploadContext::new(&state);
-    let mut auth = match load_auth_or_refresh(&upload_context, "submission_edit_prepare").await {
+    let mut auth = match load_auth_or_refresh_for_task(
+      &upload_context,
+      &task_id,
+      "submission_edit_prepare",
+    )
+    .await
+    {
       Ok(auth) => auth,
       Err(err) => return Ok(ApiResponse::error(err)),
     };
@@ -7597,7 +7629,13 @@ pub async fn submission_retry_segment_upload(
   }
 
   let upload_context = UploadContext::new(&state);
-  let auth = match load_auth_or_refresh(&upload_context, "submission_retry_segment").await {
+  let auth = match load_auth_or_refresh_for_task(
+    &upload_context,
+    &segment.task_id,
+    "submission_retry_segment",
+  )
+  .await
+  {
     Ok(auth) => auth,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
@@ -7711,10 +7749,36 @@ fn require_current_bilibili_uid(state: &State<'_, AppState>) -> Result<i64, Stri
   auth.user_id.ok_or_else(|| "请先登录B站账号".to_string())
 }
 
+fn resolve_requested_bilibili_uid(
+  state: &State<'_, AppState>,
+  requested_uid: Option<i64>,
+) -> Result<i64, String> {
+  let requested_uid = requested_uid.unwrap_or(require_current_bilibili_uid(state)?);
+  let exists = state
+    .db
+    .with_conn(|conn| {
+      conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM login_info WHERE user_id = ?1)",
+        [requested_uid],
+        |row| row.get::<_, i64>(0),
+      )
+    })
+    .map_err(|err| err.to_string())?;
+  if exists == 0 {
+    return Err("指定的B站账号未登录".to_string());
+  }
+  Ok(requested_uid)
+}
+
 fn resolve_submission_list_bilibili_uid(
   state: &State<'_, AppState>,
   context: &SubmissionContext,
+  preferred_uid: Option<i64>,
 ) -> Result<Option<i64>, String> {
+  if let Some(preferred_uid) = preferred_uid {
+    let requested_uid = resolve_requested_bilibili_uid(state, Some(preferred_uid))?;
+    return Ok(Some(requested_uid));
+  }
   if let Ok(uid) = require_current_bilibili_uid(state) {
     let current_uid_has_tasks = context
       .db
@@ -7757,17 +7821,15 @@ fn resolve_submission_list_bilibili_uid(
 }
 
 fn load_logged_baidu_uid(db: &Db) -> Result<Option<String>, String> {
-  let info = baidu_sync::load_baidu_login_info(db)?;
-  let uid = info
-    .filter(|value| value.status == "LOGGED_IN")
-    .and_then(|value| value.uid)
-    .map(|value| value.trim().to_string())
-    .filter(|value| !value.is_empty());
-  Ok(uid)
+  baidu_sync::get_active_baidu_uid(db)
 }
 
 fn require_logged_baidu_uid(db: &Db) -> Result<String, String> {
   load_logged_baidu_uid(db)?.ok_or_else(|| "请先登录网盘账号".to_string())
+}
+
+fn resolve_bound_baidu_uid(db: &Db, bilibili_uid: i64) -> Result<Option<String>, String> {
+  crate::account_store::get_bound_baidu_uid(db, bilibili_uid)
 }
 
 fn is_safe_identifier(identifier: &str) -> bool {
@@ -11781,7 +11843,8 @@ async fn run_submission_upload(
     &format!("submission_upload_start task_id={}", task_id),
   );
 
-  let mut auth = match load_auth_or_refresh(&context, "submission_upload").await {
+  let mut auth = match load_auth_or_refresh_for_task(&context, &task_id, "submission_upload").await
+  {
     Ok(auth) => auth,
     Err(err) => {
       update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
@@ -16206,6 +16269,24 @@ async fn load_auth_or_refresh(
   refresh_auth(context, reason).await
 }
 
+async fn load_auth_or_refresh_for_task(
+  context: &UploadContext,
+  task_id: &str,
+  reason: &str,
+) -> Result<AuthInfo, String> {
+  if let Some(owner_uid) = load_task_owner_uid(context.db.as_ref(), task_id)? {
+    if let Some(auth) = context
+      .login_store
+      .load_auth_info_by_uid(&context.db, owner_uid)
+      .ok()
+      .flatten()
+    {
+      return Ok(auth);
+    }
+  }
+  load_auth_or_refresh(context, reason).await
+}
+
 async fn refresh_auth(
   context: &UploadContext,
   reason: &str,
@@ -16256,6 +16337,20 @@ fn load_auth_from_queue_context(
     .ok()
     .flatten()
     .ok_or_else(|| "请先登录".to_string())
+}
+
+fn load_task_owner_uid(db: &Db, task_id: &str) -> Result<Option<i64>, String> {
+  db.with_conn(|conn| {
+    conn
+      .query_row(
+        "SELECT bilibili_uid FROM submission_task WHERE task_id = ?1",
+        [task_id],
+        |row| row.get::<_, Option<i64>>(0),
+      )
+      .optional()
+      .map(|value| value.flatten())
+  })
+  .map_err(|err| err.to_string())
 }
 
 fn load_latest_merged_video(

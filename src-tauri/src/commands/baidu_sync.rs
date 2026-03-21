@@ -126,6 +126,36 @@ pub fn baidu_sync_status(
 }
 
 #[tauri::command]
+pub fn baidu_accounts_list(
+  state: State<'_, AppState>,
+) -> ApiResponse<Vec<baidu_sync::BaiduAccountSummary>> {
+  match baidu_sync::list_baidu_accounts(&state.db) {
+    Ok(accounts) => ApiResponse::success(accounts),
+    Err(err) => ApiResponse::error(err),
+  }
+}
+
+#[tauri::command]
+pub fn baidu_account_switch(
+  state: State<'_, AppState>,
+  uid: String,
+) -> ApiResponse<baidu_sync::BaiduLoginInfo> {
+  match baidu_sync::switch_baidu_account(&state.db, &uid) {
+    Ok(Some(info)) => ApiResponse::success(info),
+    Ok(None) => ApiResponse::error("网盘账号不存在"),
+    Err(err) => ApiResponse::error(err),
+  }
+}
+
+#[tauri::command]
+pub fn baidu_account_logout(state: State<'_, AppState>, uid: String) -> ApiResponse<String> {
+  match baidu_sync::logout_baidu_by_uid(&state.db, &uid) {
+    Ok(()) => ApiResponse::success("ok".to_string()),
+    Err(err) => ApiResponse::error(err),
+  }
+}
+
+#[tauri::command]
 pub fn baidu_sync_login(
   state: State<'_, AppState>,
   request: BaiduLoginRequest,

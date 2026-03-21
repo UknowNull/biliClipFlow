@@ -511,8 +511,9 @@ pub async fn video_proxy_image(url: String) -> Result<ApiResponse<String>, Strin
 pub async fn bilibili_collections(
   state: State<'_, AppState>,
   mid: i64,
+  bilibili_uid: Option<i64>,
 ) -> Result<ApiResponse<Vec<Collection>>, String> {
-  let auth = load_auth(&state);
+  let auth = load_auth_for_uid(&state, bilibili_uid);
   append_log(
     &state.app_log_path,
     &format!("collections_start mid={} has_auth={}", mid, auth.is_some()),
@@ -580,8 +581,9 @@ pub async fn bilibili_collections(
 #[tauri::command]
 pub async fn bilibili_partitions(
   state: State<'_, AppState>,
+  bilibili_uid: Option<i64>,
 ) -> Result<ApiResponse<Vec<Partition>>, String> {
-  let auth = load_auth(&state);
+  let auth = load_auth_for_uid(&state, bilibili_uid);
   append_log(
     &state.app_log_path,
     &format!("partitions_fetch_start has_auth={}", auth.is_some()),
@@ -719,8 +721,9 @@ pub async fn bilibili_topics(
   state: State<'_, AppState>,
   partition_id: Option<i64>,
   title: Option<String>,
+  bilibili_uid: Option<i64>,
 ) -> Result<ApiResponse<Vec<ActivityTopic>>, String> {
-  let auth = load_auth(&state);
+  let auth = load_auth_for_uid(&state, bilibili_uid);
   let Some(auth_info) = auth else {
     return Ok(ApiResponse::error("Login required"));
   };
@@ -814,8 +817,9 @@ pub async fn bilibili_topics_field_schema(
   state: State<'_, AppState>,
   partition_id: Option<i64>,
   title: Option<String>,
+  bilibili_uid: Option<i64>,
 ) -> Result<ApiResponse<Vec<ActivityTopicFieldSchema>>, String> {
-  let auth = load_auth(&state);
+  let auth = load_auth_for_uid(&state, bilibili_uid);
   let Some(auth_info) = auth else {
     return Ok(ApiResponse::error("Login required"));
   };
@@ -896,5 +900,16 @@ fn default_partitions() -> Vec<Partition> {
 }
 
 fn load_auth(state: &State<'_, AppState>) -> Option<AuthInfo> {
-  state.login_store.load_auth_info(&state.db).ok().flatten()
+  state.login_store.load_primary_auth_info(&state.db).ok().flatten()
+}
+
+fn load_auth_for_uid(state: &State<'_, AppState>, bilibili_uid: Option<i64>) -> Option<AuthInfo> {
+  if let Some(user_id) = bilibili_uid.filter(|value| *value > 0) {
+    return state
+      .login_store
+      .load_auth_info_by_uid(&state.db, user_id)
+      .ok()
+      .flatten();
+  }
+  load_auth(state)
 }
