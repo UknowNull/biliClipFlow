@@ -197,6 +197,48 @@ impl LoginStore {
     Ok(Some(user_id_value))
   }
 
+  pub fn save_login_info_without_switching(
+    &self,
+    db: &Db,
+    login_data: &Value,
+  ) -> Result<Option<i64>, LoginStoreError> {
+    let previous_active_uid = self.get_active_account_uid(db)?;
+    let previous_primary_uid = self.get_primary_account_uid(db)?;
+    let saved_user_id = self.save_login_info(db, login_data)?;
+
+    match previous_active_uid {
+      Some(user_id) if Some(user_id) != saved_user_id => {
+        self.set_active_account(db, user_id)?;
+      }
+      None if saved_user_id.is_some() => {
+        self.clear_active_account(db)?;
+        self.clear_cache()?;
+      }
+      _ => {}
+    }
+
+    if previous_primary_uid != saved_user_id {
+      crate::account_store::set_primary_bilibili_uid(db, previous_primary_uid).map_err(|err| {
+        LoginStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err))
+      })?;
+    }
+
+    match previous_active_uid {
+      Some(user_id) => {
+        if let Some(data) = self.load_login_data_by_uid(db, user_id)? {
+          self.write_cache(&data)?;
+        } else {
+          self.clear_cache()?;
+        }
+      }
+      None => {
+        self.clear_cache()?;
+      }
+    }
+
+    Ok(saved_user_id)
+  }
+
   pub fn logout(&self, db: &Db) -> Result<(), LoginStoreError> {
     if let Some(user_id) = self.get_active_account_uid(db)? {
       self.logout_by_uid(db, user_id)?;
@@ -282,6 +324,14 @@ impl LoginStore {
         },
       )
       .collect())
+  }
+
+  pub fn list_account_user_ids(&self, db: &Db) -> Result<Vec<i64>, LoginStoreError> {
+    Ok(db.with_conn(|conn| {
+      let mut stmt = conn.prepare("SELECT user_id FROM login_info ORDER BY login_time DESC")?;
+      let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+      rows.collect::<Result<Vec<_>, _>>()
+    })?)
   }
 
   pub fn get_active_account_uid(&self, db: &Db) -> Result<Option<i64>, LoginStoreError> {

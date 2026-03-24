@@ -124,6 +124,7 @@ export default function SubmissionSection({
   const [totalTasks, setTotalTasks] = useState(0);
   const [taskSearch, setTaskSearch] = useState("");
   const [selectedTask, setSelectedTask] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [detailTab, setDetailTab] = useState("basic");
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
@@ -255,7 +256,10 @@ export default function SubmissionSection({
   const isDetailView = submissionView === "detail";
   const isEditView = submissionView === "edit";
   const isRemoteImportView = submissionView === "remoteImport";
+  const canModifySelectedTask = isEditView;
   const isReadOnly = isDetailView;
+  const selectedTaskHasBvid = Boolean(String(selectedTask?.task?.bvid || "").trim());
+  const canSyncRemoteEdit = selectedTaskHasBvid;
   const groupedSourceIds = buildGroupedSourceIdSet(mergeItems);
   const quickFillPageSize = 10;
   const deleteFiles = deletePreview?.files || [];
@@ -3129,6 +3133,7 @@ export default function SubmissionSection({
     setMessage("");
     setEditBaseline(null);
     resetSegmentBindingState();
+    setDetailLoading(true);
     try {
       setSubmissionView("detail");
       setSelectedTask(null);
@@ -3161,6 +3166,8 @@ export default function SubmissionSection({
           message: `submission_detail_fail err=${error?.message || String(error || "")}`,
         });
       } catch (_) {}
+    } finally {
+      setDetailLoading(false);
     }
   };
 
@@ -3187,6 +3194,7 @@ export default function SubmissionSection({
   const handleEdit = async (taskId) => {
     setMessage("");
     resetSegmentBindingState();
+    setDetailLoading(true);
     try {
       const previousTaskId = lastEditTaskIdRef.current;
       if (previousTaskId && String(previousTaskId) !== String(taskId)) {
@@ -3215,6 +3223,8 @@ export default function SubmissionSection({
       await loadPromises;
     } catch (error) {
       setMessage(error.message);
+    } finally {
+      setDetailLoading(false);
     }
   };
 
@@ -3409,13 +3419,6 @@ export default function SubmissionSection({
         setMessage("至少需要保留一个分P");
         return;
       }
-      const incompleteSegment = segmentsForSubmit.find(
-        (segment) => segment.uploadStatus !== "SUCCESS",
-      );
-      if (incompleteSegment) {
-        setMessage("存在未上传成功的分P，请处理后再提交");
-        return;
-      }
       const emptyNameSegment = segmentsForSubmit.find(
         (segment) => !segment.partName || !segment.partName.trim(),
       );
@@ -3430,13 +3433,6 @@ export default function SubmissionSection({
         setMessage("分P文件路径不能为空");
         return;
       }
-      const missingUploadInfo = segmentsForSubmit.find(
-        (segment) => !segment.cid || !segment.fileName,
-      );
-      if (missingUploadInfo) {
-        setMessage("分P上传信息缺失，请重新上传");
-        return;
-      }
     }
     const segmentPayload = segmentsForSubmit.map((segment, index) => ({
       segmentId: segment.segmentId,
@@ -3445,6 +3441,13 @@ export default function SubmissionSection({
       segmentFilePath: segment.segmentFilePath,
       cid: segment.cid ?? null,
       fileName: segment.fileName ?? null,
+      uploadStatus: segment.uploadStatus ?? null,
+      uploadProgress:
+        typeof segment.uploadProgress === "number" ? segment.uploadProgress : null,
+      uploadUploadedBytes:
+        typeof segment.uploadUploadedBytes === "number" ? segment.uploadUploadedBytes : null,
+      uploadTotalBytes:
+        typeof segment.uploadTotalBytes === "number" ? segment.uploadTotalBytes : null,
     }));
     const selectedCollectionId = (() => {
       const raw = String(taskForm.collectionId ?? "").trim();
@@ -3480,7 +3483,7 @@ export default function SubmissionSection({
     });
     setPendingEditChangedLabel(changedLabel);
     setPendingEditNeedRemote(needEditSubmit);
-    setEditSubmitConfirmSyncRemote(true);
+    setEditSubmitConfirmSyncRemote(needEditSubmit && canSyncRemoteEdit);
     setEditSubmitConfirmOpen(true);
   };
 
@@ -3500,6 +3503,26 @@ export default function SubmissionSection({
       return;
     }
     const syncRemoteUpdate = pendingEditNeedRemote ? editSubmitConfirmSyncRemote : false;
+    if (syncRemoteUpdate && !canSyncRemoteEdit) {
+      setMessage("当前任务暂无BVID，无法同步远程，请取消勾选后仅保存本地数据");
+      return;
+    }
+    if (syncRemoteUpdate && pendingEditSubmitPayload.needEditSubmit) {
+      const incompleteSegment = pendingEditSubmitPayload.segments.find(
+        (segment) => segment.uploadStatus !== "SUCCESS",
+      );
+      if (incompleteSegment) {
+        setMessage("存在未上传成功的分P，请处理后再提交");
+        return;
+      }
+      const missingUploadInfo = pendingEditSubmitPayload.segments.find(
+        (segment) => !segment.cid || !segment.fileName,
+      );
+      if (missingUploadInfo) {
+        setMessage("分P上传信息缺失，请重新上传");
+        return;
+      }
+    }
     setSubmittingEdit(true);
     try {
       if (pendingEditSubmitPayload.needUpdateSource) {
@@ -4561,7 +4584,7 @@ export default function SubmissionSection({
     detailSegmentIds.length > 0 && detailSelectedSegmentIds.length === detailSegmentIds.length;
   const detailHasMergedVideos = (selectedTask?.mergedVideos?.length || 0) > 0;
   const canBatchBindSegments =
-    !isEditView &&
+    !canModifySelectedTask &&
     detailHasOutputSegments &&
     detailHasMergedVideos &&
     detailSelectedSegmentIds.length > 0 &&
@@ -4591,7 +4614,7 @@ export default function SubmissionSection({
     (item) => String(item.seasonId) === String(taskForm.collectionId),
   );
   const partitionOptions =
-    isEditView && taskForm.partitionId && !hasPartitionOption
+    canModifySelectedTask && taskForm.partitionId && !hasPartitionOption
       ? [
           ...partitions,
           {
@@ -4605,7 +4628,7 @@ export default function SubmissionSection({
     partitionOptions,
   );
   const collectionOptions =
-    isEditView && taskForm.collectionId && !hasCollectionOption
+    canModifySelectedTask && taskForm.collectionId && !hasCollectionOption
       ? [
           ...collections,
           {
@@ -6733,7 +6756,7 @@ export default function SubmissionSection({
         </>
       ) : null}
 
-      {(isDetailView || isEditView) && selectedTask ? (
+      {(isDetailView || isEditView) ? (
         <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -6751,32 +6774,42 @@ export default function SubmissionSection({
               返回列表
             </button>
           </div>
-          {message ? (
-            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
-              {message}
+          {detailLoading ? (
+            <div className="mt-4 rounded-lg border border-black/10 bg-white/70 px-4 py-8 text-center text-sm text-[var(--muted)]">
+              正在加载投稿任务详情...
             </div>
-          ) : null}
-          <div className="sticky top-0 z-10 -mx-6 mt-4 flex flex-wrap gap-2 border-y border-black/5 bg-[var(--surface)]/95 px-6 py-3 backdrop-blur">
-            {[
-              { key: "basic", label: "基本信息" },
-              { key: "source", label: "源视频" },
-              { key: "merged", label: "合并视频" },
-              { key: "segmentUpload", label: "分段与上传" },
-            ].map((tab) => (
-              <button
-                key={tab.key}
-                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
-                  detailTab === tab.key
-                    ? "bg-[var(--accent)] text-white"
-                    : "border border-black/10 bg-white text-[var(--ink)]"
-                }`}
-                onClick={() => setDetailTab(tab.key)}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-          {detailTab === "basic" ? (
+          ) : !selectedTask ? (
+            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-8 text-center text-sm text-amber-700">
+              {message || "未读取到投稿任务详情"}
+            </div>
+          ) : (
+            <>
+              {message ? (
+                <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                  {message}
+                </div>
+              ) : null}
+              <div className="sticky top-0 z-10 -mx-6 mt-4 flex flex-wrap gap-2 border-y border-black/5 bg-[var(--surface)]/95 px-6 py-3 backdrop-blur">
+                {[
+                  { key: "basic", label: "基本信息" },
+                  { key: "source", label: "源视频" },
+                  { key: "merged", label: "合并视频" },
+                  { key: "segmentUpload", label: "分段与上传" },
+                ].map((tab) => (
+                  <button
+                    key={tab.key}
+                    className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                      detailTab === tab.key
+                        ? "bg-[var(--accent)] text-white"
+                        : "border border-black/10 bg-white text-[var(--ink)]"
+                    }`}
+                    onClick={() => setDetailTab(tab.key)}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+              {detailTab === "basic" ? (
             <div className="mt-4 space-y-4 text-sm text-[var(--ink)]">
               <div className="grid gap-2">
                 <div>任务ID：{selectedTask.task.taskId}</div>
@@ -6785,7 +6818,7 @@ export default function SubmissionSection({
                 <div>创建时间：{formatDateTime(selectedTask.task.createdAt)}</div>
                 <div>更新时间：{formatDateTime(selectedTask.task.updatedAt)}</div>
               </div>
-              {isEditView ? (
+              {canModifySelectedTask ? (
                 <div className="rounded-xl border border-black/5 bg-white/80 p-3">
                   <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                     投稿信息
@@ -7073,10 +7106,10 @@ export default function SubmissionSection({
                 </div>
               </div>
             </div>
-          ) : null}
-          {detailTab === "source" ? (
+              ) : null}
+              {detailTab === "source" ? (
             <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
-              {isEditView ? (
+              {canModifySelectedTask ? (
                 <div className="w-full">
                   <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/5 px-4 py-3">
                     <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
@@ -7194,14 +7227,20 @@ export default function SubmissionSection({
                               <button
                                 className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
                                 onClick={() => reorderSourceVideos(index, index - 1)}
-                                disabled={sourceReorderSubmitting || index === 0}
+                                disabled={
+                                  sourceReorderSubmitting ||
+                                  index === 0
+                                }
                               >
                                 上移
                               </button>
                               <button
                                 className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
                                 onClick={() => reorderSourceVideos(index, index + 1)}
-                                disabled={sourceReorderSubmitting || index === selectedTask.sourceVideos.length - 1}
+                                disabled={
+                                  sourceReorderSubmitting ||
+                                  index === selectedTask.sourceVideos.length - 1
+                                }
                               >
                                 下移
                               </button>
@@ -7214,8 +7253,8 @@ export default function SubmissionSection({
                 </table>
               )}
             </div>
-          ) : null}
-          {detailTab === "merged" ? (
+              ) : null}
+              {detailTab === "merged" ? (
             <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/5 px-4 py-3">
                 <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">合并视频</div>
@@ -7290,7 +7329,9 @@ export default function SubmissionSection({
                         >
                           <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
                           <td
-                            className="px-4 py-2 cursor-grab select-none text-[var(--muted)]"
+                            className={`px-4 py-2 select-none text-[var(--muted)] ${
+                              "cursor-grab"
+                            }`}
                             onPointerDown={(event) => handleMergedPointerDown(event, mergedId)}
                             style={{ touchAction: "none" }}
                           >
@@ -7360,16 +7401,16 @@ export default function SubmissionSection({
                 </tbody>
               </table>
             </div>
-          ) : null}
-          {detailTab === "segmentUpload" ? (
+              ) : null}
+              {detailTab === "segmentUpload" ? (
             <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
-              {isEditView ? (
+              {canModifySelectedTask ? (
                 <div className="w-full">
                   <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/5 px-4 py-3">
                     <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                       上传进度
                     </div>
-                    <button
+                      <button
                       className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
                       onClick={handleEditSegmentAdd}
                     >
@@ -7506,7 +7547,10 @@ export default function SubmissionSection({
                       <select
                         value={segmentBindingMergedId}
                         onChange={(event) => setSegmentBindingMergedId(event.target.value)}
-                        disabled={segmentBindingSubmitting || !detailHasMergedVideos}
+                        disabled={
+                          segmentBindingSubmitting ||
+                          !detailHasMergedVideos
+                        }
                         className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         <option value="">选择合并视频</option>
@@ -7670,8 +7714,8 @@ export default function SubmissionSection({
                 </table>
               )}
             </div>
-          ) : null}
-          {isEditView ? (
+              ) : null}
+              {isEditView ? (
             <div className="mt-4 flex flex-wrap gap-2">
               <div className="w-full text-xs text-[var(--muted)]">
                 本次修改：{editChangedLabelText || "无"}
@@ -7681,10 +7725,16 @@ export default function SubmissionSection({
                 onClick={handleEditSubmit}
                 disabled={submittingEdit || coverUploading}
               >
-                {submittingEdit ? "提交中" : coverUploading ? "封面上传中" : "提交修改"}
+                {submittingEdit
+                  ? "提交中"
+                  : coverUploading
+                    ? "封面上传中"
+                    : "提交修改"}
               </button>
             </div>
-          ) : null}
+              ) : null}
+            </>
+          )}
         </div>
       ) : null}
       {mergedBindDialogOpen ? (
@@ -7788,7 +7838,11 @@ export default function SubmissionSection({
                 <div>
                   <div className="font-semibold text-[var(--ink)]">是否同步更新远程</div>
                   <div className="text-xs text-[var(--muted)]">
-                    {editSubmitConfirmSyncRemote
+                    {!canSyncRemoteEdit
+                      ? editSubmitConfirmSyncRemote
+                        ? "当前任务暂无BVID，若继续提交将被拦截；取消勾选后可仅保存本地数据。"
+                        : "当前任务暂无BVID，取消勾选后将仅保存本地数据，不会调用B站远程编辑接口。"
+                      : editSubmitConfirmSyncRemote
                       ? "勾选后将同步调用B站远程编辑接口。"
                       : "不勾选时仅更新本地数据，后续重投稿/重分段时再同步。"}
                   </div>

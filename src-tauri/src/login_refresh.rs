@@ -52,7 +52,7 @@ pub fn start_cookie_refresh_loop(
 ) {
   tauri::async_runtime::spawn(async move {
     loop {
-      let result = refresh_cookie_if_needed(
+      let result = refresh_all_cookies_if_needed(
         bilibili.as_ref(),
         login_store.as_ref(),
         db.as_ref(),
@@ -80,52 +80,41 @@ pub async fn refresh_cookie(
   log_path: &Path,
 ) -> Result<AuthInfo, String> {
   let _guard = refresh_lock().lock().await;
-  append_log(log_path, "cookie_refresh_start");
-  let login_data = login_store
-    .load_login_data(db)
-    .map_err(|err| format!("读取登录信息失败: {}", err))?
-    .ok_or_else(|| "请先登录".to_string())?;
-  let cookie = extract_cookie(&login_data).ok_or_else(|| "登录信息缺少Cookie".to_string())?;
-  let csrf = extract_csrf(&cookie).ok_or_else(|| "登录信息缺少CSRF".to_string())?;
-  let refresh_token = login_store
-    .load_refresh_token(db)
-    .map_err(|err| format!("读取refresh_token失败: {}", err))?
-    .filter(|token| !token.trim().is_empty())
-    .ok_or_else(|| "登录信息缺少refresh_token".to_string())?;
-
-  let client = Client::new();
-  let info = fetch_cookie_refresh_info(&client, bilibili, &cookie, &csrf).await?;
-  append_log(
-    log_path,
-    &format!(
-      "cookie_refresh_info refresh={} timestamp={}",
-      info.refresh, info.timestamp
-    ),
-  );
-
-  let correspond_path = build_correspond_path(info.timestamp)?;
-  let refresh_csrf = fetch_refresh_csrf(&client, &cookie, &correspond_path).await?;
-  let old_refresh_token = refresh_token.clone();
-
-  let (new_cookie, new_refresh_token) = do_refresh_cookie(
+  let active_uid = login_store
+    .get_active_account_uid(db)
+    .map_err(|err| format!("读取当前账号失败: {}", err))?;
+  let target_uid = active_uid.ok_or_else(|| "请先登录".to_string())?;
+  let auth_info = refresh_cookie_by_uid_inner(
     bilibili,
-    &client,
-    &cookie,
-    &csrf,
-    &refresh_token,
-    &old_refresh_token,
-    refresh_csrf,
+    login_store,
+    db,
+    log_path,
+    target_uid,
+    false,
   )
-  .await?;
-  let new_login_data = build_refreshed_login_data(&login_data, new_cookie, new_refresh_token);
-  login_store
-    .save_login_info(db, &new_login_data)
-    .map_err(|err| format!("保存刷新Cookie失败: {}", err))?;
-  let auth_info = login_store
-    .load_auth_info(db)
-    .map_err(|err| format!("读取刷新登录信息失败: {}", err))?
-    .ok_or_else(|| "刷新后登录信息无效".to_string())?;
-  append_log(log_path, "cookie_refresh_ok");
+  .await?
+  .ok_or_else(|| "刷新后登录信息无效".to_string())?;
+  Ok(auth_info)
+}
+
+pub async fn refresh_cookie_by_uid(
+  bilibili: &BilibiliClient,
+  login_store: &LoginStore,
+  db: &Db,
+  log_path: &Path,
+  user_id: i64,
+) -> Result<AuthInfo, String> {
+  let _guard = refresh_lock().lock().await;
+  let auth_info = refresh_cookie_by_uid_inner(
+    bilibili,
+    login_store,
+    db,
+    log_path,
+    user_id,
+    false,
+  )
+  .await?
+  .ok_or_else(|| "刷新后登录信息无效".to_string())?;
   Ok(auth_info)
 }
 
@@ -136,23 +125,84 @@ pub async fn refresh_cookie_if_needed(
   log_path: &Path,
 ) -> Result<bool, String> {
   let _guard = refresh_lock().lock().await;
+  let active_uid = login_store
+    .get_active_account_uid(db)
+    .map_err(|err| format!("读取当前账号失败: {}", err))?;
+  let Some(target_uid) = active_uid else {
+    return Ok(false);
+  };
+  refresh_cookie_by_uid_inner(bilibili, login_store, db, log_path, target_uid, true)
+    .await
+    .map(|value| value.is_some())
+}
+
+pub async fn refresh_all_cookies_if_needed(
+  bilibili: &BilibiliClient,
+  login_store: &LoginStore,
+  db: &Db,
+  log_path: &Path,
+) -> Result<(), String> {
+  let _guard = refresh_lock().lock().await;
+  let user_ids = login_store
+    .list_account_user_ids(db)
+    .map_err(|err| format!("读取账号列表失败: {}", err))?;
+  if user_ids.is_empty() {
+    return Ok(());
+  }
+  for user_id in user_ids {
+    let result =
+      refresh_cookie_by_uid_inner(bilibili, login_store, db, log_path, user_id, true).await;
+    match result {
+      Ok(Some(_)) => {
+        append_log(log_path, &format!("cookie_refresh_account_ok uid={}", user_id));
+      }
+      Ok(None) => {
+        append_log(log_path, &format!("cookie_refresh_account_skip uid={}", user_id));
+      }
+      Err(err) => {
+        append_log(
+          log_path,
+          &format!("cookie_refresh_account_fail uid={} err={}", user_id, err),
+        );
+      }
+    }
+  }
+  Ok(())
+}
+
+async fn refresh_cookie_by_uid_inner(
+  bilibili: &BilibiliClient,
+  login_store: &LoginStore,
+  db: &Db,
+  log_path: &Path,
+  user_id: i64,
+  only_if_needed: bool,
+) -> Result<Option<AuthInfo>, String> {
+  append_log(
+    log_path,
+    &format!(
+      "cookie_refresh_start uid={} mode={}",
+      user_id,
+      if only_if_needed { "if_needed" } else { "force" }
+    ),
+  );
   let login_data = match login_store
-    .load_login_data(db)
+    .load_login_data_by_uid(db, user_id)
     .map_err(|err| format!("读取登录信息失败: {}", err))?
   {
     Some(data) => data,
-    None => return Ok(false),
+    None => return Ok(None),
   };
   let cookie = extract_cookie(&login_data).ok_or_else(|| "登录信息缺少Cookie".to_string())?;
   let csrf = extract_csrf(&cookie).ok_or_else(|| "登录信息缺少CSRF".to_string())?;
   let refresh_token = login_store
-    .load_refresh_token(db)
+    .load_refresh_token_by_uid(db, user_id)
     .map_err(|err| format!("读取refresh_token失败: {}", err))?
     .filter(|token| !token.trim().is_empty())
     .ok_or_else(|| "登录信息缺少refresh_token".to_string())?;
 
   let client = Client::new();
-  let expired = load_login_expire_time(db)?
+  let expired = load_login_expire_time_by_uid(db, user_id)?
     .map(|expire_time| expire_time <= Utc::now())
     .unwrap_or(false);
   let login_invalid = match check_login_status(&client, bilibili, &cookie).await {
@@ -160,14 +210,17 @@ pub async fn refresh_cookie_if_needed(
       append_log(
         log_path,
         &format!(
-          "cookie_login_check code={} is_login={} message={}",
-          info.code, info.is_login, info.message
+          "cookie_login_check uid={} code={} is_login={} message={}",
+          user_id, info.code, info.is_login, info.message
         ),
       );
       info.code == -101 || !info.is_login
     }
     Err(err) => {
-      append_log(log_path, &format!("cookie_login_check_fail err={}", err));
+      append_log(
+        log_path,
+        &format!("cookie_login_check_fail uid={} err={}", user_id, err),
+      );
       false
     }
   };
@@ -175,12 +228,12 @@ pub async fn refresh_cookie_if_needed(
   append_log(
     log_path,
     &format!(
-      "cookie_refresh_check refresh={} expired={} timestamp={}",
-      info.refresh, expired, info.timestamp
+      "cookie_refresh_check uid={} refresh={} expired={} timestamp={}",
+      user_id, info.refresh, expired, info.timestamp
     ),
   );
-  if !info.refresh && !expired && !login_invalid {
-    return Ok(false);
+  if only_if_needed && !info.refresh && !expired && !login_invalid {
+    return Ok(None);
   }
   let correspond_path = build_correspond_path(info.timestamp)?;
   let refresh_csrf = fetch_refresh_csrf(&client, &cookie, &correspond_path).await?;
@@ -197,18 +250,19 @@ pub async fn refresh_cookie_if_needed(
   .await?;
   let new_login_data = build_refreshed_login_data(&login_data, new_cookie, new_refresh_token);
   login_store
-    .save_login_info(db, &new_login_data)
+    .save_login_info_without_switching(db, &new_login_data)
     .map_err(|err| format!("保存刷新Cookie失败: {}", err))?;
-  append_log(log_path, "cookie_refresh_check_ok");
-  Ok(true)
+  let auth_info = login_store
+    .load_auth_info_by_uid(db, user_id)
+    .map_err(|err| format!("读取刷新登录信息失败: {}", err))?;
+  append_log(log_path, &format!("cookie_refresh_ok uid={}", user_id));
+  Ok(auth_info)
 }
 
-fn load_login_expire_time(db: &Db) -> Result<Option<DateTime<Utc>>, String> {
+fn load_login_expire_time_by_uid(db: &Db, user_id: i64) -> Result<Option<DateTime<Utc>>, String> {
   db.with_conn(|conn| {
-    let mut stmt = conn.prepare(
-      "SELECT expire_time FROM login_info ORDER BY login_time DESC LIMIT 1",
-    )?;
-    let mut rows = stmt.query([])?;
+    let mut stmt = conn.prepare("SELECT expire_time FROM login_info WHERE user_id = ?1 LIMIT 1")?;
+    let mut rows = stmt.query([user_id])?;
     if let Some(row) = rows.next()? {
       let expire_time: Option<String> = row.get(0)?;
       if let Some(expire_time) = expire_time {

@@ -152,42 +152,56 @@ impl Db {
       "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES ('active_baidu_uid', '', datetime('now'))",
       [],
     );
-    let _ = conn.execute(
-      "INSERT INTO baidu_account_info (uid, status, username, login_type, login_time, last_check_time, create_time, update_time) \
-       SELECT uid, status, username, login_type, login_time, last_check_time, create_time, update_time \
-       FROM baidu_login_info \
-       WHERE uid IS NOT NULL AND TRIM(uid) <> '' \
-       ON CONFLICT(uid) DO UPDATE SET \
-         status = excluded.status, \
-         username = excluded.username, \
-         login_type = excluded.login_type, \
-         login_time = excluded.login_time, \
-         last_check_time = excluded.last_check_time, \
-         update_time = excluded.update_time",
-      [],
-    );
-    let legacy_baidu_uid = conn
-      .query_row(
-        "SELECT uid FROM baidu_login_info WHERE uid IS NOT NULL AND TRIM(uid) <> '' LIMIT 1",
-        [],
-        |row| row.get::<_, String>(0),
-      )
-      .optional()?;
-    if let Some(uid) = legacy_baidu_uid.as_deref() {
+    let baidu_account_count = conn
+      .query_row("SELECT COUNT(*) FROM baidu_account_info", [], |row| row.get::<_, i64>(0))
+      .unwrap_or(0);
+    if baidu_account_count == 0 {
       let _ = conn.execute(
-        "INSERT INTO baidu_account_credential (baidu_uid, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error, create_time, update_time) \
-         SELECT ?1, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error, create_time, update_time \
-         FROM baidu_login_credential WHERE id = 1 \
-         ON CONFLICT(baidu_uid) DO UPDATE SET \
+        "INSERT INTO baidu_account_info (uid, status, username, login_type, login_time, last_check_time, create_time, update_time) \
+         SELECT uid, status, username, login_type, login_time, last_check_time, create_time, update_time \
+         FROM baidu_login_info \
+         WHERE uid IS NOT NULL AND TRIM(uid) <> '' \
+         ON CONFLICT(uid) DO UPDATE SET \
+           status = excluded.status, \
+           username = excluded.username, \
            login_type = excluded.login_type, \
-           cookie = excluded.cookie, \
-           bduss = excluded.bduss, \
-           stoken = excluded.stoken, \
-           last_attempt_time = excluded.last_attempt_time, \
-           last_attempt_error = excluded.last_attempt_error, \
+           login_time = excluded.login_time, \
+           last_check_time = excluded.last_check_time, \
            update_time = excluded.update_time",
-        [uid],
+        [],
       );
+    }
+    let baidu_credential_count = conn
+      .query_row(
+        "SELECT COUNT(*) FROM baidu_account_credential",
+        [],
+        |row| row.get::<_, i64>(0),
+      )
+      .unwrap_or(0);
+    if baidu_credential_count == 0 {
+      let legacy_baidu_uid = conn
+        .query_row(
+          "SELECT uid FROM baidu_login_info WHERE uid IS NOT NULL AND TRIM(uid) <> '' LIMIT 1",
+          [],
+          |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+      if let Some(uid) = legacy_baidu_uid.as_deref() {
+        let _ = conn.execute(
+          "INSERT INTO baidu_account_credential (baidu_uid, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error, create_time, update_time) \
+           SELECT ?1, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error, create_time, update_time \
+           FROM baidu_login_credential WHERE id = 1 \
+           ON CONFLICT(baidu_uid) DO UPDATE SET \
+             login_type = excluded.login_type, \
+             cookie = excluded.cookie, \
+             bduss = excluded.bduss, \
+             stoken = excluded.stoken, \
+             last_attempt_time = excluded.last_attempt_time, \
+             last_attempt_error = excluded.last_attempt_error, \
+             update_time = excluded.update_time",
+          [uid],
+        );
+      }
     }
     let active_bilibili_uid = conn
       .query_row(
