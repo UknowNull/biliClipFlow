@@ -6,8 +6,8 @@ use tokio::time::{sleep, Duration};
 
 use tauri::Manager;
 
-mod api;
 mod account_store;
+mod api;
 mod app_log;
 mod baidu_sync;
 mod bilibili;
@@ -59,7 +59,12 @@ fn init_panic_log(path: Arc<std::path::PathBuf>) {
             .unwrap_or_else(|| "unknown".to_string());
         app_log::append_log(
             &path,
-            &format!("panic ts={} location={} info={}", app_log::now_millis(), location, info),
+            &format!(
+                "panic ts={} location={} info={}",
+                app_log::now_millis(),
+                location,
+                info
+            ),
         );
     }));
 }
@@ -91,7 +96,8 @@ pub fn run() {
             let download_dir = commands::settings::load_download_settings_from_db(&db)
                 .map(|settings| settings.download_path)
                 .unwrap_or_else(|_| config::default_download_dir().to_string_lossy().to_string());
-            let log_dir = commands::settings::ensure_log_dir(&db, std::path::Path::new(&download_dir));
+            let log_dir =
+                commands::settings::ensure_log_dir(&db, std::path::Path::new(&download_dir));
             let log_dir = std::path::PathBuf::from(log_dir);
             let log_path = log_dir.join("auth_debug.log");
             let app_log_path = log_dir.join("app_debug.log");
@@ -281,6 +287,7 @@ pub fn run() {
             commands::submission::submission_delete_preview,
             commands::submission::submission_detail,
             commands::submission::submission_bind_merged_remote_file,
+            commands::submission::submission_clear_merged_remote_file,
             commands::submission::submission_reorder_source_videos,
             commands::submission::submission_reorder_merged_videos,
             commands::submission::submission_bind_merged_sources,

@@ -49,11 +49,55 @@ const buildMergeGroupId = () =>
 const emptySource = (index) => ({
   localId: buildSourceId(),
   sourceFilePath: "",
+  remoteBvid: "",
   sortOrder: index + 1,
   startTime: "00:00:00",
   endTime: "00:00:00",
   durationSeconds: 0,
 });
+
+const cloneSource = (source, index) => ({
+  ...source,
+  localId: buildSourceId(),
+  sortOrder: index + 1,
+});
+
+const insertSourceBelow = (items, index, source) => {
+  const next = [...(items || [])];
+  next.splice(index + 1, 0, cloneSource(source, index + 1));
+  return next.map((item, idx) => ({ ...item, sortOrder: idx + 1 }));
+};
+
+const insertMergeItemClone = (items, sourceId, clonedId) => {
+  const next = [];
+  let inserted = false;
+  for (const item of items || []) {
+    if (item.type === "GROUP" && Array.isArray(item.sourceIds) && item.sourceIds.includes(sourceId)) {
+      next.push({
+        ...item,
+        sourceIds: item.sourceIds.flatMap((id) =>
+          id === sourceId ? [id, clonedId] : [id],
+        ),
+      });
+      inserted = true;
+      continue;
+    }
+    next.push(item);
+    if (item.type === "SOURCE" && item.sourceId === sourceId) {
+      next.push({
+        id: clonedId,
+        type: "SOURCE",
+        sourceId: clonedId,
+        standalone: Boolean(item.standalone),
+      });
+      inserted = true;
+    }
+  }
+  if (!inserted) {
+    next.push({ id: clonedId, type: "SOURCE", sourceId: clonedId, standalone: false });
+  }
+  return next;
+};
 
 const defaultWorkflowConfig = {
   segmentationConfig: {
@@ -207,6 +251,7 @@ export default function SubmissionSection({
   const [remoteFilePickerPath, setRemoteFilePickerPath] = useState("/");
   const [bindingMergedVideo, setBindingMergedVideo] = useState(null);
   const [bindingRemoteFile, setBindingRemoteFile] = useState(false);
+  const [clearingMergedRemoteId, setClearingMergedRemoteId] = useState(0);
   const [deleteMergedOpen, setDeleteMergedOpen] = useState(false);
   const [deleteMergedTarget, setDeleteMergedTarget] = useState(null);
   const [deleteMergedLocalFile, setDeleteMergedLocalFile] = useState(false);
@@ -233,6 +278,7 @@ export default function SubmissionSection({
   const [editingSegmentId, setEditingSegmentId] = useState("");
   const [editingSegmentName, setEditingSegmentName] = useState("");
   const [draggingSegmentId, setDraggingSegmentId] = useState("");
+  const [draggingSourceRowId, setDraggingSourceRowId] = useState("");
   const [editSubmitConfirmOpen, setEditSubmitConfirmOpen] = useState(false);
   const [editSubmitConfirmSyncRemote, setEditSubmitConfirmSyncRemote] = useState(true);
   const [pendingEditSubmitPayload, setPendingEditSubmitPayload] = useState(null);
@@ -247,6 +293,7 @@ export default function SubmissionSection({
   const lastDetailTaskIdRef = useRef(null);
   const lastEditTaskIdRef = useRef(null);
   const dragStateRef = useRef({ activeId: "", overId: "" });
+  const sourceDragStateRef = useRef({ activeId: "", overId: "" });
   const mergedDragStateRef = useRef({ activeId: "", overId: "" });
   const mergeDragStateRef = useRef({ activeId: "", overId: "" });
   const mergeGroupDragStateRef = useRef({ groupId: "", activeId: "", overId: "" });
@@ -482,8 +529,11 @@ export default function SubmissionSection({
     setActivityDropdownOpen(false);
     setActivityMessage("");
     resetFormState();
-    await loadPartitions();
-    await loadCollections();
+    const currentProfile = await loadCurrentUpProfile();
+    const effectiveUid = String(
+      currentProfile?.effectiveUid || selectedBilibiliUid || currentUpProfile?.uid || "",
+    );
+    await Promise.all([loadPartitions(effectiveUid), loadCollections(effectiveUid)]);
     await loadBaiduSyncSettings();
   };
 
@@ -725,9 +775,11 @@ export default function SubmissionSection({
     resetSegmentBindingState();
   };
 
-  const loadPartitions = async () => {
+  const loadPartitions = async (bilibiliUidOverride = "") => {
     try {
-      const currentBilibiliUid = Number(selectedBilibiliUid || currentUpProfile?.uid || 0);
+      const currentBilibiliUid = Number(
+        bilibiliUidOverride || selectedBilibiliUid || currentUpProfile?.uid || 0,
+      );
       const data = await invokeCommand("bilibili_partitions", {
         bilibiliUid: Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0
           ? currentBilibiliUid
@@ -750,7 +802,7 @@ export default function SubmissionSection({
     }
   };
 
-  const loadCollections = async () => {
+  const loadCollections = async (bilibiliUidOverride = "") => {
     try {
       await invokeCommand("auth_client_log", {
         message: "collections_load_start",
@@ -769,8 +821,15 @@ export default function SubmissionSection({
       const profile = extractCurrentAuthProfile(auth);
       setCurrentUpProfile(profile);
       setBilibiliAccounts(Array.isArray(auth?.accounts) ? auth.accounts : []);
-      const effectiveUid = String(selectedBilibiliUid || auth?.activeAccount?.userId || profile.uid || "");
-      setSelectedBilibiliUid((prev) => prev || effectiveUid);
+      const effectiveUid = String(
+        bilibiliUidOverride || selectedBilibiliUid || auth?.activeAccount?.userId || profile.uid || "",
+      );
+      setSelectedBilibiliUid((prev) => {
+        if (prev === effectiveUid) {
+          return prev;
+        }
+        return prev || effectiveUid;
+      });
       const mid = Number(effectiveUid || profile.uid || 0);
       await invokeCommand("auth_client_log", {
         message: `collections_mid=${mid || 0}`,
@@ -839,13 +898,19 @@ export default function SubmissionSection({
     try {
       const auth = await invokeCommand("auth_status");
       const profile = extractCurrentAuthProfile(auth);
+      const effectiveUid = String(auth?.activeAccount?.userId || profile.uid || "");
       setCurrentUpProfile(profile);
       setBilibiliAccounts(Array.isArray(auth?.accounts) ? auth.accounts : []);
       setSelectedBilibiliUid((prev) => {
-        const nextUid = String(auth?.activeAccount?.userId || profile.uid || "");
-        return prev || nextUid;
+        return prev || effectiveUid;
       });
+      return {
+        auth,
+        profile,
+        effectiveUid,
+      };
     } catch (_) {}
+    return null;
   };
 
   const handleBilibiliAccountChange = async (nextUid) => {
@@ -865,7 +930,7 @@ export default function SubmissionSection({
       setBilibiliAccounts(Array.isArray(auth?.accounts) ? auth.accounts : []);
       const nextSelectedUid = String(auth?.activeAccount?.userId || profile.uid || normalized);
       setSelectedBilibiliUid(nextSelectedUid);
-      await loadCollections();
+      await Promise.all([loadPartitions(nextSelectedUid), loadCollections(nextSelectedUid)]);
       await loadTasks(
         statusFilter,
         1,
@@ -1447,6 +1512,46 @@ export default function SubmissionSection({
     }
   };
 
+  const handleClearMergedRemoteBinding = async (mergedVideo) => {
+    const taskId = String(selectedTask?.task?.taskId || "").trim();
+    const mergedId = Number(mergedVideo?.id || 0);
+    if (!taskId || !mergedId) {
+      setMessage("合并视频信息不完整，无法清空绑定");
+      return;
+    }
+    const remotePath = resolveMergedRemotePath(mergedVideo);
+    if (!remotePath || remotePath === "-") {
+      setMessage("当前合并视频未绑定网盘文件");
+      return;
+    }
+    const confirmed = await dialogConfirm(
+      `确认清空该合并视频的网盘绑定吗？\n当前绑定：${remotePath}`,
+      {
+        title: "清空网盘绑定",
+        kind: "warning",
+      },
+    );
+    if (!confirmed) {
+      return;
+    }
+    setClearingMergedRemoteId(mergedId);
+    try {
+      await invokeCommand("submission_clear_merged_remote_file", {
+        request: {
+          taskId,
+          mergedId,
+        },
+      });
+      const detail = await fetchTaskDetail(taskId, { log: false });
+      setSelectedTask(detail);
+      setMessage("已清空网盘绑定");
+    } catch (error) {
+      setMessage(error?.message || "清空网盘绑定失败");
+    } finally {
+      setClearingMergedRemoteId(0);
+    }
+  };
+
   const reorderSourceVideos = async (fromIndex, toIndex) => {
     const taskId = String(selectedTask?.task?.taskId || "").trim();
     const sources = Array.isArray(selectedTask?.sourceVideos) ? selectedTask.sourceVideos : [];
@@ -1798,10 +1903,28 @@ export default function SubmissionSection({
   };
 
   useEffect(() => {
-    loadPartitions();
-    loadCollections();
-    loadBaiduSyncSettings();
-    loadCurrentUpProfile();
+    let disposed = false;
+
+    const initializeSubmissionView = async () => {
+      const currentProfile = await loadCurrentUpProfile();
+      if (disposed) {
+        return;
+      }
+      const effectiveUid = String(
+        currentProfile?.effectiveUid || normalizedActiveBilibiliUid || selectedBilibiliUid || "",
+      );
+      await Promise.all([loadPartitions(effectiveUid), loadCollections(effectiveUid)]);
+      if (disposed) {
+        return;
+      }
+      await loadBaiduSyncSettings();
+    };
+
+    initializeSubmissionView();
+
+    return () => {
+      disposed = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -1811,6 +1934,8 @@ export default function SubmissionSection({
     setSelectedBilibiliUid((prev) =>
       prev === normalizedActiveBilibiliUid ? prev : normalizedActiveBilibiliUid,
     );
+    loadPartitions(normalizedActiveBilibiliUid);
+    loadCollections(normalizedActiveBilibiliUid);
   }, [normalizedActiveBilibiliUid]);
 
   useEffect(() => {
@@ -1962,6 +2087,26 @@ export default function SubmissionSection({
 
   const addSource = () => {
     setSourceVideos((prev) => [...prev, emptySource(prev.length)]);
+  };
+
+  const duplicateSource = (index) => {
+    const target = sourceVideos[index];
+    if (!target) {
+      return;
+    }
+    const nextSources = insertSourceBelow(sourceVideos, index, target);
+    const clonedSource = nextSources[index + 1];
+    setSourceVideos(nextSources);
+    if (clonedSource?.localId && target.localId) {
+      setMergeItems((prev) => insertMergeItemClone(prev, target.localId, clonedSource.localId));
+    }
+    setMergeSelection((prev) => {
+      const next = new Set(prev);
+      if (clonedSource?.localId) {
+        next.delete(clonedSource.localId);
+      }
+      return next;
+    });
   };
 
   const updateSource = (index, field, value) => {
@@ -2341,6 +2486,7 @@ export default function SubmissionSection({
           sources: [
             {
               sourceFilePath: source.sourceFilePath,
+              remoteBvid: source.remoteBvid || null,
               startTime: source.startTime || null,
               endTime: source.endTime || null,
               sortOrder: 1,
@@ -2350,6 +2496,7 @@ export default function SubmissionSection({
       } else {
         remainingSources.push({
           sourceFilePath: source.sourceFilePath,
+          remoteBvid: source.remoteBvid || null,
           startTime: source.startTime || null,
           endTime: source.endTime || null,
         });
@@ -2459,6 +2606,15 @@ export default function SubmissionSection({
         </td>
         <td className="px-4 py-2">
           <input
+            value={source.remoteBvid || ""}
+            onChange={(event) => updateSource(sourceIndex, "remoteBvid", event.target.value)}
+            placeholder="可选，填写源视频 BV 号"
+            readOnly={isReadOnly}
+            className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+          />
+        </td>
+        <td className="px-4 py-2">
+          <input
             value={source.startTime}
             onChange={(event) => updateSourceTime(sourceIndex, "startTime", event.target.value)}
             onBlur={() => normalizeSourceTime(sourceIndex, "startTime")}
@@ -2482,12 +2638,20 @@ export default function SubmissionSection({
         </td>
         <td className="px-4 py-2">
           {!isReadOnly ? (
-            <button
-              className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-              onClick={() => removeSource(sourceIndex)}
-            >
-              删除
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={() => duplicateSource(sourceIndex)}
+              >
+                复制
+              </button>
+              <button
+                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={() => removeSource(sourceIndex)}
+              >
+                删除
+              </button>
+            </div>
           ) : null}
         </td>
       </tr>
@@ -2496,6 +2660,16 @@ export default function SubmissionSection({
 
   const addUpdateSource = () => {
     setUpdateSourceVideos((prev) => [...prev, emptySource(prev.length)]);
+  };
+
+  const duplicateUpdateSource = (index) => {
+    setUpdateSourceVideos((prev) => {
+      const target = prev[index];
+      if (!target) {
+        return prev;
+      }
+      return insertSourceBelow(prev, index, target);
+    });
   };
 
   const updateUpdateSource = (index, field, value) => {
@@ -2713,6 +2887,7 @@ export default function SubmissionSection({
           },
           sourceVideos: validSources.map((item, index) => ({
             sourceFilePath: item.sourceFilePath,
+            remoteBvid: item.remoteBvid || null,
             sortOrder: index + 1,
             startTime: item.startTime || null,
             endTime: item.endTime || null,
@@ -2769,6 +2944,7 @@ export default function SubmissionSection({
           baiduSyncFilename: updateBaiduSync.filename || null,
           sourceVideos: validSources.map((item, index) => ({
             sourceFilePath: item.sourceFilePath,
+            remoteBvid: item.remoteBvid || null,
             sortOrder: index + 1,
             startTime: item.startTime || null,
             endTime: item.endTime || null,
@@ -3033,6 +3209,7 @@ export default function SubmissionSection({
     const sources = (detail?.sourceVideos || []).map((item, index) => ({
       localId: buildSourceId(),
       sourceFilePath: item.sourceFilePath || "",
+      remoteBvid: item.remoteBvid || "",
       sortOrder: index + 1,
       startTime: item.startTime || "00:00:00",
       endTime: item.endTime || "00:00:00",
@@ -3384,6 +3561,7 @@ export default function SubmissionSection({
       }
       sourcePayload = sourceValidation.validSources.map((item, index) => ({
         sourceFilePath: item.sourceFilePath,
+        remoteBvid: item.remoteBvid || null,
         sortOrder: index + 1,
         startTime: item.startTime || null,
         endTime: item.endTime || null,
@@ -3705,6 +3883,63 @@ export default function SubmissionSection({
     });
   };
 
+  const reorderEditableSources = (sourceId, targetId) => {
+    setSourceVideos((prev) => {
+      const fromIndex = prev.findIndex((item) => item.localId === sourceId);
+      const toIndex = prev.findIndex((item) => item.localId === targetId);
+      if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
+        return prev;
+      }
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next.map((item, index) => ({ ...item, sortOrder: index + 1 }));
+    });
+  };
+
+  const handleEditSourcePointerDown = (event, sourceId) => {
+    if (event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget?.setPointerCapture) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
+    sourceDragStateRef.current = { activeId: sourceId, overId: sourceId };
+    setDraggingSourceRowId(sourceId);
+  };
+
+  const trackPointerOverEditSource = (event) => {
+    const { activeId } = sourceDragStateRef.current;
+    if (!activeId) {
+      return;
+    }
+    const { clientX, clientY } = event;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+      return;
+    }
+    const target = document.elementFromPoint(clientX, clientY);
+    if (!target || typeof target.closest !== "function") {
+      return;
+    }
+    const row = target.closest("tr[data-edit-source-id]");
+    const overId = String(row?.dataset?.editSourceId || "").trim();
+    if (!overId || overId === sourceDragStateRef.current.overId) {
+      return;
+    }
+    sourceDragStateRef.current.overId = overId;
+    reorderEditableSources(activeId, overId);
+  };
+
+  const endEditSourcePointerDrag = () => {
+    if (!sourceDragStateRef.current.activeId) {
+      return;
+    }
+    sourceDragStateRef.current = { activeId: "", overId: "" };
+    setDraggingSourceRowId("");
+  };
+
   const handleSegmentPointerDown = (event, segmentId) => {
     if (event.button !== 0) {
       return;
@@ -3797,6 +4032,26 @@ export default function SubmissionSection({
       window.removeEventListener("pointercancel", handleUp);
     };
   }, [draggingMergedId]);
+
+  useEffect(() => {
+    if (!draggingSourceRowId) {
+      return undefined;
+    }
+    const handleMove = (event) => {
+      trackPointerOverEditSource(event);
+    };
+    const handleUp = () => {
+      endEditSourcePointerDrag();
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+  }, [draggingSourceRowId]);
 
   useEffect(() => {
     setMergeItems((prev) => {
@@ -5305,6 +5560,7 @@ export default function SubmissionSection({
                 <th className="px-4 py-2">选择</th>
                 <th className="px-4 py-2">独立分组</th>
                 <th className="px-4 py-2">视频文件（必填）</th>
+                <th className="px-4 py-2">源视频 BV 号</th>
                 <th className="px-4 py-2">开始时间</th>
                 <th className="px-4 py-2">结束时间</th>
                 <th className="px-4 py-2">合并状态</th>
@@ -5314,7 +5570,7 @@ export default function SubmissionSection({
             <tbody>
               {mergeItems.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-3 text-[var(--muted)]" colSpan={8}>
+                  <td className="px-4 py-3 text-[var(--muted)]" colSpan={9}>
                     暂无配置
                   </td>
                 </tr>
@@ -5662,6 +5918,7 @@ export default function SubmissionSection({
                       <tr>
                         <th className="px-4 py-2">序号</th>
                         <th className="px-4 py-2">视频文件（必填）</th>
+                        <th className="px-4 py-2">源视频 BV 号</th>
                         <th className="px-4 py-2">开始时间</th>
                         <th className="px-4 py-2">结束时间</th>
                         <th className="px-4 py-2">操作</th>
@@ -5669,7 +5926,10 @@ export default function SubmissionSection({
                     </thead>
                     <tbody>
                       {updateSourceVideos.map((item, index) => (
-                        <tr key={`update-source-${index}`} className="border-t border-black/5">
+                        <tr
+                          key={item.localId || `update-source-${index}`}
+                          className="border-t border-black/5"
+                        >
                           <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
                           <td className="px-4 py-2">
                             <div className="flex flex-wrap gap-2">
@@ -5688,6 +5948,16 @@ export default function SubmissionSection({
                                 选择
                               </button>
                             </div>
+                          </td>
+                          <td className="px-4 py-2">
+                            <input
+                              value={item.remoteBvid || ""}
+                              onChange={(event) =>
+                                updateUpdateSource(index, "remoteBvid", event.target.value)
+                              }
+                              placeholder="可选，填写源视频 BV 号"
+                              className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                            />
                           </td>
                           <td className="px-4 py-2">
                             <input
@@ -5712,12 +5982,20 @@ export default function SubmissionSection({
                             />
                           </td>
                           <td className="px-4 py-2">
-                            <button
-                              className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                              onClick={() => removeUpdateSource(index)}
-                            >
-                              删除
-                            </button>
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                                onClick={() => duplicateUpdateSource(index)}
+                              >
+                                复制
+                              </button>
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                                onClick={() => removeUpdateSource(index)}
+                              >
+                                删除
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -7127,6 +7405,7 @@ export default function SubmissionSection({
                       <tr>
                         <th className="px-4 py-2">序号</th>
                         <th className="px-4 py-2">视频文件路径</th>
+                        <th className="px-4 py-2">源视频 BV 号</th>
                         <th className="px-4 py-2">开始时间</th>
                         <th className="px-4 py-2">结束时间</th>
                         <th className="px-4 py-2">操作</th>
@@ -7135,14 +7414,33 @@ export default function SubmissionSection({
                     <tbody>
                       {sourceVideos.length === 0 ? (
                         <tr>
-                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
+                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
                             暂无源视频
                           </td>
                         </tr>
                       ) : (
                         sourceVideos.map((item, index) => (
-                          <tr key={`edit-source-${index}`} className="border-t border-black/5">
-                            <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                          <tr
+                            key={item.localId || `edit-source-${index}`}
+                            data-edit-source-id={item.localId || ""}
+                            className={`border-t border-black/5 ${
+                              draggingSourceRowId === item.localId ? "bg-black/5" : ""
+                            }`}
+                          >
+                            <td className="px-4 py-2 text-[var(--muted)]">
+                              <div className="flex items-center gap-2">
+                                <span
+                                  className="cursor-grab select-none text-[var(--muted)]"
+                                  onPointerDown={(event) =>
+                                    handleEditSourcePointerDown(event, item.localId)
+                                  }
+                                  style={{ touchAction: "none" }}
+                                >
+                                  ≡
+                                </span>
+                                <span>{index + 1}</span>
+                              </div>
+                            </td>
                             <td className="px-4 py-2">
                               <div className="flex flex-wrap gap-2">
                                 <input
@@ -7160,6 +7458,16 @@ export default function SubmissionSection({
                                   选择
                                 </button>
                               </div>
+                            </td>
+                            <td className="px-4 py-2">
+                              <input
+                                value={item.remoteBvid || ""}
+                                onChange={(event) =>
+                                  updateSource(index, "remoteBvid", event.target.value)
+                                }
+                                placeholder="可选，填写源视频 BV 号"
+                                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                              />
                             </td>
                             <td className="px-4 py-2">
                               <input
@@ -7184,12 +7492,20 @@ export default function SubmissionSection({
                               />
                             </td>
                             <td className="px-4 py-2">
-                              <button
-                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                                onClick={() => removeSource(index)}
-                              >
-                                删除
-                              </button>
+                              <div className="flex flex-wrap gap-2">
+                                <button
+                                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                                  onClick={() => duplicateSource(index)}
+                                >
+                                  复制
+                                </button>
+                                <button
+                                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                                  onClick={() => removeSource(index)}
+                                >
+                                  删除
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         ))
@@ -7203,6 +7519,7 @@ export default function SubmissionSection({
                     <tr>
                       <th className="px-4 py-2">序号</th>
                       <th className="px-4 py-2">视频文件路径</th>
+                      <th className="px-4 py-2">源视频 BV 号</th>
                       <th className="px-4 py-2">开始时间</th>
                       <th className="px-4 py-2">结束时间</th>
                       <th className="px-4 py-2">操作</th>
@@ -7211,7 +7528,7 @@ export default function SubmissionSection({
                   <tbody>
                     {selectedTask.sourceVideos.length === 0 ? (
                       <tr>
-                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
+                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
                           暂无源视频
                         </td>
                       </tr>
@@ -7220,6 +7537,7 @@ export default function SubmissionSection({
                         <tr key={item.id} className="border-t border-black/5">
                           <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
                           <td className="px-4 py-2 text-[var(--ink)]">{item.sourceFilePath}</td>
+                          <td className="px-4 py-2 text-[var(--muted)]">{item.remoteBvid || ""}</td>
                           <td className="px-4 py-2 text-[var(--muted)]">{item.startTime || "-"}</td>
                           <td className="px-4 py-2 text-[var(--muted)]">{item.endTime || "-"}</td>
                           <td className="px-4 py-2">
@@ -7353,8 +7671,13 @@ export default function SubmissionSection({
                             <div className="flex flex-wrap gap-2">
                               <button
                                 className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
-                                onClick={() => openRemoteFilePickerForMerged(item)}
+                                onClick={() =>
+                                  remotePath === "-"
+                                    ? openRemoteFilePickerForMerged(item)
+                                    : handleClearMergedRemoteBinding(item)
+                                }
                                 disabled={
+                                  clearingMergedRemoteId === Number(item.id) ||
                                   bindingRemoteFile ||
                                   deleteMergedSubmitting ||
                                   mergedReorderSubmitting ||
@@ -7363,9 +7686,11 @@ export default function SubmissionSection({
                               >
                                 {bindingThisItem
                                   ? "绑定中"
-                                  : remotePath === "-"
-                                    ? "绑定网盘文件"
-                                    : "修改绑定"}
+                                  : clearingMergedRemoteId === Number(item.id)
+                                    ? "清空中"
+                                    : remotePath === "-"
+                                      ? "绑定网盘文件"
+                                      : "清空绑定"}
                               </button>
                               <button
                                 className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
@@ -7669,18 +7994,21 @@ export default function SubmissionSection({
                       <th className="px-4 py-2">文件路径</th>
                       <th className="px-4 py-2">上传进度</th>
                       <th className="px-4 py-2">创建时间</th>
+                      <th className="px-4 py-2">操作</th>
                     </tr>
                   </thead>
                   <tbody>
                     {selectedTask.mergedVideos.length === 0 ? (
                       <tr>
-                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
+                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
                           暂无合并视频
                         </td>
                       </tr>
                     ) : (
                       selectedTask.mergedVideos.map((item, index) => {
                         const progress = formatUploadProgress(item.uploadProgress);
+                        const remotePath = resolveMergedRemotePath(item);
+                        const clearingThisItem = clearingMergedRemoteId === Number(item.id);
                         return (
                           <tr key={item.id} className="border-t border-black/5">
                             <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
@@ -7705,6 +8033,25 @@ export default function SubmissionSection({
                             </td>
                             <td className="px-4 py-2 text-[var(--muted)]">
                               {formatDateTime(item.createTime)}
+                            </td>
+                            <td className="px-4 py-2">
+                              {remotePath === "-" ? (
+                                <span className="text-xs text-[var(--muted)]">未绑定</span>
+                              ) : (
+                                <button
+                                  className="rounded-full border border-red-200 bg-red-50 px-2 py-1 text-xs font-semibold text-red-600 disabled:cursor-not-allowed disabled:opacity-60"
+                                  onClick={() => handleClearMergedRemoteBinding(item)}
+                                  disabled={
+                                    clearingThisItem ||
+                                    bindingRemoteFile ||
+                                    deleteMergedSubmitting ||
+                                    mergedReorderSubmitting ||
+                                    mergedBindSubmitting
+                                  }
+                                >
+                                  {clearingThisItem ? "清空中" : "清空绑定"}
+                                </button>
+                              )}
                             </td>
                           </tr>
                         );

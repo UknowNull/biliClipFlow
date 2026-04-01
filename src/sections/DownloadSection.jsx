@@ -115,6 +115,38 @@ const buildPartKey = (videoKey, cid) => {
   return `${videoKey}:${cid}`;
 };
 
+const buildDuplicatePartKey = (videoKey, cid) =>
+  `${videoKey}:${cid}:${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+
+const insertSubmitMergeItemClone = (items, sourceId, clonedId) => {
+  const next = [];
+  let inserted = false;
+  for (const item of items || []) {
+    if (item.type === "GROUP" && Array.isArray(item.sourceIds) && item.sourceIds.includes(sourceId)) {
+      next.push({
+        ...item,
+        sourceIds: item.sourceIds.flatMap((id) => (id === sourceId ? [id, clonedId] : [id])),
+      });
+      inserted = true;
+      continue;
+    }
+    next.push(item);
+    if (item.type === "SOURCE" && item.sourceId === sourceId) {
+      next.push({
+        id: clonedId,
+        type: "SOURCE",
+        sourceId: clonedId,
+        standalone: Boolean(item.standalone),
+      });
+      inserted = true;
+    }
+  }
+  if (!inserted) {
+    next.push({ id: clonedId, type: "SOURCE", sourceId: clonedId, standalone: false });
+  }
+  return next;
+};
+
 const extractVideoInputs = (input) => {
   if (!input) {
     return [];
@@ -941,6 +973,81 @@ export default function DownloadSection({
     );
   };
 
+  const duplicatePartConfig = (partKey) => {
+    const target = selectedPartsConfig.find((part) => part.key === partKey);
+    if (!target) {
+      return;
+    }
+    const clonedKey = buildDuplicatePartKey(target.videoKey, target.cid);
+    setVideoItems((prev) =>
+      prev.map((item) => {
+        if (item.key !== target.videoKey) {
+          return item;
+        }
+        const partIndex = item.selectedPartsConfig.findIndex((part) => part.key === partKey);
+        if (partIndex < 0) {
+          return item;
+        }
+        const duplicated = {
+          ...item.selectedPartsConfig[partIndex],
+          key: clonedKey,
+        };
+        const nextConfigs = [...item.selectedPartsConfig];
+        nextConfigs.splice(partIndex + 1, 0, duplicated);
+        return {
+          ...item,
+          selectedPartsConfig: nextConfigs,
+        };
+      }),
+    );
+    setSubmitMergeItems((prev) => insertSubmitMergeItemClone(prev, partKey, clonedKey));
+    setSubmitMergeSelection((prev) => {
+      const next = new Set(prev);
+      next.delete(clonedKey);
+      return next;
+    });
+  };
+
+  const removePartConfig = (partKey) => {
+    const target = selectedPartsConfig.find((part) => part.key === partKey);
+    if (!target) {
+      return;
+    }
+    setVideoItems((prev) =>
+      prev.map((item) => {
+        if (item.key !== target.videoKey) {
+          return item;
+        }
+        const nextConfigs = item.selectedPartsConfig.filter((part) => part.key !== partKey);
+        const stillHasSameCid = nextConfigs.some((part) => part.cid === target.cid);
+        return {
+          ...item,
+          selectedPartsConfig: nextConfigs,
+          selectedParts: stillHasSameCid
+            ? item.selectedParts
+            : item.selectedParts.filter((part) => part.cid !== target.cid),
+        };
+      }),
+    );
+    setSubmitMergeItems((prev) =>
+      prev
+        .map((item) => {
+          if (item.type === "GROUP") {
+            const nextSourceIds = (item.sourceIds || []).filter((id) => id !== partKey);
+            return { ...item, sourceIds: nextSourceIds };
+          }
+          return item;
+        })
+        .filter((item) => item.type !== "GROUP" || (item.sourceIds || []).length > 0)
+        .filter((item) => item.type !== "SOURCE" || item.sourceId !== partKey),
+    );
+    setSubmitMergeSelection((prev) => {
+      const next = new Set(prev);
+      next.delete(partKey);
+      return next;
+    });
+  };
+
   const addTag = (value) => {
     const nextTag = value.trim();
     if (!nextTag || tags.includes(nextTag)) {
@@ -1694,6 +1801,24 @@ export default function DownloadSection({
         </td>
         <td className="px-3 py-2 text-[var(--desc-color)]">
           {submitGroupedSourceIds.has(sourceId) ? "已合并" : "未合并"}
+        </td>
+        <td className="px-3 py-2">
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="h-7 px-2 rounded border border-[var(--split-color)] text-xs text-[var(--content-color)]"
+              onClick={() => duplicatePartConfig(sourceId)}
+            >
+              复制
+            </button>
+            <button
+              type="button"
+              className="h-7 px-2 rounded border border-[var(--split-color)] text-xs text-[var(--content-color)]"
+              onClick={() => removePartConfig(sourceId)}
+            >
+              删除
+            </button>
+          </div>
         </td>
       </tr>
     );
@@ -2818,12 +2943,13 @@ export default function DownloadSection({
                           <th className="px-3 py-2">开始时间</th>
                           <th className="px-3 py-2">结束时间</th>
                           <th className="px-3 py-2">合并状态</th>
+                          <th className="px-3 py-2">操作</th>
                         </tr>
                       </thead>
                       <tbody>
                         {submitMergeItems.length === 0 ? (
                           <tr>
-                            <td className="px-3 py-3 text-[var(--desc-color)]" colSpan={8}>
+                            <td className="px-3 py-3 text-[var(--desc-color)]" colSpan={9}>
                               暂无配置
                             </td>
                           </tr>
@@ -2842,7 +2968,7 @@ export default function DownloadSection({
                                   data-merge-item-id={item.id}
                                   className="border-t border-[var(--split-color)]"
                                 >
-                                  <td className="p-0" colSpan={8}>
+                                  <td className="p-0" colSpan={9}>
                                     <div className="m-2 overflow-hidden rounded-lg border-2 border-[var(--primary-color)]/40 bg-white/70">
                                       <div
                                         className="flex items-center justify-between border-b border-[var(--primary-color)]/30 bg-[var(--primary-color)]/10 px-3 py-2 text-xs text-[var(--desc-color)] cursor-grab"
