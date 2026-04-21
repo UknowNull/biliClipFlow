@@ -150,6 +150,7 @@ pub fn run() {
                 )),
             };
             commands::download::recover_stale_downloads(&state);
+            commands::download::repair_stale_integration_relations(&state);
             commands::download::start_download_queue_loop(&state);
             let live_context = live_recorder::LiveContext {
                 db: Arc::clone(&state.db),
@@ -275,6 +276,7 @@ pub fn run() {
             commands::submission::submission_create,
             commands::submission::submission_update,
             commands::submission::submission_repost,
+            commands::submission::submission_repost_transcode,
             commands::submission::submission_resegment,
             commands::submission::submission_list,
             commands::submission::submission_list_by_status,

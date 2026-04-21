@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import {
   confirm as dialogConfirm,
@@ -50,6 +51,9 @@ const emptySource = (index) => ({
   localId: buildSourceId(),
   sourceFilePath: "",
   remoteBvid: "",
+  remoteAid: 0,
+  remoteCid: 0,
+  remotePartTitle: "",
   sortOrder: index + 1,
   startTime: "00:00:00",
   endTime: "00:00:00",
@@ -111,6 +115,28 @@ const buildMergeItemsFromSources = (sources) =>
     .map((item) => item?.localId)
     .filter((id) => id)
     .map((id) => ({ id, type: "SOURCE", sourceId: id, standalone: false }));
+
+const formatSourceBindingSummary = (source) => {
+  const remoteBvid = String(source?.remoteBvid || "").trim();
+  if (!remoteBvid) {
+    return "";
+  }
+  const remoteCid = Number(source?.remoteCid || 0);
+  const remotePartTitle = String(source?.remotePartTitle || "").trim();
+  if (remoteCid > 0 && remotePartTitle) {
+    return `已绑定 ${remotePartTitle} (CID ${remoteCid})`;
+  }
+  if (remoteCid > 0) {
+    return `已绑定 CID ${remoteCid}`;
+  }
+  return "已绑定BV，未指定分P";
+};
+
+const sanitizeLocalFileName = (value) =>
+  String(value || "")
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
 
 export default function SubmissionSection({
   activeBilibiliUid = "",
@@ -181,6 +207,15 @@ export default function SubmissionSection({
   const [remoteImportInput, setRemoteImportInput] = useState("");
   const [remoteImportLoading, setRemoteImportLoading] = useState(false);
   const [remoteImportPreview, setRemoteImportPreview] = useState(null);
+  const [sourcePartPickerOpen, setSourcePartPickerOpen] = useState(false);
+  const [sourcePartPickerLoadingId, setSourcePartPickerLoadingId] = useState("");
+  const [sourcePartPickerTarget, setSourcePartPickerTarget] = useState("create");
+  const [sourcePartPickerSourceId, setSourcePartPickerSourceId] = useState("");
+  const [sourcePartPickerTitle, setSourcePartPickerTitle] = useState("");
+  const [sourcePartPickerBvid, setSourcePartPickerBvid] = useState("");
+  const [sourcePartPickerAid, setSourcePartPickerAid] = useState(0);
+  const [sourcePartPickerPages, setSourcePartPickerPages] = useState([]);
+  const [sourcePartPickerError, setSourcePartPickerError] = useState("");
   const [deleteTargetId, setDeleteTargetId] = useState("");
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deletePreview, setDeletePreview] = useState(null);
@@ -203,7 +238,6 @@ export default function SubmissionSection({
   const [quickFillPage, setQuickFillPage] = useState(1);
   const [quickFillTotal, setQuickFillTotal] = useState(0);
   const [quickFillSearch, setQuickFillSearch] = useState("");
-  const [updateOpen, setUpdateOpen] = useState(false);
   const [resegmentOpen, setResegmentOpen] = useState(false);
   const [resegmentTaskId, setResegmentTaskId] = useState("");
   const [resegmentDefaultSeconds, setResegmentDefaultSeconds] = useState(0);
@@ -220,6 +254,13 @@ export default function SubmissionSection({
   const [repostHasBvid, setRepostHasBvid] = useState(false);
   const [repostUseCurrentBvid, setRepostUseCurrentBvid] = useState(false);
   const [repostSubmitting, setRepostSubmitting] = useState(false);
+  const [transcodeRepostOpen, setTranscodeRepostOpen] = useState(false);
+  const [transcodeRepostTaskId, setTranscodeRepostTaskId] = useState("");
+  const [transcodeRepostHasBvid, setTranscodeRepostHasBvid] = useState(false);
+  const [transcodeRepostUseCurrentBvid, setTranscodeRepostUseCurrentBvid] =
+    useState(false);
+  const [transcodeRepostSubmitting, setTranscodeRepostSubmitting] =
+    useState(false);
   const [createSubmitting, setCreateSubmitting] = useState(false);
   const [exportingTasks, setExportingTasks] = useState(false);
   const [importingTasks, setImportingTasks] = useState(false);
@@ -236,7 +277,12 @@ export default function SubmissionSection({
 
   const [defaultBaiduSyncPath, setDefaultBaiduSyncPath] = useState("/录播");
   const [updateTaskId, setUpdateTaskId] = useState("");
+  const [updateTaskDir, setUpdateTaskDir] = useState("");
   const [updateSourceVideos, setUpdateSourceVideos] = useState([emptySource(0)]);
+  const [updateMergeItems, setUpdateMergeItems] = useState(() =>
+    buildMergeItemsFromSources([emptySource(0)]),
+  );
+  const [updateMergeSelection, setUpdateMergeSelection] = useState(() => new Set());
   const [updateSegmentationEnabled, setUpdateSegmentationEnabled] = useState(true);
   const [updateWorkflowConfig, setUpdateWorkflowConfig] = useState(defaultWorkflowConfig);
   const [updateSegmentPrefix, setUpdateSegmentPrefix] = useState("");
@@ -245,6 +291,11 @@ export default function SubmissionSection({
     path: "",
     filename: "",
   });
+  const [updateImportOpen, setUpdateImportOpen] = useState(false);
+  const [updateImportInput, setUpdateImportInput] = useState("");
+  const [updateImportLoading, setUpdateImportLoading] = useState(false);
+  const [updateImportResults, setUpdateImportResults] = useState([]);
+  const [updateImportSelection, setUpdateImportSelection] = useState(() => new Set());
   const [syncPickerOpen, setSyncPickerOpen] = useState(false);
   const [syncTarget, setSyncTarget] = useState("");
   const [remoteFilePickerOpen, setRemoteFilePickerOpen] = useState(false);
@@ -302,6 +353,7 @@ export default function SubmissionSection({
   const isCreateView = submissionView === "create";
   const isDetailView = submissionView === "detail";
   const isEditView = submissionView === "edit";
+  const isUpdateView = submissionView === "update";
   const isRemoteImportView = submissionView === "remoteImport";
   const canModifySelectedTask = isEditView;
   const isReadOnly = isDetailView;
@@ -508,12 +560,21 @@ export default function SubmissionSection({
   };
 
   const resetUpdateState = () => {
+    const initialSources = [emptySource(0)];
     setUpdateTaskId("");
-    setUpdateSourceVideos([emptySource(0)]);
+    setUpdateTaskDir("");
+    setUpdateSourceVideos(initialSources);
+    setUpdateMergeItems(buildMergeItemsFromSources(initialSources));
+    setUpdateMergeSelection(new Set());
     setUpdateSegmentationEnabled(true);
     setUpdateWorkflowConfig(defaultWorkflowConfig);
     setUpdateSegmentPrefix("");
     setUpdateBaiduSync({ enabled: false, path: "", filename: "" });
+    setUpdateImportOpen(false);
+    setUpdateImportInput("");
+    setUpdateImportLoading(false);
+    setUpdateImportResults([]);
+    setUpdateImportSelection(new Set());
     setUpdateSubmitting(false);
   };
 
@@ -585,24 +646,206 @@ export default function SubmissionSection({
     await loadTasks(statusFilter, currentPage, pageSize);
   };
 
-  const openUpdateModal = (task) => {
+  const closeSourcePartPicker = () => {
+    if (sourcePartPickerLoadingId) {
+      return;
+    }
+    setSourcePartPickerOpen(false);
+    setSourcePartPickerTarget("create");
+    setSourcePartPickerSourceId("");
+    setSourcePartPickerTitle("");
+    setSourcePartPickerBvid("");
+    setSourcePartPickerAid(0);
+    setSourcePartPickerPages([]);
+    setSourcePartPickerError("");
+  };
+
+  const buildIntegratedSourceFilePath = (taskDir, preview, page) => {
+    const bvid = String(preview?.bvid || "").trim();
+    const pageNo = Number(page?.page || 0) || 1;
+    const cid = Number(page?.cid || 0) || 0;
+    const rawTitle =
+      String(page?.partName || page?.part_title || preview?.title || "").trim() ||
+      `${bvid || "video"}_P${pageNo}`;
+    const safeTitle = sanitizeLocalFileName(rawTitle) || `${bvid || "video"}_P${pageNo}`;
+    const fileName = `${bvid || "video"}_P${pageNo}_${cid}_${safeTitle}.mp4`;
+    const normalizedTaskDir = String(taskDir || "").trim();
+    if (!normalizedTaskDir) {
+      return fileName;
+    }
+    return `${normalizedTaskDir}/integrated_sources/${fileName}`;
+  };
+
+  const resolveSourceBindingFilePath = async (preview, page) => {
+    if (sourcePartPickerTarget === "update") {
+      return buildIntegratedSourceFilePath(updateTaskDir, preview, page);
+    }
+    if (isEditView) {
+      const taskId = String(selectedTask?.task?.taskId || "").trim();
+      if (taskId) {
+        try {
+          const taskDir = await invokeCommand("submission_task_dir", { taskId });
+          return buildIntegratedSourceFilePath(taskDir, preview, page);
+        } catch (_) {
+          return buildIntegratedSourceFilePath("", preview, page);
+        }
+      }
+    }
+    return buildIntegratedSourceFilePath("", preview, page);
+  };
+
+  const applySourceRemoteBinding = (sourceId, preview, page = null, sourceFilePath = "") => {
+    const normalizedBvid = String(preview?.bvid || "").trim();
+    const normalizedAid = Number(preview?.aid || 0) || 0;
+    const normalizedCid = Number(page?.cid || 0) || 0;
+    const normalizedPartTitle = String(
+      page?.partName || page?.part_title || "",
+    ).trim();
+    const normalizedDurationSeconds = Number(page?.durationSeconds || page?.duration || 0) || 0;
+    const applyBinding = (items) =>
+      items.map((item) => {
+        if (item.localId !== sourceId) {
+          return item;
+        }
+        const nextPath = String(sourceFilePath || "").trim() || item.sourceFilePath || "";
+        const nextStartTime = item.startTime || "00:00:00";
+        const shouldFillEndTime =
+          normalizedDurationSeconds > 0 &&
+          (!String(item.endTime || "").trim() || item.endTime === "00:00:00");
+        return {
+          ...item,
+          sourceFilePath: nextPath,
+          remoteBvid: normalizedBvid || item.remoteBvid || "",
+          remoteAid: normalizedAid,
+          remoteCid: normalizedCid,
+          remotePartTitle: normalizedPartTitle,
+          durationSeconds: normalizedDurationSeconds || item.durationSeconds || 0,
+          startTime: nextStartTime,
+          endTime: shouldFillEndTime ? formatDurationHms(normalizedDurationSeconds) : item.endTime,
+        };
+      });
+    if (sourcePartPickerTarget === "update") {
+      setUpdateSourceVideos((prev) => applyBinding(prev));
+      return;
+    }
+    setSourceVideos((prev) => applyBinding(prev));
+  };
+
+  const handleChooseSourceRemotePart = async (target, sourceIndex) => {
+    const isUpdateTarget = target === "update";
+    const sourceList = isUpdateTarget ? updateSourceVideos : sourceVideos;
+    const source = sourceList[sourceIndex];
+    if (!source) {
+      return;
+    }
+    const input = String(source.remoteBvid || "").trim();
+    if (!input) {
+      setMessage("请先输入源视频BV号或视频链接");
+      return;
+    }
+    setSourcePartPickerLoadingId(source.localId);
+    setSourcePartPickerError("");
+    try {
+      const preview = await invokeCommand("submission_remote_video_preview", {
+        request: {
+          input,
+          enforceOwnerMatch: false,
+        },
+      });
+      const pages = Array.isArray(preview?.pages)
+        ? preview.pages.filter((item) => Number(item?.cid || 0) > 0)
+        : [];
+      setSourcePartPickerSourceId(source.localId);
+      setSourcePartPickerTarget(isUpdateTarget ? "update" : "create");
+      setSourcePartPickerTitle(String(preview?.title || "").trim());
+      setSourcePartPickerBvid(String(preview?.bvid || input).trim());
+      setSourcePartPickerAid(Number(preview?.aid || 0) || 0);
+      setSourcePartPickerPages(pages);
+      setSourcePartPickerOpen(true);
+    } catch (error) {
+      setMessage(error?.message || "查询分P失败");
+    } finally {
+      setSourcePartPickerLoadingId("");
+    }
+  };
+
+  const handleConfirmSourcePartBinding = async (page) => {
+    const targetId = String(sourcePartPickerSourceId || "").trim();
+    const targetBvid = String(sourcePartPickerBvid || "").trim();
+    if (!targetId || !targetBvid) {
+      setSourcePartPickerError("绑定目标无效");
+      return;
+    }
+    const preview = {
+      bvid: targetBvid,
+      aid: sourcePartPickerAid,
+      title: sourcePartPickerTitle,
+    };
+    const sourceFilePath = await resolveSourceBindingFilePath(preview, page);
+    applySourceRemoteBinding(
+      targetId,
+      preview,
+      page,
+      sourceFilePath,
+    );
+    setMessage(
+      `已绑定分P：${page?.partName || page?.part_title || `CID ${page?.cid || 0}`}`,
+    );
+    closeSourcePartPicker();
+  };
+
+  const handleConfirmSourceBvidBinding = () => {
+    const targetId = String(sourcePartPickerSourceId || "").trim();
+    const targetBvid = String(sourcePartPickerBvid || "").trim();
+    if (!targetId || !targetBvid) {
+      setSourcePartPickerError("绑定目标无效");
+      return;
+    }
+    applySourceRemoteBinding(targetId, {
+      bvid: targetBvid,
+      aid: sourcePartPickerAid,
+    });
+    setMessage(`已绑定BV：${targetBvid}`);
+    closeSourcePartPicker();
+  };
+
+  const openUpdateModal = async (task) => {
+    const taskId = String(task?.taskId || "").trim();
     setMessage("");
-    setUpdateOpen(true);
-    setUpdateTaskId(task?.taskId || "");
+    setSubmissionView("update");
+    setUpdateTaskId(taskId);
+    setUpdateTaskDir("");
     setUpdateSegmentPrefix(task?.segmentPrefix || "");
     setUpdateBaiduSync({
       enabled: Boolean(task?.baiduSyncEnabled),
       path: task?.baiduSyncPath || "",
       filename: task?.baiduSyncFilename || "",
     });
-    setUpdateSourceVideos([emptySource(0)]);
+    const initialSources = [emptySource(0)];
+    setUpdateSourceVideos(initialSources);
+    setUpdateMergeItems(buildMergeItemsFromSources(initialSources));
+    setUpdateMergeSelection(new Set());
     setUpdateSegmentationEnabled(true);
     setUpdateWorkflowConfig(defaultWorkflowConfig);
+    setUpdateImportOpen(false);
+    setUpdateImportInput("");
+    setUpdateImportLoading(false);
+    setUpdateImportResults([]);
+    setUpdateImportSelection(new Set());
     setUpdateSubmitting(false);
+    if (!taskId) {
+      return;
+    }
+    try {
+      const dir = await invokeCommand("submission_task_dir", { taskId });
+      setUpdateTaskDir(String(dir || "").trim());
+    } catch (error) {
+      setMessage(error.message);
+    }
   };
 
   const closeUpdateModal = () => {
-    setUpdateOpen(false);
+    setSubmissionView("list");
     resetUpdateState();
     setMessage("");
   };
@@ -729,6 +972,29 @@ export default function SubmissionSection({
     setMessage("");
   };
 
+  const openTranscodeRepostModal = (task) => {
+    const targetId = String(task?.taskId || "").trim();
+    if (!targetId) {
+      return;
+    }
+    const hasBvid = Boolean(String(task?.bvid || "").trim());
+    setMessage("");
+    setTranscodeRepostOpen(true);
+    setTranscodeRepostTaskId(targetId);
+    setTranscodeRepostHasBvid(hasBvid);
+    setTranscodeRepostUseCurrentBvid(hasBvid);
+    setTranscodeRepostSubmitting(false);
+  };
+
+  const closeTranscodeRepostModal = () => {
+    setTranscodeRepostOpen(false);
+    setTranscodeRepostTaskId("");
+    setTranscodeRepostHasBvid(false);
+    setTranscodeRepostUseCurrentBvid(false);
+    setTranscodeRepostSubmitting(false);
+    setMessage("");
+  };
+
   const clearEditUploadCache = async (taskId) => {
     const targetId = String(taskId || "").trim();
     if (!targetId) {
@@ -749,6 +1015,9 @@ export default function SubmissionSection({
       if (taskId) {
         clearEditUploadCache(taskId);
       }
+    }
+    if (submissionView === "update") {
+      resetUpdateState();
     }
     setSubmissionView("list");
     setMessage("");
@@ -2111,7 +2380,21 @@ export default function SubmissionSection({
 
   const updateSource = (index, field, value) => {
     setSourceVideos((prev) =>
-      prev.map((item, idx) => (idx === index ? { ...item, [field]: value } : item)),
+      prev.map((item, idx) => {
+        if (idx !== index) {
+          return item;
+        }
+        if (field === "remoteBvid") {
+          return {
+            ...item,
+            remoteBvid: value,
+            remoteAid: 0,
+            remoteCid: 0,
+            remotePartTitle: "",
+          };
+        }
+        return { ...item, [field]: value };
+      }),
     );
   };
 
@@ -2444,9 +2727,12 @@ export default function SubmissionSection({
     setDraggingMergeGroupSource({ groupId: "", sourceId: "" });
   };
 
-  const buildMergeGroupsPayload = (validSources) => {
-    const hasGroup = mergeItems.some((item) => item.type === "GROUP");
-    const hasStandalone = mergeItems.some((item) => item.type === "SOURCE" && item.standalone);
+  const buildMergeGroupsPayload = (validSources, itemsOverride = mergeItems) => {
+    const mergeItemsInput = Array.isArray(itemsOverride) ? itemsOverride : [];
+    const hasGroup = mergeItemsInput.some((item) => item.type === "GROUP");
+    const hasStandalone = mergeItemsInput.some(
+      (item) => item.type === "SOURCE" && item.standalone,
+    );
     if (!hasGroup && !hasStandalone) {
       return [];
     }
@@ -2457,15 +2743,19 @@ export default function SubmissionSection({
     );
     const groups = [];
     const remainingSources = [];
-    for (const item of mergeItems) {
+    for (const item of mergeItemsInput) {
       if (item.type === "GROUP") {
         const groupSources = (item.sourceIds || [])
           .map((sourceId) => sourceMap.get(sourceId))
           .filter(Boolean)
           .map((source, index) => ({
             sourceFilePath: source.sourceFilePath,
+            remoteAid: source.remoteAid || null,
             startTime: source.startTime || null,
             endTime: source.endTime || null,
+            remoteBvid: source.remoteBvid || null,
+            remoteCid: source.remoteCid || null,
+            remotePartTitle: source.remotePartTitle || null,
             sortOrder: index + 1,
           }));
         if (groupSources.length > 0) {
@@ -2487,6 +2777,9 @@ export default function SubmissionSection({
             {
               sourceFilePath: source.sourceFilePath,
               remoteBvid: source.remoteBvid || null,
+              remoteAid: source.remoteAid || null,
+              remoteCid: source.remoteCid || null,
+              remotePartTitle: source.remotePartTitle || null,
               startTime: source.startTime || null,
               endTime: source.endTime || null,
               sortOrder: 1,
@@ -2497,6 +2790,9 @@ export default function SubmissionSection({
         remainingSources.push({
           sourceFilePath: source.sourceFilePath,
           remoteBvid: source.remoteBvid || null,
+          remoteAid: source.remoteAid || null,
+          remoteCid: source.remoteCid || null,
+          remotePartTitle: source.remotePartTitle || null,
           startTime: source.startTime || null,
           endTime: source.endTime || null,
         });
@@ -2509,6 +2805,112 @@ export default function SubmissionSection({
       });
     }
     return groups;
+  };
+
+  const toggleUpdateMergeSelection = (sourceId, checked) => {
+    const grouped = buildGroupedSourceIdSet(updateMergeItems);
+    if (grouped.has(sourceId)) {
+      return;
+    }
+    const item = updateMergeItems.find(
+      (candidate) => candidate.type === "SOURCE" && candidate.sourceId === sourceId,
+    );
+    if (item?.standalone) {
+      return;
+    }
+    setUpdateMergeSelection((prev) => {
+      const next = new Set(prev);
+      if (checked) {
+        next.add(sourceId);
+      } else {
+        next.delete(sourceId);
+      }
+      return next;
+    });
+  };
+
+  const toggleUpdateMergeStandalone = (sourceId) => {
+    setUpdateMergeItems((prev) =>
+      prev.map((item) => {
+        if (item.type !== "SOURCE" || item.sourceId !== sourceId) {
+          return item;
+        }
+        const next = { ...item, standalone: !item.standalone };
+        if (next.standalone) {
+          setUpdateMergeSelection((selection) => {
+            const nextSelection = new Set(selection);
+            nextSelection.delete(sourceId);
+            return nextSelection;
+          });
+        }
+        return next;
+      }),
+    );
+  };
+
+  const createUpdateMergeGroup = () => {
+    const selected = Array.from(updateMergeSelection);
+    if (selected.length < 2) {
+      setMessage("请至少选择两个源视频进行合并");
+      return;
+    }
+    const selectedSet = new Set(selected);
+    const orderedSelected = updateSourceVideos
+      .map((item) => item.localId)
+      .filter((id) => selectedSet.has(id));
+    if (orderedSelected.length < 2) {
+      setMessage("请选择有效的源视频进行合并");
+      return;
+    }
+    const groupId = buildMergeGroupId();
+    setUpdateMergeItems((prev) => {
+      const next = [];
+      let inserted = false;
+      for (const item of prev) {
+        if (item.type === "SOURCE" && selectedSet.has(item.sourceId)) {
+          if (!inserted) {
+            next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected });
+            inserted = true;
+          }
+          continue;
+        }
+        next.push(item);
+      }
+      if (!inserted) {
+        next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected });
+      }
+      return next;
+    });
+    setUpdateMergeSelection(new Set());
+  };
+
+  const releaseUpdateMergeGroup = (groupId) => {
+    const normalizedGroupId = String(groupId || "").trim();
+    if (!normalizedGroupId) {
+      return;
+    }
+    setUpdateMergeItems((prev) => {
+      const next = [];
+      const releasedIds = [];
+      for (const item of prev) {
+        if (item.id !== normalizedGroupId || item.type !== "GROUP") {
+          next.push(item);
+          continue;
+        }
+        (item.sourceIds || []).forEach((sourceId) => {
+          releasedIds.push(sourceId);
+          next.push({ id: sourceId, type: "SOURCE", sourceId, standalone: false });
+        });
+      }
+      if (releasedIds.length > 0) {
+        setUpdateMergeSelection((selection) => {
+          const filtered = new Set(selection);
+          releasedIds.forEach((id) => filtered.delete(id));
+          return filtered;
+        });
+      }
+      return syncMergeItemsWithSources(updateSourceVideos, next);
+    });
   };
 
   const resolveSourceIndexById = (sourceId) =>
@@ -2605,13 +3007,35 @@ export default function SubmissionSection({
           </div>
         </td>
         <td className="px-4 py-2">
-          <input
-            value={source.remoteBvid || ""}
-            onChange={(event) => updateSource(sourceIndex, "remoteBvid", event.target.value)}
-            placeholder="可选，填写源视频 BV 号"
-            readOnly={isReadOnly}
-            className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-          />
+          <div className="space-y-2">
+            <div className="flex flex-wrap gap-2">
+              <input
+                value={source.remoteBvid || ""}
+                onChange={(event) => updateSource(sourceIndex, "remoteBvid", event.target.value)}
+                placeholder="可选，填写源视频 BV 号或链接"
+                readOnly={isReadOnly}
+                className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+              />
+              {!isReadOnly ? (
+                <button
+                  type="button"
+                  className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                  onClick={() => handleChooseSourceRemotePart("create", sourceIndex)}
+                  disabled={sourcePartPickerLoadingId === source.localId}
+                >
+                  {sourcePartPickerLoadingId === source.localId ? "查询中" : "选择分P"}
+                </button>
+              ) : null}
+            </div>
+            {formatSourceBindingSummary(source) ? (
+              <div className="text-xs text-[var(--muted)]">
+                {formatSourceBindingSummary(source)}
+              </div>
+            ) : null}
+          </div>
+        </td>
+        <td className="px-4 py-2 text-[var(--muted)]">
+          {source.remotePartTitle || (source.remoteBvid ? "未指定分P" : "-")}
         </td>
         <td className="px-4 py-2">
           <input
@@ -2659,7 +3083,11 @@ export default function SubmissionSection({
   };
 
   const addUpdateSource = () => {
-    setUpdateSourceVideos((prev) => [...prev, emptySource(prev.length)]);
+    setUpdateSourceVideos((prev) => {
+      const next = [...prev, emptySource(prev.length)];
+      setUpdateMergeItems((items) => syncMergeItemsWithSources(next, items));
+      return next;
+    });
   };
 
   const duplicateUpdateSource = (index) => {
@@ -2668,13 +3096,43 @@ export default function SubmissionSection({
       if (!target) {
         return prev;
       }
-      return insertSourceBelow(prev, index, target);
+      const next = insertSourceBelow(prev, index, target);
+      const clonedSource = next[index + 1];
+      setUpdateMergeItems((items) => {
+        let merged = syncMergeItemsWithSources(next, items);
+        if (clonedSource?.localId && target.localId) {
+          merged = insertMergeItemClone(merged, target.localId, clonedSource.localId);
+        }
+        return merged;
+      });
+      setUpdateMergeSelection((selection) => {
+        const nextSelection = new Set(selection);
+        if (clonedSource?.localId) {
+          nextSelection.delete(clonedSource.localId);
+        }
+        return nextSelection;
+      });
+      return next;
     });
   };
 
   const updateUpdateSource = (index, field, value) => {
     setUpdateSourceVideos((prev) =>
-      prev.map((item, idx) => (idx === index ? { ...item, [field]: value } : item)),
+      prev.map((item, idx) => {
+        if (idx !== index) {
+          return item;
+        }
+        if (field === "remoteBvid") {
+          return {
+            ...item,
+            remoteBvid: value,
+            remoteAid: 0,
+            remoteCid: 0,
+            remotePartTitle: "",
+          };
+        }
+        return { ...item, [field]: value };
+      }),
     );
   };
 
@@ -2705,11 +3163,21 @@ export default function SubmissionSection({
   };
 
   const removeUpdateSource = (index) => {
-    setUpdateSourceVideos((prev) =>
-      prev
+    setUpdateSourceVideos((prev) => {
+      const next = prev
         .filter((_, idx) => idx !== index)
-        .map((item, idx) => ({ ...item, sortOrder: idx + 1 })),
-    );
+        .map((item, idx) => ({ ...item, sortOrder: idx + 1 }));
+      const removed = prev[index];
+      setUpdateMergeItems((items) => syncMergeItemsWithSources(next, items));
+      if (removed?.localId) {
+        setUpdateMergeSelection((selection) => {
+          const nextSelection = new Set(selection);
+          nextSelection.delete(removed.localId);
+          return nextSelection;
+        });
+      }
+      return next;
+    });
   };
 
   const buildWorkflowConfig = (mergeGroups) => {
@@ -2727,9 +3195,9 @@ export default function SubmissionSection({
     return config;
   };
 
-  const buildUpdateWorkflowConfig = () => {
+  const buildUpdateWorkflowConfig = (mergeGroups = []) => {
     const prefix = updateSegmentPrefix.trim();
-    return {
+    const config = {
       enableSegmentation: updateSegmentationEnabled,
       segmentationConfig: {
         enabled: updateSegmentationEnabled,
@@ -2738,6 +3206,10 @@ export default function SubmissionSection({
       },
       segmentPrefix: prefix ? prefix : null,
     };
+    if (Array.isArray(mergeGroups) && mergeGroups.length > 0) {
+      config.mergeGroups = mergeGroups;
+    }
+    return config;
   };
 
   const addTag = (value) => {
@@ -2888,6 +3360,9 @@ export default function SubmissionSection({
           sourceVideos: validSources.map((item, index) => ({
             sourceFilePath: item.sourceFilePath,
             remoteBvid: item.remoteBvid || null,
+            remoteAid: item.remoteAid || null,
+            remoteCid: item.remoteCid || null,
+            remotePartTitle: item.remotePartTitle || null,
             sortOrder: index + 1,
             startTime: item.startTime || null,
             endTime: item.endTime || null,
@@ -2934,6 +3409,7 @@ export default function SubmissionSection({
       return;
     }
     const validSources = sourceValidation.validSources;
+    const mergeGroups = buildMergeGroupsPayload(validSources, updateMergeItems);
     setUpdateSubmitting(true);
     try {
       const payload = {
@@ -2945,11 +3421,14 @@ export default function SubmissionSection({
           sourceVideos: validSources.map((item, index) => ({
             sourceFilePath: item.sourceFilePath,
             remoteBvid: item.remoteBvid || null,
+            remoteAid: item.remoteAid || null,
+            remoteCid: item.remoteCid || null,
+            remotePartTitle: item.remotePartTitle || null,
             sortOrder: index + 1,
             startTime: item.startTime || null,
             endTime: item.endTime || null,
           })),
-          workflowConfig: buildUpdateWorkflowConfig(),
+          workflowConfig: buildUpdateWorkflowConfig(mergeGroups),
         },
       };
       await invokeCommand("submission_update", payload);
@@ -3042,6 +3521,143 @@ export default function SubmissionSection({
     } catch (error) {
       setMessage(error.message);
     }
+  };
+
+  const buildUpdateImportedSourcePath = (preview, page) =>
+    buildIntegratedSourceFilePath(updateTaskDir, preview, page);
+
+  const openUpdateImportModal = () => {
+    if (!String(updateTaskId || "").trim()) {
+      setMessage("任务ID无效");
+      return;
+    }
+    if (!String(updateTaskDir || "").trim()) {
+      setMessage("任务目录未就绪，请重新进入视频更新页面后重试");
+      return;
+    }
+    setUpdateImportOpen(true);
+    setUpdateImportInput("");
+    setUpdateImportLoading(false);
+    setUpdateImportResults([]);
+    setUpdateImportSelection(new Set());
+    setMessage("");
+  };
+
+  const closeUpdateImportModal = () => {
+    if (updateImportLoading) {
+      return;
+    }
+    setUpdateImportOpen(false);
+    setUpdateImportInput("");
+    setUpdateImportResults([]);
+    setUpdateImportSelection(new Set());
+  };
+
+  const handleUpdateImportQuery = async () => {
+    const rawInput = String(updateImportInput || "").trim();
+    if (!rawInput) {
+      setMessage("请输入至少一个视频链接或BVID");
+      return;
+    }
+    const inputs = Array.from(
+      new Set(
+        rawInput
+          .split(/[\n\r,\s]+/)
+          .map((item) => item.trim())
+          .filter((item) => item),
+      ),
+    );
+    if (inputs.length === 0) {
+      setMessage("请输入至少一个视频链接或BVID");
+      return;
+    }
+    setUpdateImportLoading(true);
+    setMessage("");
+    try {
+      const previews = [];
+      for (const input of inputs) {
+        const preview = await invokeCommand("submission_remote_video_preview", {
+          request: {
+            input,
+            enforceOwnerMatch: false,
+          },
+        });
+        const pages = Array.isArray(preview?.pages)
+          ? preview.pages.filter((item) => Number(item?.cid || 0) > 0)
+          : [];
+        previews.push({
+          input,
+          title: String(preview?.title || "").trim(),
+          bvid: String(preview?.bvid || input).trim(),
+          aid: Number(preview?.aid || 0) || 0,
+          pages,
+        });
+      }
+      setUpdateImportResults(previews);
+      setUpdateImportSelection(new Set());
+    } catch (error) {
+      setMessage(error?.message || "查询视频失败");
+    } finally {
+      setUpdateImportLoading(false);
+    }
+  };
+
+  const toggleUpdateImportSelection = (key, checked) => {
+    setUpdateImportSelection((prev) => {
+      const next = new Set(prev);
+      if (checked) {
+        next.add(key);
+      } else {
+        next.delete(key);
+      }
+      return next;
+    });
+  };
+
+  const handleApplyUpdateImportedSources = () => {
+    const rows = [];
+    for (const preview of updateImportResults) {
+      for (const page of preview.pages || []) {
+        const key = `${preview.bvid}:${page.cid}`;
+        if (!updateImportSelection.has(key)) {
+          continue;
+        }
+        const durationSeconds = Number(page?.durationSeconds || page?.duration || 0) || 0;
+        rows.push({
+          localId: buildSourceId(),
+          sourceFilePath: buildUpdateImportedSourcePath(preview, page),
+          remoteBvid: preview.bvid,
+          remoteAid: preview.aid,
+          remoteCid: Number(page?.cid || 0) || 0,
+          remotePartTitle: String(page?.partName || page?.part_title || "").trim(),
+          sortOrder: rows.length + 1,
+          startTime: "00:00:00",
+          endTime: formatDurationHms(durationSeconds > 0 ? durationSeconds : 1),
+          durationSeconds,
+        });
+      }
+    }
+    if (rows.length === 0) {
+      setMessage("请至少选择一个分P");
+      return;
+    }
+    setUpdateSourceVideos((prev) => {
+      const next = [
+        ...prev.filter((item) => String(item.sourceFilePath || "").trim()),
+        ...rows,
+      ].map((item, index) => ({
+        ...item,
+        sortOrder: index + 1,
+      }));
+      const normalized = next.length > 0 ? next : [emptySource(0)];
+      setUpdateMergeItems((items) => syncMergeItemsWithSources(normalized, items));
+      return normalized;
+    });
+    setUpdateImportOpen(false);
+    setUpdateImportInput("");
+    setUpdateImportResults([]);
+    setUpdateImportSelection(new Set());
+    setMessage(`已导入 ${rows.length} 个远程分P`);
   };
 
   const handleOpenBvid = async (bvid) => {
@@ -3210,6 +3826,9 @@ export default function SubmissionSection({
       localId: buildSourceId(),
       sourceFilePath: item.sourceFilePath || "",
       remoteBvid: item.remoteBvid || "",
+      remoteAid: Number(item.remoteAid || 0) || 0,
+      remoteCid: Number(item.remoteCid || 0) || 0,
+      remotePartTitle: item.remotePartTitle || "",
       sortOrder: index + 1,
       startTime: item.startTime || "00:00:00",
       endTime: item.endTime || "00:00:00",
@@ -3508,6 +4127,36 @@ export default function SubmissionSection({
     }
   };
 
+  const handleTranscodeRepostSubmit = async () => {
+    if (!transcodeRepostTaskId || transcodeRepostSubmitting) {
+      return;
+    }
+    if (transcodeRepostUseCurrentBvid && !transcodeRepostHasBvid) {
+      setMessage("当前任务没有BV号，无法集成投稿");
+      return;
+    }
+    setMessage("");
+    setTranscodeRepostSubmitting(true);
+    try {
+      const result = await invokeCommand("submission_repost_transcode", {
+        request: {
+          taskId: transcodeRepostTaskId,
+          integrateCurrentBvid: transcodeRepostUseCurrentBvid,
+        },
+      });
+      setMessage(result || "转码投稿已启动");
+      closeTranscodeRepostModal();
+      await loadTasks(statusFilter, currentPage, pageSize);
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("anchor-clip-list-refresh"));
+      }
+    } catch (error) {
+      setMessage(error.message);
+      await showErrorDialog(error);
+      setTranscodeRepostSubmitting(false);
+    }
+  };
+
   const handleEditSubmit = async () => {
     if (!selectedTask?.task?.taskId || submittingEdit) {
       return;
@@ -3562,6 +4211,9 @@ export default function SubmissionSection({
       sourcePayload = sourceValidation.validSources.map((item, index) => ({
         sourceFilePath: item.sourceFilePath,
         remoteBvid: item.remoteBvid || null,
+        remoteAid: item.remoteAid || null,
+        remoteCid: item.remoteCid || null,
+        remotePartTitle: item.remotePartTitle || null,
         sortOrder: index + 1,
         startTime: item.startTime || null,
         endTime: item.endTime || null,
@@ -3571,10 +4223,6 @@ export default function SubmissionSection({
     if (needEditSubmit) {
       if (!taskForm.title.trim()) {
         setMessage("请输入投稿标题");
-        return;
-      }
-      if (taskForm.title.length > 80) {
-        setMessage("投稿标题不能超过 80 个字符");
         return;
       }
       if (!taskForm.partitionId) {
@@ -4424,7 +5072,7 @@ export default function SubmissionSection({
 
   const handleQueuePrioritize = async (taskId) => {
     setMessage("");
-    const confirmed = await dialogConfirm("确认将该任务置顶并优先投稿？", {
+    const confirmed = await dialogConfirm("确认设置该任务为优先投稿？如果已设置，将刷新优先时间。", {
       title: "优先投稿",
       kind: "warning",
     });
@@ -5175,6 +5823,100 @@ export default function SubmissionSection({
     currentPageTaskIds.length > 0 &&
     currentPageTaskIds.every((taskId) => selectedTaskIds.has(taskId));
   const selectedTaskCount = selectedTaskIds.size;
+  const sourcePartPickerModal =
+    sourcePartPickerOpen && typeof document !== "undefined"
+      ? createPortal(
+          <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 px-4">
+            <div className="w-full max-w-2xl rounded-2xl bg-white p-5 shadow-lg">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-[var(--ink)]">选择源视频分P</div>
+                  <div className="mt-1 text-xs text-[var(--muted)]">
+                    {sourcePartPickerTitle || sourcePartPickerBvid || "-"}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={closeSourcePartPicker}
+                  disabled={Boolean(sourcePartPickerLoadingId)}
+                >
+                  关闭
+                </button>
+              </div>
+              {sourcePartPickerError ? (
+                <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                  {sourcePartPickerError}
+                </div>
+              ) : null}
+              <div className="mt-4 max-h-[60vh] overflow-auto rounded-xl border border-black/10">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                    <tr>
+                      <th className="px-4 py-2">分P</th>
+                      <th className="px-4 py-2">CID</th>
+                      <th className="px-4 py-2">标题</th>
+                      <th className="px-4 py-2">时长</th>
+                      <th className="px-4 py-2">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sourcePartPickerPages.length === 0 ? (
+                      <tr>
+                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
+                          未查询到分P，可直接绑定当前 BV
+                        </td>
+                      </tr>
+                    ) : (
+                      sourcePartPickerPages.map((page) => (
+                        <tr
+                          key={`${page.cid}-${page.page || 0}`}
+                          className="border-t border-black/5"
+                        >
+                          <td className="px-4 py-2 text-[var(--ink)]">P{page.page || "-"}</td>
+                          <td className="px-4 py-2 text-[var(--muted)]">{page.cid || "-"}</td>
+                          <td className="px-4 py-2 text-[var(--ink)]">
+                            {page.partName || page.part_title || "-"}
+                          </td>
+                          <td className="px-4 py-2 text-[var(--muted)]">
+                            {formatDurationHms(Number(page.durationSeconds || page.duration || 0))}
+                          </td>
+                          <td className="px-4 py-2">
+                            <button
+                              type="button"
+                              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                              onClick={() => handleConfirmSourcePartBinding(page)}
+                            >
+                              绑定
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  type="button"
+                  className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={closeSourcePartPicker}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
+                  onClick={handleConfirmSourceBvidBinding}
+                >
+                  直接绑定BV
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )
+      : null;
 
   return (
     <div className="space-y-6">
@@ -5399,7 +6141,7 @@ export default function SubmissionSection({
               }
               disabled={isReadOnly}
             />
-            优先投稿（进入投稿队列时置顶）
+            优先投稿（按最近设置时间参与队列优先级）
           </label>
           <div className="text-xs text-[var(--muted)]">
             分段前缀会作为分段文件名的前缀（可选）
@@ -5561,6 +6303,7 @@ export default function SubmissionSection({
                 <th className="px-4 py-2">独立分组</th>
                 <th className="px-4 py-2">视频文件（必填）</th>
                 <th className="px-4 py-2">源视频 BV 号</th>
+                <th className="px-4 py-2">分P标题</th>
                 <th className="px-4 py-2">开始时间</th>
                 <th className="px-4 py-2">结束时间</th>
                 <th className="px-4 py-2">合并状态</th>
@@ -5570,7 +6313,7 @@ export default function SubmissionSection({
             <tbody>
               {mergeItems.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-3 text-[var(--muted)]" colSpan={9}>
+                  <td className="px-4 py-3 text-[var(--muted)]" colSpan={10}>
                     暂无配置
                   </td>
                 </tr>
@@ -5589,7 +6332,7 @@ export default function SubmissionSection({
                         data-merge-item-id={item.id}
                         className="border-t border-black/5"
                       >
-                        <td className="p-0" colSpan={8}>
+                        <td className="p-0" colSpan={10}>
                           <div className="m-2 overflow-hidden rounded-xl border-2 border-[var(--accent)]/40 bg-white/70">
                             <div
                               className={`flex items-center justify-between border-b border-[var(--accent)]/30 bg-[var(--accent)]/10 px-3 py-2 text-xs text-[var(--muted)] ${
@@ -5677,11 +6420,12 @@ export default function SubmissionSection({
           <div className="w-full max-w-2xl rounded-2xl bg-white p-5 shadow-lg">
             <div className="flex items-center justify-between gap-3">
               <div className="text-sm font-semibold text-[var(--ink)]">一键填写</div>
-              <button
-                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                onClick={closeQuickFill}
-              >
-                关闭
+                  <button
+                    type="button"
+                    className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={closeQuickFill}
+                  >
+                    关闭
               </button>
             </div>
             <div className="mt-3">
@@ -5754,20 +6498,27 @@ export default function SubmissionSection({
         </div>
       ) : null}
 
-      {updateOpen ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
-          <div className="w-full max-w-5xl rounded-2xl bg-white p-5 shadow-lg">
-            <div className="flex items-center justify-between gap-3">
-              <div className="text-sm font-semibold text-[var(--ink)]">视频更新</div>
-              <button
-                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                onClick={closeUpdateModal}
-              >
-                关闭
-              </button>
+      {isUpdateView ? (
+        <div className="rounded-2xl bg-white/80 p-6 shadow-sm ring-1 ring-black/5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-[0.2em] text-[var(--muted)]">
+                视频更新
+              </div>
+              <div className="mt-1 text-xs text-[var(--muted)]">
+                支持本地文件与远程分P混合配置，远程源视频会在下载完成后自动继续更新流程。
+              </div>
             </div>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+              onClick={backToList}
+            >
+              返回列表
+            </button>
+          </div>
+          <div className="mt-4">
             {message ? (
-              <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
                 {message}
               </div>
             ) : null}
@@ -5905,12 +6656,26 @@ export default function SubmissionSection({
                   <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                     源视频配置
                   </div>
-                  <button
-                    className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
-                    onClick={addUpdateSource}
-                  >
-                    添加视频
-                  </button>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                      onClick={openUpdateImportModal}
+                    >
+                      导入视频
+                    </button>
+                    <button
+                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                      onClick={createUpdateMergeGroup}
+                    >
+                      创建合并组
+                    </button>
+                    <button
+                      className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
+                      onClick={addUpdateSource}
+                    >
+                      添加视频
+                    </button>
+                  </div>
                 </div>
                 <div className="mt-3 overflow-hidden rounded-xl border border-black/5">
                   <table className="w-full text-left text-sm">
@@ -5919,8 +6684,12 @@ export default function SubmissionSection({
                         <th className="px-4 py-2">序号</th>
                         <th className="px-4 py-2">视频文件（必填）</th>
                         <th className="px-4 py-2">源视频 BV 号</th>
+                        <th className="px-4 py-2">分P标题</th>
                         <th className="px-4 py-2">开始时间</th>
                         <th className="px-4 py-2">结束时间</th>
+                        <th className="px-4 py-2">合并</th>
+                        <th className="px-4 py-2">独立分组</th>
+                        <th className="px-4 py-2">合并状态</th>
                         <th className="px-4 py-2">操作</th>
                       </tr>
                     </thead>
@@ -5950,14 +6719,34 @@ export default function SubmissionSection({
                             </div>
                           </td>
                           <td className="px-4 py-2">
-                            <input
-                              value={item.remoteBvid || ""}
-                              onChange={(event) =>
-                                updateUpdateSource(index, "remoteBvid", event.target.value)
-                              }
-                              placeholder="可选，填写源视频 BV 号"
-                              className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                            />
+                            <div className="space-y-2">
+                              <div className="flex flex-wrap gap-2">
+                                <input
+                                  value={item.remoteBvid || ""}
+                                  onChange={(event) =>
+                                    updateUpdateSource(index, "remoteBvid", event.target.value)
+                                  }
+                                  placeholder="可选，填写源视频 BV 号或链接"
+                                  className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                                />
+                                <button
+                                  type="button"
+                                  className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                                  onClick={() => handleChooseSourceRemotePart("update", index)}
+                                  disabled={sourcePartPickerLoadingId === item.localId}
+                                >
+                                  {sourcePartPickerLoadingId === item.localId ? "查询中" : "选择分P"}
+                                </button>
+                              </div>
+                              {formatSourceBindingSummary(item) ? (
+                                <div className="text-xs text-[var(--muted)]">
+                                  {formatSourceBindingSummary(item)}
+                                </div>
+                              ) : null}
+                            </div>
+                          </td>
+                          <td className="px-4 py-2 text-[var(--muted)]">
+                            {item.remotePartTitle || (item.remoteBvid ? "未指定分P" : "-")}
                           </td>
                           <td className="px-4 py-2">
                             <input
@@ -5982,6 +6771,51 @@ export default function SubmissionSection({
                             />
                           </td>
                           <td className="px-4 py-2">
+                            <input
+                              type="checkbox"
+                              checked={updateMergeSelection.has(item.localId)}
+                              onChange={(event) =>
+                                toggleUpdateMergeSelection(item.localId, event.target.checked)
+                              }
+                              disabled={
+                                buildGroupedSourceIdSet(updateMergeItems).has(item.localId) ||
+                                updateMergeItems.some(
+                                  (candidate) =>
+                                    candidate.type === "SOURCE" &&
+                                    candidate.sourceId === item.localId &&
+                                    candidate.standalone,
+                                )
+                              }
+                            />
+                          </td>
+                          <td className="px-4 py-2">
+                            <input
+                              type="checkbox"
+                              title="独立分组"
+                              checked={
+                                updateMergeItems.find(
+                                  (candidate) =>
+                                    candidate.type === "SOURCE" &&
+                                    candidate.sourceId === item.localId,
+                                )?.standalone || false
+                              }
+                              onChange={() => toggleUpdateMergeStandalone(item.localId)}
+                              disabled={buildGroupedSourceIdSet(updateMergeItems).has(item.localId)}
+                            />
+                          </td>
+                          <td className="px-4 py-2 text-[var(--muted)]">
+                            {buildGroupedSourceIdSet(updateMergeItems).has(item.localId)
+                              ? "已加入合并组"
+                              : updateMergeItems.find(
+                                    (candidate) =>
+                                      candidate.type === "SOURCE" &&
+                                      candidate.sourceId === item.localId &&
+                                      candidate.standalone,
+                                  )?.standalone
+                                ? "独立分组"
+                                : "未配置"}
+                          </td>
+                          <td className="px-4 py-2">
                             <div className="flex flex-wrap gap-2">
                               <button
                                 className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
@@ -6002,6 +6836,50 @@ export default function SubmissionSection({
                     </tbody>
                   </table>
                 </div>
+                <div className="mt-3 rounded-xl border border-black/5 bg-white/80 p-3">
+                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                    合并配置
+                  </div>
+                  <div className="mt-2 space-y-2 text-xs text-[var(--ink)]">
+                    {updateMergeItems.filter((item) => item.type === "GROUP").length === 0 ? (
+                      <div className="text-[var(--muted)]">当前未创建合并组</div>
+                    ) : (
+                      updateMergeItems
+                        .filter((item) => item.type === "GROUP")
+                        .map((group, groupIndex) => {
+                          const sourceNames = (group.sourceIds || [])
+                            .map((sourceId) => {
+                              const source = updateSourceVideos.find((item) => item.localId === sourceId);
+                              return (
+                                String(source?.remotePartTitle || "").trim() ||
+                                String(source?.sourceFilePath || "").split(/[\\/]/).pop() ||
+                                sourceId
+                              );
+                            })
+                            .join("，");
+                          return (
+                            <div
+                              key={group.id}
+                              className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-black/10 bg-white px-3 py-2"
+                            >
+                              <div>
+                                <div className="font-semibold text-[var(--ink)]">
+                                  合并组 {groupIndex + 1}
+                                </div>
+                                <div className="text-[var(--muted)]">{sourceNames || "-"}</div>
+                              </div>
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
+                                onClick={() => releaseUpdateMergeGroup(group.id)}
+                              >
+                                解除合并
+                              </button>
+                            </div>
+                          );
+                        })
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
             <div className="mt-4 flex flex-wrap gap-2">
@@ -6011,6 +6889,124 @@ export default function SubmissionSection({
                 disabled={updateSubmitting}
               >
                 {updateSubmitting ? "提交中" : "提交更新"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {updateImportOpen ? (
+        <div className="fixed inset-0 z-[55] flex items-center justify-center bg-black/40 px-4">
+          <div className="w-full max-w-5xl rounded-2xl bg-white p-5 shadow-lg">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold text-[var(--ink)]">导入远程视频</div>
+                <div className="mt-1 text-xs text-[var(--muted)]">
+                  支持一次输入多个 BVID 或视频链接，按换行、空格或逗号分隔。
+                </div>
+              </div>
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={closeUpdateImportModal}
+                disabled={updateImportLoading}
+              >
+                关闭
+              </button>
+            </div>
+            <div className="mt-4 grid gap-3">
+              <textarea
+                value={updateImportInput}
+                onChange={(event) => setUpdateImportInput(event.target.value)}
+                placeholder={"例如：\nBV1xx...\nBV1yy...\nhttps://www.bilibili.com/video/BV1zz..."}
+                className="min-h-28 w-full rounded-xl border border-black/10 bg-white/80 px-3 py-3 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
+              />
+              <div className="flex justify-end gap-2">
+                <button
+                  className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={closeUpdateImportModal}
+                  disabled={updateImportLoading}
+                >
+                  取消
+                </button>
+                <button
+                  className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                  onClick={handleUpdateImportQuery}
+                  disabled={updateImportLoading}
+                >
+                  {updateImportLoading ? "查询中" : "查询视频"}
+                </button>
+              </div>
+            </div>
+            <div className="mt-4 max-h-[55vh] overflow-auto rounded-xl border border-black/10">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                  <tr>
+                    <th className="px-4 py-2">选择</th>
+                    <th className="px-4 py-2">BV号</th>
+                    <th className="px-4 py-2">分P</th>
+                    <th className="px-4 py-2">标题</th>
+                    <th className="px-4 py-2">时长</th>
+                    <th className="px-4 py-2">导入后路径</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {updateImportResults.length === 0 ? (
+                    <tr>
+                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
+                        暂无查询结果
+                      </td>
+                    </tr>
+                  ) : (
+                    updateImportResults.flatMap((preview) =>
+                      (preview.pages || []).map((page) => {
+                        const key = `${preview.bvid}:${page.cid}`;
+                        return (
+                          <tr key={key} className="border-t border-black/5">
+                            <td className="px-4 py-2">
+                              <input
+                                type="checkbox"
+                                checked={updateImportSelection.has(key)}
+                                onChange={(event) =>
+                                  toggleUpdateImportSelection(key, event.target.checked)
+                                }
+                              />
+                            </td>
+                            <td className="px-4 py-2 text-[var(--ink)]">{preview.bvid}</td>
+                            <td className="px-4 py-2 text-[var(--muted)]">
+                              P{page.page || "-"} / CID {page.cid || "-"}
+                            </td>
+                            <td className="px-4 py-2 text-[var(--ink)]">
+                              {page.partName || page.part_title || preview.title || "-"}
+                            </td>
+                            <td className="px-4 py-2 text-[var(--muted)]">
+                              {formatDurationHms(
+                                Number(page.durationSeconds || page.duration || 0),
+                              )}
+                            </td>
+                            <td className="px-4 py-2 text-[var(--muted)]">
+                              {buildUpdateImportedSourcePath(preview, page) || "-"}
+                            </td>
+                          </tr>
+                        );
+                      }),
+                    )
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={closeUpdateImportModal}
+                disabled={updateImportLoading}
+              >
+                取消
+              </button>
+              <button
+                className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                onClick={handleApplyUpdateImportedSources}
+                disabled={updateImportSelection.size === 0}
+              >
+                导入已选分P
               </button>
             </div>
           </div>
@@ -6149,9 +7145,10 @@ export default function SubmissionSection({
                 <th className="px-6 py-3">标题</th>
                 <th className="px-6 py-3">任务状态</th>
                 <th className="px-6 py-3">工作流状态</th>
+                <th className="px-6 py-3">投稿状态</th>
                 <th className="px-6 py-3">BVID</th>
                 <th className="px-6 py-3">UP主</th>
-                <th className="px-6 py-3">投稿状态</th>
+                <th className="px-6 py-3">优先时间</th>
                 <th className="px-6 py-3">创建时间</th>
                 <th className="px-6 py-3">更新时间</th>
                 <th className="sticky right-0 z-20 bg-[var(--surface)] px-6 py-3 shadow-[-6px_0_10px_-6px_rgba(0,0,0,0.2)]">
@@ -6162,7 +7159,7 @@ export default function SubmissionSection({
             <tbody className="whitespace-nowrap">
               {tasks.length === 0 ? (
                 <tr>
-                  <td className="px-6 py-4 text-[var(--muted)]" colSpan={10}>
+                  <td className="px-6 py-4 text-[var(--muted)]" colSpan={11}>
                     暂无任务。
                   </td>
                 </tr>
@@ -6248,6 +7245,29 @@ export default function SubmissionSection({
                         <span className="text-xs text-[var(--muted)]">无工作流</span>
                       )}
                     </td>
+                    <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
+                      {(() => {
+                        const reason = resolveRejectReason(task);
+                        const showTooltip = isRemoteFailed(task) && reason !== "-";
+                        const remoteStatus = resolveRemoteStatus(task);
+                        return (
+                          <div className="group relative inline-block">
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${remoteStatusTone(
+                                remoteStatus,
+                              )}`}
+                            >
+                              {remoteStatus}
+                            </span>
+                            {showTooltip ? (
+                              <div className="pointer-events-none absolute left-0 top-full z-50 mt-1 w-[320px] max-w-[360px] rounded-lg border border-black/10 bg-white px-3 py-2 text-xs text-[var(--ink)] shadow-lg opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                                <div className="whitespace-normal break-words">{reason}</div>
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })()}
+                    </td>
                     <td className="px-6 py-3 whitespace-nowrap">
                       {task.bvid ? (
                         <button
@@ -6273,27 +7293,7 @@ export default function SubmissionSection({
                       )}
                     </td>
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
-                      {(() => {
-                        const reason = resolveRejectReason(task);
-                        const showTooltip = isRemoteFailed(task) && reason !== "-";
-                        const remoteStatus = resolveRemoteStatus(task);
-                        return (
-                          <div className="group relative inline-block">
-                            <span
-                              className={`rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${remoteStatusTone(
-                                remoteStatus,
-                              )}`}
-                            >
-                              {remoteStatus}
-                            </span>
-                            {showTooltip ? (
-                              <div className="pointer-events-none absolute left-0 top-full z-50 mt-1 w-[320px] max-w-[360px] rounded-lg border border-black/10 bg-white px-3 py-2 text-xs text-[var(--ink)] shadow-lg opacity-0 transition-opacity duration-150 group-hover:opacity-100">
-                                <div className="whitespace-normal break-words">{reason}</div>
-                              </div>
-                            ) : null}
-                          </div>
-                        );
-                      })()}
+                      {task.priorityAt ? formatDateTime(task.priorityAt) : "-"}
                     </td>
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
                       {formatDateTime(task.createdAt)}
@@ -6351,15 +7351,12 @@ export default function SubmissionSection({
                             重新分段
                           </button>
                         ) : null}
-                        {task.status === "WAITING_UPLOAD" ? (
-                          <button
-                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:opacity-60"
-                            onClick={() => handleQueuePrioritize(task.taskId)}
-                            disabled={task.priority}
-                          >
-                            {task.priority ? "已优先" : "优先投稿"}
-                          </button>
-                        ) : null}
+                        <button
+                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                          onClick={() => handleQueuePrioritize(task.taskId)}
+                        >
+                          {task.priority ? "刷新优先" : "优先投稿"}
+                        </button>
                         {task.status === "FAILED" && task.hasIntegratedDownloads ? (
                           <button
                             className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
@@ -6373,6 +7370,12 @@ export default function SubmissionSection({
                           onClick={() => openRepostModal(task)}
                         >
                           重新投稿
+                        </button>
+                        <button
+                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                          onClick={() => openTranscodeRepostModal(task)}
+                        >
+                          转码投稿
                         </button>
                         <button
                           className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
@@ -6801,6 +7804,76 @@ export default function SubmissionSection({
                     spinnerClassName="h-3 w-3"
                   >
                     开始重新投稿
+                  </LoadingButton>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {transcodeRepostOpen ? (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+              <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-lg">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-[var(--ink)]">转码投稿</div>
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={closeTranscodeRepostModal}
+                  >
+                    关闭
+                  </button>
+                </div>
+                {message ? (
+                  <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                    {message}
+                  </div>
+                ) : null}
+                <div className="mt-4 space-y-3 text-sm text-[var(--ink)]">
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-xs leading-6 text-amber-800">
+                    该操作会从当前任务的源视频重新开始处理，不复用旧的剪辑、合并、分段产物。
+                    处理链路固定为“剪辑转码 + 合并转码 + 分段 copy”，用于兜底修复时间戳异常、音画不同步等问题。
+                  </div>
+                  <div className="space-y-2">
+                    <div className="text-xs text-[var(--muted)]">投稿方式</div>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={transcodeRepostUseCurrentBvid}
+                        onChange={() => setTranscodeRepostUseCurrentBvid(true)}
+                        disabled={!transcodeRepostHasBvid}
+                      />
+                      <span className={transcodeRepostHasBvid ? "" : "text-[var(--muted)]"}>
+                        集成当前BV视频（编辑投稿，沿用BV号）
+                      </span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={!transcodeRepostUseCurrentBvid}
+                        onChange={() => setTranscodeRepostUseCurrentBvid(false)}
+                      />
+                      <span>重新生成投稿（创建新的BV号）</span>
+                    </label>
+                    {!transcodeRepostHasBvid ? (
+                      <div className="text-xs text-amber-700">
+                        当前任务没有BV号，将创建新投稿。
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={closeTranscodeRepostModal}
+                  >
+                    取消
+                  </button>
+                  <LoadingButton
+                    className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={handleTranscodeRepostSubmit}
+                    loading={transcodeRepostSubmitting}
+                    loadingLabel="处理中"
+                    spinnerClassName="h-3 w-3"
+                  >
+                    开始转码投稿
                   </LoadingButton>
                 </div>
               </div>
@@ -7406,6 +8479,7 @@ export default function SubmissionSection({
                         <th className="px-4 py-2">序号</th>
                         <th className="px-4 py-2">视频文件路径</th>
                         <th className="px-4 py-2">源视频 BV 号</th>
+                        <th className="px-4 py-2">分P标题</th>
                         <th className="px-4 py-2">开始时间</th>
                         <th className="px-4 py-2">结束时间</th>
                         <th className="px-4 py-2">操作</th>
@@ -7414,7 +8488,7 @@ export default function SubmissionSection({
                     <tbody>
                       {sourceVideos.length === 0 ? (
                         <tr>
-                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
+                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={7}>
                             暂无源视频
                           </td>
                         </tr>
@@ -7460,14 +8534,34 @@ export default function SubmissionSection({
                               </div>
                             </td>
                             <td className="px-4 py-2">
-                              <input
-                                value={item.remoteBvid || ""}
-                                onChange={(event) =>
-                                  updateSource(index, "remoteBvid", event.target.value)
-                                }
-                                placeholder="可选，填写源视频 BV 号"
-                                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                              />
+                              <div className="space-y-2">
+                                <div className="flex flex-wrap gap-2">
+                                  <input
+                                    value={item.remoteBvid || ""}
+                                    onChange={(event) =>
+                                      updateSource(index, "remoteBvid", event.target.value)
+                                    }
+                                    placeholder="可选，填写源视频 BV 号或链接"
+                                    className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                                  />
+                                  <button
+                                    type="button"
+                                    className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                                    onClick={() => handleChooseSourceRemotePart("create", index)}
+                                    disabled={sourcePartPickerLoadingId === item.localId}
+                                  >
+                                    {sourcePartPickerLoadingId === item.localId ? "查询中" : "选择分P"}
+                                  </button>
+                                </div>
+                                {formatSourceBindingSummary(item) ? (
+                                  <div className="text-xs text-[var(--muted)]">
+                                    {formatSourceBindingSummary(item)}
+                                  </div>
+                                ) : null}
+                              </div>
+                            </td>
+                            <td className="px-4 py-2 text-[var(--muted)]">
+                              {item.remotePartTitle || (item.remoteBvid ? "未指定分P" : "-")}
                             </td>
                             <td className="px-4 py-2">
                               <input
@@ -7517,18 +8611,19 @@ export default function SubmissionSection({
                 <table className="w-full text-left text-sm">
                   <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                     <tr>
-                      <th className="px-4 py-2">序号</th>
-                      <th className="px-4 py-2">视频文件路径</th>
-                      <th className="px-4 py-2">源视频 BV 号</th>
-                      <th className="px-4 py-2">开始时间</th>
-                      <th className="px-4 py-2">结束时间</th>
-                      <th className="px-4 py-2">操作</th>
+                        <th className="px-4 py-2">序号</th>
+                        <th className="px-4 py-2">视频文件路径</th>
+                        <th className="px-4 py-2">源视频 BV 号</th>
+                        <th className="px-4 py-2">分P标题</th>
+                        <th className="px-4 py-2">开始时间</th>
+                        <th className="px-4 py-2">结束时间</th>
+                        <th className="px-4 py-2">操作</th>
                     </tr>
                   </thead>
                   <tbody>
                     {selectedTask.sourceVideos.length === 0 ? (
                       <tr>
-                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
+                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={7}>
                           暂无源视频
                         </td>
                       </tr>
@@ -7537,7 +8632,17 @@ export default function SubmissionSection({
                         <tr key={item.id} className="border-t border-black/5">
                           <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
                           <td className="px-4 py-2 text-[var(--ink)]">{item.sourceFilePath}</td>
-                          <td className="px-4 py-2 text-[var(--muted)]">{item.remoteBvid || ""}</td>
+                          <td className="px-4 py-2 text-[var(--muted)]">
+                            <div>{item.remoteBvid || ""}</div>
+                            {formatSourceBindingSummary(item) ? (
+                              <div className="text-[10px] text-[var(--muted)]">
+                                {formatSourceBindingSummary(item)}
+                              </div>
+                            ) : null}
+                          </td>
+                          <td className="px-4 py-2 text-[var(--muted)]">
+                            {item.remotePartTitle || (item.remoteBvid ? "未指定分P" : "-")}
+                          </td>
                           <td className="px-4 py-2 text-[var(--muted)]">{item.startTime || "-"}</td>
                           <td className="px-4 py-2 text-[var(--muted)]">{item.endTime || "-"}</td>
                           <td className="px-4 py-2">
@@ -8142,6 +9247,7 @@ export default function SubmissionSection({
           </div>
         </div>
       ) : null}
+      {sourcePartPickerModal}
       {coverPreviewModalOpen ? (
         <div
           className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 px-4 py-6"

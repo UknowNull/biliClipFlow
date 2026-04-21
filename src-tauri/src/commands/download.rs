@@ -955,6 +955,50 @@ pub fn recover_stale_downloads(state: &AppState) {
     });
 }
 
+fn load_stale_integration_relation_record_ids(
+    context: &DownloadContext,
+) -> Result<Vec<i64>, String> {
+    context
+        .db
+        .with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT MIN(tr.download_task_id) \
+                 FROM task_relations tr \
+                 JOIN video_download vd ON vd.id = tr.download_task_id \
+                 JOIN submission_task st ON st.task_id = tr.submission_task_id \
+                 WHERE tr.relation_type = 'INTEGRATED' \
+                   AND tr.workflow_status = 'PENDING_DOWNLOAD' \
+                   AND vd.status = 2 \
+                   AND st.status = 'COMPLETED' \
+                 GROUP BY tr.submission_task_id",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .map_err(|err| err.to_string())
+}
+
+pub fn repair_stale_integration_relations(state: &AppState) {
+    let context = DownloadContext::from_state(state);
+    let record_ids = load_stale_integration_relation_record_ids(&context).unwrap_or_default();
+    if record_ids.is_empty() {
+        append_log(&context.app_log_path, "download_repair_relations none");
+        return;
+    }
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "download_repair_relations scheduled count={}",
+            record_ids.len()
+        ),
+    );
+    tauri::async_runtime::spawn(async move {
+        for record_id in record_ids {
+            let _ = refresh_integration_status(&context, record_id).await;
+        }
+    });
+}
+
 pub fn start_download_queue_loop(state: &AppState) {
     let context = DownloadContext::from_state(state);
     tauri::async_runtime::spawn(async move {
@@ -1087,13 +1131,20 @@ async fn handle_integration_download(
     }
 
     let insert_result = context.db.with_conn(|conn| {
+    let priority_enabled = submission.priority.unwrap_or(false);
+    let priority_at = if priority_enabled {
+      Some(now.as_str())
+    } else {
+      None
+    };
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
-       VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+      "INSERT INTO submission_task (task_id, status, priority, priority_at, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
       params![
         &submission_id,
         "PENDING",
-        if submission.priority.unwrap_or(false) { 1 } else { 0 },
+        if priority_enabled { 1 } else { 0 },
+        priority_at,
         submission.title,
         submission.description,
         submission.partition_id,
@@ -2290,7 +2341,7 @@ async fn download_part(
             )
             .await
             {
-                if has_partial_file(&output_path) {
+                if should_pause_for_aria2c_resume(&err, &output_path) {
                     append_log(
                         &context.app_log_path,
                         &format!(
@@ -2301,7 +2352,7 @@ async fn download_part(
                     );
                     return Err("aria2c下载中断，可重试续传".to_string());
                 }
-                cleanup_aria2c_files(&output_path);
+                cleanup_aria2c_resume_artifacts(&output_path);
                 append_log(
                     &context.app_log_path,
                     &format!("aria2c_fallback record_id={} err={}", record_id, err),
@@ -2372,7 +2423,7 @@ async fn download_part(
                 )
                 .await
                 {
-                    if has_partial_file(&output_path) {
+                    if should_pause_for_aria2c_resume(&err, &output_path) {
                         append_log(
                             &context.app_log_path,
                             &format!(
@@ -2383,7 +2434,7 @@ async fn download_part(
                         );
                         return Err("aria2c下载中断，可重试续传".to_string());
                     }
-                    cleanup_aria2c_files(&output_path);
+                    cleanup_aria2c_resume_artifacts(&output_path);
                     append_log(
                         &context.app_log_path,
                         &format!("aria2c_fallback record_id={} err={}", record_id, err),
@@ -2442,7 +2493,7 @@ async fn download_part(
                 )
                 .await
                 {
-                    if has_partial_file(&output_path) {
+                    if should_pause_for_aria2c_resume(&err, &output_path) {
                         append_log(
                             &context.app_log_path,
                             &format!(
@@ -2453,7 +2504,7 @@ async fn download_part(
                         );
                         return Err("aria2c下载中断，可重试续传".to_string());
                     }
-                    cleanup_aria2c_files(&output_path);
+                    cleanup_aria2c_resume_artifacts(&output_path);
                     append_log(
                         &context.app_log_path,
                         &format!("aria2c_fallback record_id={} err={}", record_id, err),
@@ -2551,9 +2602,17 @@ async fn download_part(
                             }
                         }
                         if video_result.is_err() || audio_result.is_err() {
-                            if has_partial_file(&temp_video_path)
-                                && has_partial_file(&temp_audio_path)
-                            {
+                            let can_resume_video = video_result
+                                .as_ref()
+                                .err()
+                                .map(|err| should_pause_for_aria2c_resume(err, &temp_video_path))
+                                .unwrap_or(false);
+                            let can_resume_audio = audio_result
+                                .as_ref()
+                                .err()
+                                .map(|err| should_pause_for_aria2c_resume(err, &temp_audio_path))
+                                .unwrap_or(false);
+                            if can_resume_video && can_resume_audio {
                                 append_log(
                                     &context.app_log_path,
                                     &format!(
@@ -2590,10 +2649,8 @@ async fn download_part(
                                     }
                                 }
                             }
-                            if has_partial_file(&temp_video_path)
-                                || has_partial_file(&temp_audio_path)
-                            {
-                                let resume_path = if has_partial_file(&temp_audio_path) {
+                            if can_resume_video || can_resume_audio {
+                                let resume_path = if can_resume_audio {
                                     &temp_audio_path
                                 } else {
                                     &temp_video_path
@@ -2608,8 +2665,8 @@ async fn download_part(
                                 );
                                 return Err("aria2c下载中断，可重试续传".to_string());
                             }
-                            cleanup_aria2c_files(&temp_video_path);
-                            cleanup_aria2c_files(&temp_audio_path);
+                            cleanup_aria2c_resume_artifacts(&temp_video_path);
+                            cleanup_aria2c_resume_artifacts(&temp_audio_path);
                             aria2c_failed = true;
                         } else {
                             match merge_dash_stream_files(
@@ -3074,6 +3131,14 @@ fn has_partial_file(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|meta| meta.len() > 0)
         .unwrap_or(false)
+}
+
+fn should_pause_for_aria2c_resume(message: &str, path: &Path) -> bool {
+    !is_aria2c_missing_error(message) && has_partial_file(path)
+}
+
+fn cleanup_aria2c_resume_artifacts(path: &Path) {
+    cleanup_aria2c_files(path);
 }
 
 fn cleanup_aria2c_files(path: &Path) {
@@ -4505,10 +4570,29 @@ async fn refresh_integration_status(
     if completed == total {
         let _ = update_relation_workflow_status(context, &submission_task_id, "READY");
         let submission_status = load_submission_status(context, &submission_task_id)?;
+        let workflow_status = load_workflow_instance_status(context, &submission_task_id)?;
         if submission_status == "FAILED" {
+            if workflow_status.as_deref() == Some("FAILED") {
+                let _ = update_submission_status(context, &submission_task_id, "PENDING");
+                crate::commands::submission::start_submission_workflow(
+                    context.db.clone(),
+                    context.app_log_path.clone(),
+                    context.edit_upload_state.clone(),
+                    submission_task_id.clone(),
+                );
+                let _ =
+                    update_relation_workflow_status(context, &submission_task_id, "WORKFLOW_STARTED");
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "download_integration_resume_submission task_id={} reason=downloads_ready_after_failed_wait",
+                        submission_task_id
+                    ),
+                );
+            }
             return Ok(());
         }
-        if let Some(status) = load_workflow_instance_status(context, &submission_task_id)? {
+        if let Some(status) = workflow_status {
             if status == "VIDEO_DOWNLOADING" {
                 let _ = update_workflow_instance_status(context, &submission_task_id, "COMPLETED");
                 return Ok(());

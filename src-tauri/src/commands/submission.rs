@@ -33,7 +33,8 @@ use crate::commands::settings::{
     DEFAULT_UPLOAD_CONCURRENCY,
 };
 use crate::config::default_download_dir;
-use crate::db::Db;
+use crate::db::{Db, DbError};
+use crate::ffmpeg::{run_ffprobe_capture, run_ffprobe_json};
 use crate::login_refresh;
 use crate::login_store::{AuthInfo, LoginStore};
 use crate::path_store::{
@@ -42,8 +43,9 @@ use crate::path_store::{
     to_stored_local_path_with_prefix,
 };
 use crate::processing::{
-    clip_sources, decide_clip_copy, merge_files, parse_time_to_seconds, probe_duration_seconds,
-    segment_file, ClipSource,
+    clip_sources, clip_sources_transcode, decide_clip_copy, merge_files, merge_files_transcode,
+    parse_time_to_seconds, probe_duration_seconds, segment_file, segment_file_with_options,
+    ClipSource, TranscodeProfile,
 };
 #[cfg(target_os = "windows")]
 use crate::utils::apply_no_window;
@@ -167,6 +169,9 @@ pub struct SourceVideoInput {
     pub start_time: Option<String>,
     pub end_time: Option<String>,
     pub remote_bvid: Option<String>,
+    pub remote_aid: Option<i64>,
+    pub remote_cid: Option<i64>,
+    pub remote_part_title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -210,12 +215,25 @@ pub struct SubmissionRepostRequest {
     pub baidu_sync_filename: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionTranscodeRepostRequest {
+    pub task_id: String,
+    pub integrate_current_bvid: bool,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ReprocessMode {
     Legacy,
     Specified,
     MergeAll,
     FullReprocess,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaProcessMode {
+    CopyOnly,
+    ClipAndMergeTranscode,
 }
 
 const FALLBACK_REASON_REPOST_MISSING_MERGED: &str = "合并视频缺失（重新投稿已回退源视频重下）";
@@ -249,6 +267,21 @@ fn reprocess_mode_to_str(mode: ReprocessMode) -> &'static str {
     }
 }
 
+fn media_process_mode_to_str(mode: MediaProcessMode) -> &'static str {
+    match mode {
+        MediaProcessMode::CopyOnly => "COPY_ONLY",
+        MediaProcessMode::ClipAndMergeTranscode => "CLIP_AND_MERGE_TRANSCODE",
+    }
+}
+
+fn parse_media_process_mode(mode: Option<&str>) -> MediaProcessMode {
+    let normalized = mode.unwrap_or("").trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "CLIP_AND_MERGE_TRANSCODE" => MediaProcessMode::ClipAndMergeTranscode,
+        _ => MediaProcessMode::CopyOnly,
+    }
+}
+
 fn apply_reprocess_metadata(config: &mut Value, mode: ReprocessMode, merged_video_id: Option<i64>) {
     if !config.is_object() {
         *config = Value::Object(Map::new());
@@ -270,6 +303,19 @@ fn apply_reprocess_metadata(config: &mut Value, mode: ReprocessMode, merged_vide
     }
 }
 
+fn apply_media_process_mode(config: &mut Value, mode: MediaProcessMode) {
+    if !config.is_object() {
+        *config = Value::Object(Map::new());
+    }
+    let Some(map) = config.as_object_mut() else {
+        return;
+    };
+    map.insert(
+        "mediaProcessMode".to_string(),
+        Value::String(media_process_mode_to_str(mode).to_string()),
+    );
+}
+
 fn load_reprocess_metadata(config: Option<&Value>) -> (ReprocessMode, Option<i64>) {
     let Some(config) = config else {
         return (ReprocessMode::Legacy, None);
@@ -283,6 +329,17 @@ fn load_reprocess_metadata(config: Option<&Value>) -> (ReprocessMode, Option<i64
         .get("reprocessMergedId")
         .and_then(|value| value.as_i64());
     (mode, merged_id)
+}
+
+fn load_media_process_mode(config: Option<&Value>) -> MediaProcessMode {
+    let Some(config) = config else {
+        return MediaProcessMode::CopyOnly;
+    };
+    config
+        .get("mediaProcessMode")
+        .and_then(|value| value.as_str())
+        .map(|value| parse_media_process_mode(Some(value)))
+        .unwrap_or(MediaProcessMode::CopyOnly)
 }
 
 fn apply_resegment_terminal_metadata(config: &mut Value, started_from_terminal: bool) {
@@ -511,6 +568,7 @@ pub struct SubmissionTaskRecord {
     pub task_id: String,
     pub status: String,
     pub priority: bool,
+    pub priority_at: Option<String>,
     pub title: String,
     pub description: Option<String>,
     pub cover_url: Option<String>,
@@ -558,6 +616,9 @@ pub struct TaskSourceVideoRecord {
     pub start_time: Option<String>,
     pub end_time: Option<String>,
     pub remote_bvid: Option<String>,
+    pub remote_aid: Option<i64>,
+    pub remote_cid: Option<i64>,
+    pub remote_part_title: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -980,12 +1041,19 @@ pub async fn submission_create(
       .unwrap_or_else(|| "NORMAL".to_string())
       .trim()
       .to_ascii_uppercase();
+    let priority_enabled = request.task.priority.unwrap_or(false);
+    let priority_at = if priority_enabled {
+      Some(now.as_str())
+    } else {
+      None
+    };
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, cover_local_path, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename, source_type) \
-       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+      "INSERT INTO submission_task (task_id, status, priority, priority_at, title, description, cover_url, cover_local_path, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename, source_type) \
+       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
       params![
         &task_id,
-        if request.task.priority.unwrap_or(false) { 1 } else { 0 },
+        if priority_enabled { 1 } else { 0 },
+        priority_at,
         &request.task.title,
         request.task.description.as_deref(),
         normalized_cover_url.as_deref(),
@@ -1019,14 +1087,11 @@ pub async fn submission_create(
 
     for (source, stored_source_path) in request.source_videos.iter().zip(stored_source_paths.iter()) {
       let source_id = uuid::Uuid::new_v4().to_string();
-      let remote_bvid = source
-        .remote_bvid
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+      let (remote_bvid, remote_aid, remote_cid, remote_part_title, remote_video_url) =
+        normalize_source_remote_binding(source);
       conn.execute(
-        "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_bvid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         (
           source_id,
           &task_id,
@@ -1034,7 +1099,11 @@ pub async fn submission_create(
           source.sort_order,
           source.start_time.as_deref(),
           source.end_time.as_deref(),
-          remote_bvid,
+          remote_video_url.as_deref(),
+          remote_bvid.as_deref(),
+          remote_aid,
+          remote_cid,
+          remote_part_title.as_deref(),
         ),
       )?;
     }
@@ -1111,6 +1180,9 @@ pub async fn submission_update(
     if request.source_videos.is_empty() {
         return Ok(ApiResponse::error("请至少添加一个源视频"));
     }
+    if let Err(err) = validate_source_video_inputs(&request.source_videos) {
+        return Ok(ApiResponse::error(err));
+    }
     let workflow_config = match request.workflow_config {
         Some(config) => config,
         None => return Ok(ApiResponse::error("工作流配置不能为空")),
@@ -1138,13 +1210,51 @@ pub async fn submission_update(
     if let Err(err) = update_submission_status(&context, &task_id, "PENDING") {
         return Ok(ApiResponse::error(format!("更新任务状态失败: {}", err)));
     }
-    if let Err(err) = create_workflow_instance_for_task_with_type(
+    let (workflow_instance_id, _) = match create_workflow_instance_for_task_with_type(
         context.db.as_ref(),
         &task_id,
         &workflow_config,
         "VIDEO_UPDATE",
     ) {
-        return Ok(ApiResponse::error(err));
+        Ok(value) => value,
+        Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    let new_source_paths = request
+        .source_videos
+        .iter()
+        .map(|source| source.source_file_path.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let created_download_ids = match prepare_integrated_source_downloads(
+        &context,
+        &task_id,
+        &workflow_instance_id,
+        &new_source_paths,
+    ) {
+        Ok(value) => value,
+        Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    if let Err(err) =
+        crate::commands::download::requeue_integrated_downloads(&state, &created_download_ids).await
+    {
+        return Ok(ApiResponse::error(format!(
+            "创建远程源视频下载任务失败: {}",
+            err
+        )));
+    }
+    if !created_download_ids.is_empty() {
+        append_log(
+            &state.app_log_path,
+            &format!(
+                "submission_update_wait_integrated_downloads task_id={} count={}",
+                task_id,
+                created_download_ids.len()
+            ),
+        );
+        return Ok(ApiResponse::success(format!(
+            "更新任务已创建，{} 个远程源视频已进入下载队列，下载完成后自动继续",
+            created_download_ids.len()
+        )));
     }
     start_submission_workflow(
         context.db.clone(),
@@ -1175,9 +1285,11 @@ pub async fn submission_repost(
             Some(ref config) => config.clone(),
             None => return Ok(ApiResponse::error("未找到工作流配置")),
         };
-        apply_reprocess_metadata(&mut workflow_config, mode, request.merged_video_id);
-        let workflow_config = strip_update_sources(&workflow_config);
         let integrate_current_bvid = request.integrate_current_bvid;
+        apply_reprocess_metadata(&mut workflow_config, mode, request.merged_video_id);
+        apply_integrate_current_bvid(&mut workflow_config, integrate_current_bvid);
+        apply_media_process_mode(&mut workflow_config, MediaProcessMode::CopyOnly);
+        let workflow_config = strip_update_sources(&workflow_config);
         if integrate_current_bvid {
             let has_bvid = detail
                 .task
@@ -1210,17 +1322,26 @@ pub async fn submission_repost(
                 }
             ),
         );
+        if detail.source_videos.is_empty() {
+            return handle_full_reprocess_missing_sources(
+                &state,
+                &context,
+                &task_id,
+                &workflow_config,
+                integrate_current_bvid,
+                &[],
+            )
+            .await;
+        }
         let missing_sources = collect_missing_source_files(&detail.source_videos);
         if !missing_sources.is_empty() {
-            return enqueue_missing_source_downloads_for_repost(
+            return handle_full_reprocess_missing_sources(
                 &state,
                 &context,
                 &task_id,
                 &workflow_config,
                 integrate_current_bvid,
                 &missing_sources,
-                "源视频缺失",
-                true,
             )
             .await;
         }
@@ -1252,6 +1373,8 @@ pub async fn submission_repost(
         };
         apply_reprocess_metadata(&mut workflow_config, mode, request.merged_video_id);
         let integrate_current_bvid = request.integrate_current_bvid;
+        apply_integrate_current_bvid(&mut workflow_config, integrate_current_bvid);
+        apply_media_process_mode(&mut workflow_config, MediaProcessMode::CopyOnly);
         if integrate_current_bvid {
             let has_bvid = detail
                 .task
@@ -1639,6 +1762,29 @@ pub async fn submission_repost(
                         );
                         return;
                     }
+                    if !integrate_current_bvid {
+                        if let Err(err) =
+                            reset_segments_for_new_bvid(&context_clone, &task_id_clone)
+                        {
+                            let _ =
+                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                            let _ = update_workflow_status(
+                                &context_clone,
+                                &task_id_clone,
+                                "FAILED",
+                                Some("SEGMENTING"),
+                                0.0,
+                            );
+                            append_log(
+                                app_log_path.as_ref(),
+                                &format!(
+                                    "submission_repost_reset_segments_fail task_id={} err={}",
+                                    task_id_clone, err
+                                ),
+                            );
+                            return;
+                        }
+                    }
                     finalize_reprocess_success(
                         &context_clone,
                         &task_id_clone,
@@ -1747,11 +1893,27 @@ pub async fn submission_repost(
                     );
                     return;
                 }
-                finalize_reprocess_success(
-                    &context_clone,
-                    &task_id_clone,
-                    "submission_repost_ok",
-                );
+                if !integrate_current_bvid {
+                    if let Err(err) = reset_segments_for_new_bvid(&context_clone, &task_id_clone) {
+                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                        let _ = update_workflow_status(
+                            &context_clone,
+                            &task_id_clone,
+                            "FAILED",
+                            Some("SEGMENTING"),
+                            0.0,
+                        );
+                        append_log(
+                            app_log_path.as_ref(),
+                            &format!(
+                                "submission_repost_reset_segments_fail task_id={} err={}",
+                                task_id_clone, err
+                            ),
+                        );
+                        return;
+                    }
+                }
+                finalize_reprocess_success(&context_clone, &task_id_clone, "submission_repost_ok");
             });
             return Ok(ApiResponse::success("重新投稿已启动".to_string()));
         }
@@ -1790,32 +1952,55 @@ pub async fn submission_repost(
                 merge_files(&merge_inputs_clone, &merge_output_for_merge)
             })
             .await;
-            if let Err(err) = merge_result {
-                let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                let _ = update_workflow_status(
-                    &context_clone,
-                    &task_id_clone,
-                    "FAILED",
-                    Some("SEGMENTING"),
-                    0.0,
-                );
-                append_log(
-                    app_log_path.as_ref(),
-                    &format!(
-                        "submission_repost_merge_fail task_id={} err={}",
-                        task_id_clone, err
-                    ),
-                );
-                return;
-            }
+            match merge_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                    let _ = update_workflow_status(
+                        &context_clone,
+                        &task_id_clone,
+                        "FAILED",
+                        Some("SEGMENTING"),
+                        0.0,
+                    );
+                    append_log(
+                        app_log_path.as_ref(),
+                        &format!(
+                            "submission_repost_merge_fail task_id={} err={}",
+                            task_id_clone, err
+                        ),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                    let _ = update_workflow_status(
+                        &context_clone,
+                        &task_id_clone,
+                        "FAILED",
+                        Some("SEGMENTING"),
+                        0.0,
+                    );
+                    append_log(
+                        app_log_path.as_ref(),
+                        &format!(
+                            "submission_repost_merge_fail task_id={} err={}",
+                            task_id_clone, err
+                        ),
+                    );
+                    return;
+                }
+            };
             let segment_outputs = if should_segment {
                 if enable_segmentation {
                     let merge_output_for_segment_clone = merge_output_for_segment.clone();
                     match tauri::async_runtime::spawn_blocking(move || {
-                        segment_file(
+                        segment_file_with_options(
                             &merge_output_for_segment_clone,
                             &output_dir_clone,
                             segment_seconds,
+                            false,
+                            false,
                         )
                     })
                     .await
@@ -1968,9 +2153,6 @@ pub async fn submission_repost(
         });
         return Ok(ApiResponse::success("重新投稿已启动".to_string()));
     }
-    if detail.source_videos.is_empty() {
-        return Ok(ApiResponse::error("请至少添加一个源视频"));
-    }
     let workflow_config = match detail.workflow_config {
         Some(config) => config,
         None => return Ok(ApiResponse::error("未找到工作流配置")),
@@ -1997,8 +2179,34 @@ pub async fn submission_repost(
         return Ok(ApiResponse::error(format!("更新百度同步配置失败: {}", err)));
     }
 
+    if detail.source_videos.is_empty() {
+        if let Some(response) = try_repost_with_existing_merged_assets(
+            &state,
+            &context,
+            &task_id,
+            &workflow_config,
+            integrate_current_bvid,
+        )
+        .await?
+        {
+            return Ok(response);
+        }
+        return Ok(ApiResponse::error("请至少添加一个源视频"));
+    }
+
     let missing_sources = collect_missing_source_files(&detail.source_videos);
     if !missing_sources.is_empty() {
+        if let Some(response) = try_repost_with_existing_merged_assets(
+            &state,
+            &context,
+            &task_id,
+            &workflow_config,
+            integrate_current_bvid,
+        )
+        .await?
+        {
+            return Ok(response);
+        }
         return enqueue_missing_source_downloads_for_repost(
             &state,
             &context,
@@ -2060,6 +2268,30 @@ fn collect_missing_source_paths(paths: &[String]) -> Vec<String> {
         }
     }
     missing
+}
+
+fn prepare_integrated_source_downloads(
+    context: &SubmissionContext,
+    task_id: &str,
+    workflow_instance_id: &str,
+    source_paths: &[String],
+) -> Result<Vec<i64>, String> {
+    let missing_sources = collect_missing_source_paths(source_paths);
+    if missing_sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (retry_records, unresolved_sources) =
+        collect_retry_download_records_for_missing_sources(context, task_id, &missing_sources)?;
+    if !unresolved_sources.is_empty() {
+        return Err(
+            "存在本地缺失且未绑定可下载远程信息的源视频，请先补充远程BV/CID绑定或改为本地文件"
+                .to_string(),
+        );
+    }
+    if retry_records.is_empty() {
+        return Ok(Vec::new());
+    }
+    create_retry_download_records(context, task_id, workflow_instance_id, &retry_records)
 }
 
 fn extract_source_paths_from_task(detail: &SubmissionTaskDetail) -> Vec<String> {
@@ -2146,19 +2378,6 @@ fn extract_update_sources_from_config(config: &Value) -> Vec<ClipSource> {
     }
     sources.sort_by_key(|item| item.order);
     sources
-}
-
-fn task_sources_to_clip_sources(sources: &[TaskSourceVideoRecord]) -> Vec<ClipSource> {
-    sources
-        .iter()
-        .map(|source| ClipSource {
-            input_path: source.source_file_path.trim().to_string(),
-            start_time: source.start_time.clone(),
-            end_time: source.end_time.clone(),
-            order: source.sort_order,
-        })
-        .filter(|source| !source.input_path.is_empty())
-        .collect()
 }
 
 fn clip_source_match_key(source: &ClipSource) -> (i64, String, String) {
@@ -2474,27 +2693,6 @@ fn repair_merge_groups_from_fallback(
     }
 }
 
-fn resolve_merge_groups_from_bindings(
-    context: &SubmissionContext,
-    task_id: &str,
-) -> Vec<MergeGroupPlan> {
-    let merged_videos = load_merged_videos_by_task(context, task_id).unwrap_or_default();
-    let mut groups = Vec::new();
-    for merged in merged_videos {
-        if let Ok(sources) = load_merged_source_clips(context, task_id, merged.id) {
-            if sources.is_empty() {
-                continue;
-            }
-            let sources = normalize_binding_sources(sources);
-            groups.push(MergeGroupPlan {
-                order: groups.len() as i64 + 1,
-                sources,
-            });
-        }
-    }
-    groups
-}
-
 fn resolve_merge_groups(
     context: &SubmissionContext,
     task_id: &str,
@@ -2543,31 +2741,6 @@ fn resolve_merge_groups(
         });
     }
     groups
-}
-
-fn resolve_reprocess_sources(
-    context: &SubmissionContext,
-    detail: &SubmissionTaskDetail,
-    config: &Value,
-    mode: ReprocessMode,
-    merged_id: Option<i64>,
-) -> Vec<ClipSource> {
-    if mode == ReprocessMode::Specified {
-        if let Some(merged_id) = merged_id {
-            if let Ok(sources) = load_merged_source_clips(context, &detail.task.task_id, merged_id)
-            {
-                if !sources.is_empty() {
-                    return sources;
-                }
-            }
-        }
-        let update_sources = extract_update_sources_from_config(config);
-        if !update_sources.is_empty() {
-            return update_sources;
-        }
-    }
-    let fallback = task_sources_to_clip_sources(&detail.source_videos);
-    normalize_binding_sources(fallback)
 }
 
 fn resolve_reprocess_source_paths(
@@ -2669,6 +2842,801 @@ async fn handle_repost_missing_assets(
     Ok(ApiResponse::success(format!(
         "{}，已自动重新剪辑并重新投稿",
         reason
+    )))
+}
+
+#[tauri::command]
+pub async fn submission_repost_transcode(
+    state: State<'_, AppState>,
+    request: SubmissionTranscodeRepostRequest,
+) -> Result<ApiResponse<String>, String> {
+    let context = SubmissionContext::new(&state);
+    let task_id = request.task_id.trim().to_string();
+    if task_id.is_empty() {
+        return Ok(ApiResponse::error("任务ID不能为空"));
+    }
+    let detail = match load_task_detail(&context, &task_id) {
+        Ok(detail) => detail,
+        Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    let mut workflow_config = match detail.workflow_config {
+        Some(ref config) => config.clone(),
+        None => return Ok(ApiResponse::error("未找到工作流配置")),
+    };
+    let integrate_current_bvid = request.integrate_current_bvid;
+    apply_reprocess_metadata(&mut workflow_config, ReprocessMode::FullReprocess, None);
+    apply_integrate_current_bvid(&mut workflow_config, integrate_current_bvid);
+    apply_media_process_mode(
+        &mut workflow_config,
+        MediaProcessMode::ClipAndMergeTranscode,
+    );
+    let workflow_config = strip_update_sources(&workflow_config);
+    if integrate_current_bvid {
+        let has_bvid = detail
+            .task
+            .bvid
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if !has_bvid {
+            return Ok(ApiResponse::error("当前任务没有BV号，无法集成投稿"));
+        }
+    }
+    if let Some(response) = try_repost_transcode_with_existing_clean_merged(
+        &state,
+        &context,
+        &task_id,
+        &workflow_config,
+        integrate_current_bvid,
+    )
+    .await?
+    {
+        append_log(
+            &state.app_log_path,
+            &format!(
+                "submission_repost_transcode_reuse_merged task_id={}",
+                task_id
+            ),
+        );
+        return Ok(response);
+    }
+    append_log(
+        &state.app_log_path,
+        &format!(
+            "submission_repost_transcode_start task_id={} type={}",
+            task_id,
+            if integrate_current_bvid {
+                "UPDATE"
+            } else {
+                "NEW"
+            }
+        ),
+    );
+    if detail.source_videos.is_empty() {
+        return handle_full_reprocess_missing_sources(
+            &state,
+            &context,
+            &task_id,
+            &workflow_config,
+            integrate_current_bvid,
+            &[],
+        )
+        .await;
+    }
+    let missing_sources = collect_missing_source_files(&detail.source_videos);
+    if !missing_sources.is_empty() {
+        return handle_full_reprocess_missing_sources(
+            &state,
+            &context,
+            &task_id,
+            &workflow_config,
+            integrate_current_bvid,
+            &missing_sources,
+        )
+        .await;
+    }
+    let _ = reset_submission_for_repost(
+        &context,
+        &state.app_log_path,
+        &task_id,
+        &workflow_config,
+        if integrate_current_bvid {
+            "VIDEO_UPDATE"
+        } else {
+            "VIDEO_SUBMISSION"
+        },
+        !integrate_current_bvid,
+        true,
+    )?;
+    start_submission_workflow(
+        context.db.clone(),
+        context.app_log_path.clone(),
+        context.edit_upload_state.clone(),
+        task_id,
+    );
+    Ok(ApiResponse::success("转码投稿已启动".to_string()))
+}
+
+async fn handle_full_reprocess_missing_sources(
+    state: &State<'_, AppState>,
+    context: &SubmissionContext,
+    task_id: &str,
+    workflow_config: &Value,
+    integrate_current_bvid: bool,
+    missing_sources: &[String],
+) -> Result<ApiResponse<String>, String> {
+    append_log(
+        &state.app_log_path,
+        &format!(
+            "submission_full_reprocess_missing_sources task_id={} missing_count={}",
+            task_id,
+            missing_sources.len()
+        ),
+    );
+    if missing_sources.is_empty() {
+        return try_prepare_full_reprocess_from_baidu_merged(
+            state,
+            context,
+            task_id,
+            workflow_config,
+            integrate_current_bvid,
+        )
+        .await;
+    }
+    let (_, unresolved_sources) =
+        collect_retry_download_records_for_missing_sources(context, task_id, missing_sources)?;
+    if unresolved_sources.is_empty() {
+        return enqueue_missing_source_downloads_for_repost(
+            state,
+            context,
+            task_id,
+            workflow_config,
+            integrate_current_bvid,
+            missing_sources,
+            "源视频缺失，已按源视频绑定重新下载，下载完成后自动重新剪辑、合并、分段并投稿",
+            true,
+        )
+        .await;
+    }
+
+    append_log(
+        &state.app_log_path,
+        &format!(
+            "submission_full_reprocess_fallback_to_merged task_id={} unresolved_count={}",
+            task_id,
+            unresolved_sources.len()
+        ),
+    );
+    for path in &unresolved_sources {
+        append_log(
+            &state.app_log_path,
+            &format!(
+                "submission_full_reprocess_unresolved_source task_id={} path={}",
+                task_id, path
+            ),
+        );
+    }
+    try_prepare_full_reprocess_from_baidu_merged(
+        state,
+        context,
+        task_id,
+        workflow_config,
+        integrate_current_bvid,
+    )
+    .await
+}
+
+fn prepare_workflow_for_existing_merged_repost(
+    context: &SubmissionContext,
+    app_log_path: &PathBuf,
+    task_id: &str,
+    workflow_config: &Value,
+    workflow_type: &str,
+    clear_bvid: bool,
+) -> Result<(), String> {
+    if let Err(err) = clear_edit_upload_segments_by_task(context, task_id) {
+        append_log(
+            app_log_path,
+            &format!(
+                "submission_existing_merged_clear_cache_fail task_id={} err={}",
+                task_id, err
+            ),
+        );
+    }
+    reset_workflow_instances(context, task_id).map_err(|err| format!("重置工作流失败: {}", err))?;
+    let (instance_id, _) = create_workflow_instance_for_task_with_type(
+        context.db.as_ref(),
+        task_id,
+        workflow_config,
+        workflow_type,
+    )
+    .map_err(|err| format!("创建工作流失败: {}", err))?;
+    let now = now_rfc3339();
+    context
+        .db
+        .with_conn(|conn| {
+            if clear_bvid {
+                conn.execute(
+                    "UPDATE submission_task SET status = 'PENDING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+                    (&now, task_id),
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE submission_task SET status = 'PENDING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+                    (&now, task_id),
+                )?;
+            }
+            conn.execute(
+                "UPDATE task_relations SET workflow_instance_id = ?1, updated_at = ?2 WHERE submission_task_id = ?3 AND relation_type = 'INTEGRATED'",
+                (&instance_id, &now, task_id),
+            )?;
+            Ok(())
+        })
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn try_repost_with_existing_merged_assets(
+    state: &State<'_, AppState>,
+    context: &SubmissionContext,
+    task_id: &str,
+    workflow_config: &Value,
+    integrate_current_bvid: bool,
+) -> Result<Option<ApiResponse<String>>, String> {
+    let mut merged_videos = load_merged_videos_by_task(context, task_id).unwrap_or_default();
+    if merged_videos.is_empty() {
+        return Ok(None);
+    }
+
+    let base_dir = resolve_submission_base_dir(context, task_id);
+    let workflow_type = if integrate_current_bvid {
+        "VIDEO_UPDATE"
+    } else {
+        "VIDEO_SUBMISSION"
+    };
+    let mut merged_workflow_config = workflow_config.clone();
+    apply_reprocess_metadata(&mut merged_workflow_config, ReprocessMode::MergeAll, None);
+
+    for merged in &mut merged_videos {
+        let mut path = merged.video_path.clone().unwrap_or_default();
+        if path.trim().is_empty() || !PathBuf::from(&path).exists() {
+            match try_restore_merged_from_baidu(context, &state.app_log_path, merged, &base_dir)
+                .await?
+            {
+                BaiduRestoreResult::Ready(restored) => {
+                    path = restored.to_string_lossy().to_string();
+                    merged.video_path = Some(path.clone());
+                }
+                BaiduRestoreResult::Queued => {
+                    prepare_workflow_for_baidu_restore(
+                        context,
+                        &state.app_log_path,
+                        task_id,
+                        &merged_workflow_config,
+                        workflow_type,
+                        !integrate_current_bvid,
+                    )?;
+                    return Ok(Some(ApiResponse::success(
+                        "源视频缺失，但已切换为优先恢复合并视频；网盘下载完成后自动重新投稿"
+                            .to_string(),
+                    )));
+                }
+                BaiduRestoreResult::NotBound => {
+                    append_log(
+                        &state.app_log_path,
+                        &format!(
+                            "submission_existing_merged_unavailable task_id={} merged_id={} reason=not_bound",
+                            task_id, merged.id
+                        ),
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        if path.trim().is_empty() || !PathBuf::from(&path).exists() {
+            append_log(
+                &state.app_log_path,
+                &format!(
+                    "submission_existing_merged_unavailable task_id={} merged_id={} reason=local_missing",
+                    task_id, merged.id
+                ),
+            );
+            return Ok(None);
+        }
+    }
+
+    prepare_workflow_for_existing_merged_repost(
+        context,
+        &state.app_log_path,
+        task_id,
+        &merged_workflow_config,
+        workflow_type,
+        !integrate_current_bvid,
+    )?;
+    let context_clone = context.clone();
+    let task_id_owned = task_id.to_string();
+    let workflow_type_owned = workflow_type.to_string();
+    let app_log_path = state.app_log_path.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = resume_repost_after_restore(
+            &context_clone,
+            &app_log_path,
+            &task_id_owned,
+            ReprocessMode::MergeAll,
+            None,
+            &workflow_type_owned,
+        )
+        .await;
+    });
+    Ok(Some(ApiResponse::success(
+        "源视频缺失，但本地合并视频可用，已直接基于合并视频重新投稿".to_string(),
+    )))
+}
+
+async fn try_prepare_full_reprocess_from_baidu_merged(
+    state: &State<'_, AppState>,
+    context: &SubmissionContext,
+    task_id: &str,
+    workflow_config: &Value,
+    integrate_current_bvid: bool,
+) -> Result<ApiResponse<String>, String> {
+    let mut merged_videos = load_merged_videos_by_task(context, task_id)?;
+    if merged_videos.is_empty() {
+        return Ok(ApiResponse::error(
+            "任务异常：源视频缺失且无法按B站重新下载，同时未找到可恢复的合并视频".to_string(),
+        ));
+    }
+
+    let mut merged_workflow_config = workflow_config.clone();
+    apply_reprocess_metadata(&mut merged_workflow_config, ReprocessMode::MergeAll, None);
+    apply_integrate_current_bvid(&mut merged_workflow_config, integrate_current_bvid);
+    let workflow_type = if integrate_current_bvid {
+        "VIDEO_UPDATE"
+    } else {
+        "VIDEO_SUBMISSION"
+    };
+    let base_dir = resolve_submission_base_dir(context, task_id);
+    let mut queued_restore = false;
+
+    for merged in &mut merged_videos {
+        match try_restore_merged_from_baidu(context, &state.app_log_path, merged, &base_dir).await?
+        {
+            BaiduRestoreResult::Ready(restored) => {
+                merged.video_path = Some(restored.to_string_lossy().to_string());
+            }
+            BaiduRestoreResult::Queued => {
+                queued_restore = true;
+            }
+            BaiduRestoreResult::NotBound => {
+                let merged_name = merged
+                    .file_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("未知合并视频");
+                append_log(
+                    &state.app_log_path,
+                    &format!(
+                        "submission_full_reprocess_merged_not_bound task_id={} merged_id={} file={}",
+                        task_id, merged.id, merged_name
+                    ),
+                );
+                return Ok(ApiResponse::error(format!(
+                    "任务异常：存在缺失源视频且未绑定可重下的BVID/CID，合并视频“{}”也未绑定网盘地址，无法执行全部重新投稿",
+                    merged_name
+                )));
+            }
+        }
+    }
+
+    if queued_restore {
+        prepare_workflow_for_baidu_restore(
+            context,
+            &state.app_log_path,
+            task_id,
+            &merged_workflow_config,
+            workflow_type,
+            !integrate_current_bvid,
+        )?;
+        return Ok(ApiResponse::success(
+            "部分源视频缺失且无法按B站重新下载，已转为下载合并视频后重新分段、投稿".to_string(),
+        ));
+    }
+
+    prepare_workflow_for_existing_merged_repost(
+        context,
+        &state.app_log_path,
+        task_id,
+        &merged_workflow_config,
+        workflow_type,
+        !integrate_current_bvid,
+    )?;
+    let context_clone = context.clone();
+    let task_id_owned = task_id.to_string();
+    let workflow_type_owned = workflow_type.to_string();
+    let app_log_path = state.app_log_path.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = resume_repost_after_restore(
+            &context_clone,
+            &app_log_path,
+            &task_id_owned,
+            ReprocessMode::MergeAll,
+            None,
+            &workflow_type_owned,
+        )
+        .await;
+    });
+    Ok(ApiResponse::success(
+        "部分源视频缺失且无法按B站重新下载，已基于已恢复的合并视频重新分段、投稿".to_string(),
+    ))
+}
+
+fn parse_ffprobe_time(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(|item| item.as_str())
+        .and_then(|raw| raw.parse::<f64>().ok())
+}
+
+fn merged_probe_has_packets(
+    path: &Path,
+    stream_selector: &str,
+    start_seconds: f64,
+) -> Result<bool, String> {
+    let interval = format!("{:.3}%+0.8", start_seconds.max(0.0));
+    let args = vec![
+        "-v".to_string(),
+        "error".to_string(),
+        "-read_intervals".to_string(),
+        interval,
+        "-select_streams".to_string(),
+        stream_selector.to_string(),
+        "-show_packets".to_string(),
+        "-show_entries".to_string(),
+        "packet=pts_time".to_string(),
+        "-of".to_string(),
+        "json".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let data = run_ffprobe_json(&args)?;
+    Ok(data
+        .get("packets")
+        .and_then(|value| value.as_array())
+        .map(|items| !items.is_empty())
+        .unwrap_or(false))
+}
+
+fn merged_audio_packet_gap_delta(path: &Path, start_seconds: f64, span_seconds: f64) -> Result<f64, String> {
+    let interval = format!("{:.3}%+{:.3}", start_seconds.max(0.0), span_seconds.max(0.1));
+    let args = vec![
+        "-v".to_string(),
+        "error".to_string(),
+        "-read_intervals".to_string(),
+        interval,
+        "-select_streams".to_string(),
+        "a:0".to_string(),
+        "-show_packets".to_string(),
+        "-show_entries".to_string(),
+        "packet=pts_time,duration_time".to_string(),
+        "-of".to_string(),
+        "csv=p=0".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let (stdout, _) = run_ffprobe_capture(&args)?;
+    let mut prev_pts: Option<f64> = None;
+    let mut max_delta = 0.0f64;
+    let mut packet_count = 0usize;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split(',').map(|item| item.trim()).filter(|item| !item.is_empty());
+        let Some(pts_raw) = parts.next() else {
+            continue;
+        };
+        let Some(duration_raw) = parts.next() else {
+            continue;
+        };
+        let Some(pts_time) = pts_raw.parse::<f64>().ok() else {
+            continue;
+        };
+        let Some(duration_time) = duration_raw.parse::<f64>().ok() else {
+            continue;
+        };
+        if let Some(previous) = prev_pts {
+            let gap_delta = ((pts_time - previous) - duration_time).abs();
+            if gap_delta > max_delta {
+                max_delta = gap_delta;
+            }
+        }
+        prev_pts = Some(pts_time);
+        packet_count += 1;
+    }
+
+    if packet_count < 2 {
+        return Err(format!(
+            "audio_packet_probe_insufficient start={:.3} span={:.3} packets={}",
+            start_seconds, span_seconds, packet_count
+        ));
+    }
+
+    Ok(max_delta)
+}
+
+fn is_merged_video_reusable_for_transcode_repost(
+    context: &SubmissionContext,
+    task_id: &str,
+    merged: &MergedVideoRecord,
+    app_log_path: &PathBuf,
+) -> Result<bool, String> {
+    let Some(path_str) = merged.video_path.as_deref() else {
+        append_log(
+            app_log_path,
+            &format!(
+                "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=path_empty",
+                task_id, merged.id
+            ),
+        );
+        return Ok(false);
+    };
+    let path_str = path_str.trim();
+    if path_str.is_empty() {
+        append_log(
+            app_log_path,
+            &format!(
+                "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=path_blank",
+                task_id, merged.id
+            ),
+        );
+        return Ok(false);
+    }
+    let path = PathBuf::from(path_str);
+    if !path.exists() {
+        append_log(
+            app_log_path,
+            &format!(
+                "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=missing path={}",
+                task_id,
+                merged.id,
+                path.to_string_lossy()
+            ),
+        );
+        return Ok(false);
+    }
+
+    let duration = match verify_generated_media_output(
+        context,
+        task_id,
+        &path,
+        "submission_transcode_reuse_merged_verify",
+        None,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            append_log(
+                app_log_path,
+                &format!(
+                    "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=verify_fail err={}",
+                    task_id, merged.id, err
+                ),
+            );
+            return Ok(false);
+        }
+    };
+
+    let probe_args = vec![
+        "-v".to_string(),
+        "error".to_string(),
+        "-show_entries".to_string(),
+        "stream=codec_type,start_time,duration:format=start_time,duration".to_string(),
+        "-of".to_string(),
+        "json".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let probe = run_ffprobe_json(&probe_args)?;
+    let streams = probe
+        .get("streams")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let video_stream = streams
+        .iter()
+        .find(|item| item.get("codec_type").and_then(|value| value.as_str()) == Some("video"));
+    let audio_stream = streams
+        .iter()
+        .find(|item| item.get("codec_type").and_then(|value| value.as_str()) == Some("audio"));
+    let Some(video_stream) = video_stream else {
+        append_log(
+            app_log_path,
+            &format!(
+                "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=missing_video_stream",
+                task_id, merged.id
+            ),
+        );
+        return Ok(false);
+    };
+    let Some(audio_stream) = audio_stream else {
+        append_log(
+            app_log_path,
+            &format!(
+                "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=missing_audio_stream",
+                task_id, merged.id
+            ),
+        );
+        return Ok(false);
+    };
+    let video_start = parse_ffprobe_time(video_stream.get("start_time")).unwrap_or(0.0);
+    let audio_start = parse_ffprobe_time(audio_stream.get("start_time")).unwrap_or(0.0);
+    let video_duration = parse_ffprobe_time(video_stream.get("duration")).unwrap_or(duration);
+    let audio_duration = parse_ffprobe_time(audio_stream.get("duration")).unwrap_or(duration);
+    let av_delta = (video_start - audio_start).abs();
+    if av_delta > 0.2 {
+        append_log(
+            app_log_path,
+            &format!(
+                "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=av_start_delta delta={:.3}",
+                task_id, merged.id, av_delta
+            ),
+        );
+        return Ok(false);
+    }
+    let av_duration_delta = (video_duration - audio_duration).abs();
+    if av_duration_delta > 1.0 {
+        append_log(
+            app_log_path,
+            &format!(
+                "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=av_duration_delta delta={:.3}",
+                task_id, merged.id, av_duration_delta
+            ),
+        );
+        return Ok(false);
+    }
+
+    let mut sample_points = vec![0.0];
+    if duration > 2.0 {
+        sample_points.push(duration * 0.25);
+        sample_points.push(duration * 0.5);
+        sample_points.push(duration * 0.75);
+        sample_points.push((duration - 5.0).max(0.0));
+    }
+    sample_points
+        .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    sample_points.dedup_by(|left, right| (*left - *right).abs() < 0.5);
+
+    for sample in sample_points {
+        let has_video = merged_probe_has_packets(&path, "v:0", sample)?;
+        let has_audio = merged_probe_has_packets(&path, "a:0", sample)?;
+        if !has_video || !has_audio {
+            append_log(
+                app_log_path,
+                &format!(
+                    "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=packet_probe_missing sample={:.3} has_video={} has_audio={}",
+                    task_id, merged.id, sample, has_video, has_audio
+                ),
+            );
+            return Ok(false);
+        }
+    }
+
+    let continuity_window = 660.0f64;
+    let continuity_step = 600.0f64;
+    let continuity_threshold = 0.5f64;
+    let mut continuity_points = vec![0.0];
+    let mut cursor = 0.0f64;
+    while cursor < duration {
+        continuity_points.push(cursor);
+        cursor += continuity_step;
+    }
+    if duration > continuity_window {
+        continuity_points.push((duration - continuity_window).max(0.0));
+    }
+    continuity_points
+        .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    continuity_points.dedup_by(|left, right| (*left - *right).abs() < 1.0);
+
+    for sample in continuity_points {
+        let span = continuity_window.min((duration - sample).max(1.0));
+        let max_gap_delta = match merged_audio_packet_gap_delta(&path, sample, span) {
+            Ok(value) => value,
+            Err(err) => {
+                append_log(
+                    app_log_path,
+                    &format!(
+                        "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=audio_packet_probe_fail sample={:.3} span={:.3} err={}",
+                        task_id, merged.id, sample, span, err
+                    ),
+                );
+                return Ok(false);
+            }
+        };
+        if max_gap_delta > continuity_threshold {
+            append_log(
+                app_log_path,
+                &format!(
+                    "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=audio_packet_gap delta={:.3} sample={:.3} span={:.3}",
+                    task_id, merged.id, max_gap_delta, sample, span
+                ),
+            );
+            return Ok(false);
+        }
+    }
+
+    append_log(
+        app_log_path,
+        &format!(
+            "submission_transcode_reuse_merged_ok task_id={} merged_id={} path={} duration={:.3}",
+            task_id,
+            merged.id,
+            path.to_string_lossy(),
+            duration
+        ),
+    );
+    Ok(true)
+}
+
+async fn try_repost_transcode_with_existing_clean_merged(
+    state: &State<'_, AppState>,
+    context: &SubmissionContext,
+    task_id: &str,
+    workflow_config: &Value,
+    integrate_current_bvid: bool,
+) -> Result<Option<ApiResponse<String>>, String> {
+    let merged = match load_latest_merged_video(context, task_id)? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    if !is_merged_video_reusable_for_transcode_repost(
+        context,
+        task_id,
+        &merged,
+        &state.app_log_path,
+    )? {
+        return Ok(None);
+    }
+
+    let workflow_type = if integrate_current_bvid {
+        "VIDEO_UPDATE"
+    } else {
+        "VIDEO_SUBMISSION"
+    };
+    let mut merged_workflow_config = workflow_config.clone();
+    apply_reprocess_metadata(
+        &mut merged_workflow_config,
+        ReprocessMode::Specified,
+        Some(merged.id),
+    );
+    apply_integrate_current_bvid(&mut merged_workflow_config, integrate_current_bvid);
+    apply_media_process_mode(
+        &mut merged_workflow_config,
+        MediaProcessMode::ClipAndMergeTranscode,
+    );
+
+    prepare_workflow_for_existing_merged_repost(
+        context,
+        &state.app_log_path,
+        task_id,
+        &merged_workflow_config,
+        workflow_type,
+        !integrate_current_bvid,
+    )?;
+    let context_clone = context.clone();
+    let task_id_owned = task_id.to_string();
+    let workflow_type_owned = workflow_type.to_string();
+    let app_log_path = state.app_log_path.clone();
+    let merged_id = merged.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = resume_repost_after_restore(
+            &context_clone,
+            &app_log_path,
+            &task_id_owned,
+            ReprocessMode::Specified,
+            Some(merged_id),
+            &workflow_type_owned,
+        )
+        .await;
+    });
+    Ok(Some(ApiResponse::success(
+        "检测到当前本地合并视频可直接复用，已跳过剪辑/合并，直接进入分段转码投稿".to_string(),
     )))
 }
 
@@ -3209,11 +4177,7 @@ fn should_defer_recovery_for_remote_restore(
     if has_pending_restore {
         return Ok(true);
     }
-
-    let workflow_status = load_workflow_status(context, task_id)?
-        .map(|record| record.status)
-        .unwrap_or_default();
-    Ok(workflow_status == "VIDEO_DOWNLOADING")
+    Ok(false)
 }
 
 async fn resume_resegment_after_restore(
@@ -3507,30 +4471,53 @@ async fn resume_resegment_after_restore(
                     merge_files(&merge_inputs_clone, &merge_output_for_merge)
                 })
                 .await;
-                if let Err(err) = merge_result {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
-                        &context_clone,
-                        &task_id_clone,
-                        "FAILED",
-                        Some("SEGMENTING"),
-                        0.0,
-                    );
-                    append_log(
-                        app_log_path.as_ref(),
-                        &format!(
-                            "submission_resegment_merge_fail task_id={} err={}",
-                            task_id_clone, err
-                        ),
-                    );
-                    return;
-                }
+                match merge_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                        let _ = update_workflow_status(
+                            &context_clone,
+                            &task_id_clone,
+                            "FAILED",
+                            Some("SEGMENTING"),
+                            0.0,
+                        );
+                        append_log(
+                            app_log_path.as_ref(),
+                            &format!(
+                                "submission_resegment_merge_fail task_id={} err={}",
+                                task_id_clone, err
+                            ),
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                        let _ = update_workflow_status(
+                            &context_clone,
+                            &task_id_clone,
+                            "FAILED",
+                            Some("SEGMENTING"),
+                            0.0,
+                        );
+                        append_log(
+                            app_log_path.as_ref(),
+                            &format!(
+                                "submission_resegment_merge_fail task_id={} err={}",
+                                task_id_clone, err
+                            ),
+                        );
+                        return;
+                    }
+                };
                 let merge_output_for_segment_clone = merge_output_for_segment.clone();
                 let segment_outputs = match tauri::async_runtime::spawn_blocking(move || {
-                    segment_file(
+                    segment_file_with_options(
                         &merge_output_for_segment_clone,
                         &output_dir_clone,
                         segment_seconds,
+                        false,
+                        false,
                     )
                 })
                 .await
@@ -3862,6 +4849,9 @@ async fn resume_repost_after_restore(
     let enable_segmentation = workflow_settings.enable_segmentation;
     let segment_seconds = workflow_settings.segment_duration_seconds.max(1);
     let segment_prefix = workflow_settings.segment_prefix.clone();
+    let config = load_latest_workflow_config(context, task_id).ok().flatten();
+    let media_process_mode = load_media_process_mode(config.as_ref());
+    let use_transcode_media = media_process_mode == MediaProcessMode::ClipAndMergeTranscode;
     let should_segment = integrate_current_bvid || enable_segmentation;
     let base_dir = resolve_submission_base_dir(context, task_id);
     let output_dir = base_dir
@@ -3968,6 +4958,29 @@ async fn resume_repost_after_restore(
                         );
                         return;
                     }
+                    if !integrate_current_bvid {
+                        if let Err(err) =
+                            reset_segments_for_new_bvid(&context_clone, &task_id_clone)
+                        {
+                            let _ =
+                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                            let _ = update_workflow_status(
+                                &context_clone,
+                                &task_id_clone,
+                                "FAILED",
+                                Some("SEGMENTING"),
+                                0.0,
+                            );
+                            append_log(
+                                app_log_path.as_ref(),
+                                &format!(
+                                    "submission_repost_reset_segments_fail task_id={} err={}",
+                                    task_id_clone, err
+                                ),
+                            );
+                            return;
+                        }
+                    }
                     finalize_reprocess_success(
                         &context_clone,
                         &task_id_clone,
@@ -4005,8 +5018,26 @@ async fn resume_repost_after_restore(
                 };
 
                 let outputs = if enable_segmentation {
+                    append_log(
+                        app_log_path.as_ref(),
+                        &format!(
+                            "submission_repost_segment_mode task_id={} mode={}",
+                            task_id_clone,
+                            if use_transcode_media {
+                                "segment_transcode"
+                            } else {
+                                "segment_copy"
+                            }
+                        ),
+                    );
                     match tauri::async_runtime::spawn_blocking(move || {
-                        segment_file(&new_merged_path, &output_dir_clone, segment_seconds)
+                        segment_file_with_options(
+                            &new_merged_path,
+                            &output_dir_clone,
+                            segment_seconds,
+                            false,
+                            use_transcode_media,
+                        )
                     })
                     .await
                     {
@@ -4076,11 +5107,27 @@ async fn resume_repost_after_restore(
                     );
                     return;
                 }
-                finalize_reprocess_success(
-                    &context_clone,
-                    &task_id_clone,
-                    "submission_repost_ok",
-                );
+                if !integrate_current_bvid {
+                    if let Err(err) = reset_segments_for_new_bvid(&context_clone, &task_id_clone) {
+                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                        let _ = update_workflow_status(
+                            &context_clone,
+                            &task_id_clone,
+                            "FAILED",
+                            Some("SEGMENTING"),
+                            0.0,
+                        );
+                        append_log(
+                            app_log_path.as_ref(),
+                            &format!(
+                                "submission_repost_reset_segments_fail task_id={} err={}",
+                                task_id_clone, err
+                            ),
+                        );
+                        return;
+                    }
+                }
+                finalize_reprocess_success(&context_clone, &task_id_clone, "submission_repost_ok");
             });
         }
         ReprocessMode::MergeAll => {
@@ -4118,32 +5165,67 @@ async fn resume_repost_after_restore(
                     merge_files(&merge_inputs_clone, &merge_output_for_merge)
                 })
                 .await;
-                if let Err(err) = merge_result {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
-                        &context_clone,
-                        &task_id_clone,
-                        "FAILED",
-                        Some("SEGMENTING"),
-                        0.0,
-                    );
-                    append_log(
-                        app_log_path.as_ref(),
-                        &format!(
-                            "submission_repost_merge_fail task_id={} err={}",
-                            task_id_clone, err
-                        ),
-                    );
-                    return;
-                }
+                match merge_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                        let _ = update_workflow_status(
+                            &context_clone,
+                            &task_id_clone,
+                            "FAILED",
+                            Some("SEGMENTING"),
+                            0.0,
+                        );
+                        append_log(
+                            app_log_path.as_ref(),
+                            &format!(
+                                "submission_repost_merge_fail task_id={} err={}",
+                                task_id_clone, err
+                            ),
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                        let _ = update_workflow_status(
+                            &context_clone,
+                            &task_id_clone,
+                            "FAILED",
+                            Some("SEGMENTING"),
+                            0.0,
+                        );
+                        append_log(
+                            app_log_path.as_ref(),
+                            &format!(
+                                "submission_repost_merge_fail task_id={} err={}",
+                                task_id_clone, err
+                            ),
+                        );
+                        return;
+                    }
+                };
                 let segment_outputs = if should_segment {
                     if enable_segmentation {
                         let merge_output_for_segment_clone = merge_output_for_segment.clone();
+                        append_log(
+                            app_log_path.as_ref(),
+                            &format!(
+                                "submission_repost_segment_mode task_id={} mode={}",
+                                task_id_clone,
+                                if use_transcode_media {
+                                    "segment_transcode"
+                                } else {
+                                    "segment_copy"
+                                }
+                            ),
+                        );
                         match tauri::async_runtime::spawn_blocking(move || {
-                            segment_file(
+                            segment_file_with_options(
                                 &merge_output_for_segment_clone,
                                 &output_dir_clone,
                                 segment_seconds,
+                                false,
+                                use_transcode_media,
                             )
                         })
                         .await
@@ -5295,24 +6377,45 @@ pub async fn submission_resegment(
                 merge_files(&merge_inputs_clone, &merge_output_for_merge)
             })
             .await;
-            if let Err(err) = merge_result {
-                let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                let _ = update_workflow_status(
-                    &context_clone,
-                    &task_id_clone,
-                    "FAILED",
-                    Some("SEGMENTING"),
-                    0.0,
-                );
-                append_log(
-                    app_log_path.as_ref(),
-                    &format!(
-                        "submission_resegment_merge_fail task_id={} err={}",
-                        task_id_clone, err
-                    ),
-                );
-                return;
-            }
+            match merge_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                    let _ = update_workflow_status(
+                        &context_clone,
+                        &task_id_clone,
+                        "FAILED",
+                        Some("SEGMENTING"),
+                        0.0,
+                    );
+                    append_log(
+                        app_log_path.as_ref(),
+                        &format!(
+                            "submission_resegment_merge_fail task_id={} err={}",
+                            task_id_clone, err
+                        ),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                    let _ = update_workflow_status(
+                        &context_clone,
+                        &task_id_clone,
+                        "FAILED",
+                        Some("SEGMENTING"),
+                        0.0,
+                    );
+                    append_log(
+                        app_log_path.as_ref(),
+                        &format!(
+                            "submission_resegment_merge_fail task_id={} err={}",
+                            task_id_clone, err
+                        ),
+                    );
+                    return;
+                }
+            };
             let still_latest_after_merge = ensure_workflow_instance_latest(
                 &context_clone,
                 &task_id_clone,
@@ -5325,10 +6428,12 @@ pub async fn submission_resegment(
             }
             let merge_output_for_segment_clone = merge_output_for_segment.clone();
             let segment_outputs = match tauri::async_runtime::spawn_blocking(move || {
-                segment_file(
+                segment_file_with_options(
                     &merge_output_for_segment_clone,
                     &output_dir_clone,
                     segment_seconds,
+                    false,
+                    false,
                 )
             })
             .await
@@ -7331,9 +8436,6 @@ pub async fn submission_edit_submit(
     if title.is_empty() {
         return Ok(ApiResponse::error("投稿标题不能为空"));
     }
-    if title.len() > 80 {
-        return Ok(ApiResponse::error("投稿标题不能超过 80 个字符"));
-    }
     if request.task.partition_id <= 0 {
         return Ok(ApiResponse::error("请选择B站分区"));
     }
@@ -8035,11 +9137,7 @@ fn cleanup_stale_repost_dirs_for_task(
     Ok(())
 }
 
-fn finalize_reprocess_success(
-    context: &SubmissionContext,
-    task_id: &str,
-    success_event: &str,
-) {
+fn finalize_reprocess_success(context: &SubmissionContext, task_id: &str, success_event: &str) {
     let _ = update_submission_status(context, task_id, "WAITING_UPLOAD");
     let _ = update_workflow_status(context, task_id, "COMPLETED", None, 100.0);
     if let Err(err) = cleanup_stale_repost_dirs_for_task(context, task_id) {
@@ -8355,22 +9453,22 @@ pub async fn submission_queue_prioritize(
     if task_id.is_empty() {
         return Ok(ApiResponse::error("任务ID不能为空"));
     }
-    let status = match load_task_status(&context, &task_id) {
-        Ok(status) => status,
-        Err(err) => return Ok(ApiResponse::error(format!("读取任务状态失败: {}", err))),
-    };
-    if status != "WAITING_UPLOAD" {
-        return Ok(ApiResponse::error("仅支持对投稿队列中的任务进行优先投稿"));
-    }
     let now = now_rfc3339();
     if let Err(err) = context.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE submission_task SET priority = 1, updated_at = ?1 WHERE task_id = ?2",
-            (&now, &task_id),
+        let updated = conn.execute(
+            "UPDATE submission_task SET priority = 1, priority_at = ?1, updated_at = ?2 WHERE task_id = ?3",
+            (&now, &now, &task_id),
         )?;
+        if updated == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     }) {
-        return Ok(ApiResponse::error(format!("设置优先投稿失败: {}", err)));
+        let message = match err {
+            DbError::Sql(rusqlite::Error::QueryReturnedNoRows) => "未找到投稿任务".to_string(),
+            other => format!("设置优先投稿失败: {}", other),
+        };
+        return Ok(ApiResponse::error(message));
     }
     Ok(ApiResponse::success("已设置为优先投稿".to_string()))
 }
@@ -9576,6 +10674,114 @@ async fn fetch_remote_collection_info_by_aid(
     }
 }
 
+async fn fetch_public_remote_video_preview(
+    state: &State<'_, AppState>,
+    auth: Option<&AuthInfo>,
+    input: &str,
+    bvid: Option<String>,
+    aid: Option<i64>,
+) -> Result<SubmissionRemoteVideoPreview, String> {
+    let mut params = Vec::new();
+    if let Some(bvid) = bvid.as_ref() {
+        params.push(("bvid".to_string(), bvid.to_string()));
+    }
+    if let Some(aid) = aid {
+        params.push(("aid".to_string(), aid.to_string()));
+    }
+    let url = format!("{}/x/web-interface/view", state.bilibili.base_url());
+    let data = state
+        .bilibili
+        .get_json(&url, &params, auth, false)
+        .await
+        .map_err(|err| format!("拉取公开视频详情失败: {}", err))?;
+
+    let resolved_bvid = json_string_compatible(data.get("bvid"))
+        .or_else(|| bvid.clone())
+        .ok_or_else(|| "公开视频详情缺少BVID".to_string())?;
+    let resolved_aid = json_i64_compatible(data.get("aid")).or(aid).unwrap_or(0);
+    if resolved_aid <= 0 || resolved_bvid.trim().is_empty() {
+        return Err("公开视频详情无效".to_string());
+    }
+
+    let title = json_string_compatible(data.get("title"))
+        .or_else(|| bvid.clone())
+        .unwrap_or_else(|| "未命名视频".to_string());
+    let description = json_string_compatible(data.get("desc"));
+    let cover_url = json_string_compatible(data.get("pic"));
+    let partition_id = json_i64_compatible(data.get("tid")).filter(|value| *value > 0);
+    let partition_name = json_string_compatible(data.get("tname"));
+    let owner_mid = data
+        .get("owner")
+        .and_then(|value| json_i64_compatible(value.get("mid")))
+        .filter(|value| *value > 0);
+    let owner_name = data
+        .get("owner")
+        .and_then(|value| json_string_compatible(value.get("name")));
+
+    let pages = data
+        .get("pages")
+        .and_then(|value| value.as_array())
+        .map(|list| {
+            list.iter()
+                .enumerate()
+                .filter_map(|(index, page)| {
+                    let cid = json_i64_compatible(page.get("cid"))?;
+                    if cid <= 0 {
+                        return None;
+                    }
+                    let page_no =
+                        json_i64_compatible(page.get("page")).unwrap_or((index + 1) as i64);
+                    let part_name = json_string_compatible(page.get("part"))
+                        .or_else(|| json_string_compatible(page.get("title")))
+                        .unwrap_or_else(|| format!("P{}", page_no.max(1)));
+                    let duration_seconds = json_i64_compatible(page.get("duration"))
+                        .unwrap_or(0)
+                        .max(0);
+                    let safe_part = sanitize_filename(&part_name);
+                    let file_name = if safe_part.trim().is_empty() {
+                        format!("{}_P{}.mp4", resolved_bvid, page_no.max(1))
+                    } else {
+                        format!("{}_P{}_{}.mp4", resolved_bvid, page_no.max(1), safe_part)
+                    };
+                    Some(SubmissionRemoteVideoPage {
+                        source_key: format!("{}:{}", resolved_bvid, cid),
+                        bvid: resolved_bvid.clone(),
+                        aid: resolved_aid,
+                        cid,
+                        page: page_no.max(1),
+                        part_name: part_name.clone(),
+                        duration_seconds,
+                        start_time: "00:00:00".to_string(),
+                        end_time: seconds_to_hms(duration_seconds),
+                        file_name,
+                        remote_file_name: None,
+                        source_file_path: build_remote_source_path(&resolved_bvid, cid, &part_name),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(SubmissionRemoteVideoPreview {
+        input: input.trim().to_string(),
+        bvid: resolved_bvid,
+        aid: resolved_aid,
+        title,
+        description,
+        cover_url,
+        partition_id,
+        partition_name,
+        tags: None,
+        collection_id: None,
+        collection_name: None,
+        enable_segmentation: false,
+        segment_duration_seconds: 133,
+        owner_mid,
+        owner_name,
+        pages,
+    })
+}
+
 async fn fetch_remote_video_preview(
     state: &State<'_, AppState>,
     input: &str,
@@ -9609,6 +10815,33 @@ async fn fetch_remote_video_preview(
         ),
     );
 
+    let creator_archive = data.get("archive");
+    let creator_aid = creator_archive
+        .and_then(|value| json_i64_compatible(value.get("aid")))
+        .unwrap_or(0);
+    let creator_bvid = creator_archive
+        .and_then(|value| json_string_compatible(value.get("bvid")))
+        .unwrap_or_default();
+    let creator_pages = data
+        .get("videos")
+        .and_then(|value| value.as_array())
+        .or_else(|| data.get("pages").and_then(|value| value.as_array()))
+        .map(|value| value.len())
+        .unwrap_or(0);
+    if creator_aid <= 0 || creator_bvid.trim().is_empty() || creator_pages == 0 {
+        append_log(
+            &state.app_log_path,
+            &format!(
+                "remote_preview_fallback_public input={} creator_aid={} creator_bvid={} creator_pages={}",
+                input.trim(),
+                creator_aid,
+                creator_bvid,
+                creator_pages
+            ),
+        );
+        return fetch_public_remote_video_preview(state, auth.as_ref(), input, bvid, aid).await;
+    }
+
     let archive = data
         .get("archive")
         .ok_or_else(|| "视频详情缺少archive字段".to_string())?;
@@ -9617,7 +10850,9 @@ async fn fetch_remote_video_preview(
         .ok_or_else(|| "视频详情缺少BVID".to_string())?;
     let resolved_aid = json_i64_compatible(archive.get("aid")).or(aid).unwrap_or(0);
     let title = json_string_compatible(archive.get("title"))
-        .ok_or_else(|| "视频详情缺少标题".to_string())?;
+        .or_else(|| json_string_compatible(data.get("title")))
+        .or_else(|| bvid.clone())
+        .unwrap_or_else(|| "未命名视频".to_string());
     let description = json_string_compatible(archive.get("desc"));
     let description = description.or_else(|| {
         archive
@@ -9686,9 +10921,31 @@ async fn fetch_remote_video_preview(
       partition_name.as_deref().unwrap_or("-")
     ),
   );
-    let owner_mid = json_i64_compatible(archive.get("mid")).filter(|value| *value > 0);
-    let owner_name = json_string_compatible(archive.get("author"));
-    if owner_mid.is_none() || resolved_aid <= 0 || resolved_bvid.trim().is_empty() {
+    let owner_mid = json_i64_compatible(archive.get("mid"))
+        .or_else(|| json_i64_compatible(archive.get("author_mid")))
+        .or_else(|| {
+            archive
+                .get("owner")
+                .and_then(|value| json_i64_compatible(value.get("mid")))
+        })
+        .or_else(|| {
+            archive
+                .get("author")
+                .and_then(|value| json_i64_compatible(value.get("mid")))
+        })
+        .filter(|value| *value > 0);
+    let owner_name = json_string_compatible(archive.get("author"))
+        .or_else(|| {
+            archive
+                .get("owner")
+                .and_then(|value| json_string_compatible(value.get("name")))
+        })
+        .or_else(|| {
+            archive
+                .get("author")
+                .and_then(|value| json_string_compatible(value.get("name")))
+        });
+    if resolved_aid <= 0 || resolved_bvid.trim().is_empty() {
         return Err("视频详情不存在或无权限".to_string());
     }
     let collection_info =
@@ -10058,8 +11315,8 @@ pub fn submission_remote_import_save(
     let save_result = context.db.with_conn_mut(|conn| {
     let tx = conn.transaction()?;
     tx.execute(
-      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, remote_state, reject_reason, created_at, updated_at, bilibili_uid, import_mode, baidu_sync_enabled, source_type) \
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11, ?12, 0, NULL, ?13, ?14, ?15, ?16, 0, ?17)",
+      "INSERT INTO submission_task (task_id, status, priority, priority_at, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, remote_state, reject_reason, created_at, updated_at, bilibili_uid, import_mode, baidu_sync_enabled, source_type) \
+       VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11, ?12, 0, NULL, ?13, ?14, ?15, ?16, 0, ?17)",
       params![
         &task_id,
         "COMPLETED",
@@ -10387,84 +11644,124 @@ fn load_tasks(
           WHEN st.status = 'WAITING_UPLOAD' THEN st.priority \
           ELSE 0 \
         END DESC, \
+        CASE \
+          WHEN st.status = 'WAITING_UPLOAD' AND COALESCE(st.priority, 0) = 1 THEN COALESCE(st.priority_at, st.updated_at) \
+          ELSE NULL \
+        END DESC, \
+        CASE \
+          WHEN st.status = 'WAITING_UPLOAD' AND COALESCE(st.priority, 0) = 0 THEN st.updated_at \
+          ELSE NULL \
+        END ASC, \
         st.created_at DESC";
       let sql = match (status.as_ref(), like_query.as_ref(), source_type.as_ref()) {
         (Some(_), Some(_), Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+             WHERE latest_wi.task_id = st.task_id \
+             ORDER BY latest_wi.created_at DESC LIMIT 1 \
+           ) \
            LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
            WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND COALESCE(st.source_type, 'NORMAL') = ?3 AND (st.title LIKE ?4 COLLATE NOCASE OR st.bvid LIKE ?4 COLLATE NOCASE) {} LIMIT ?5 OFFSET ?6",
           order_by
         ),
         (Some(_), Some(_), None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+             WHERE latest_wi.task_id = st.task_id \
+             ORDER BY latest_wi.created_at DESC LIMIT 1 \
+           ) \
            LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
            WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND (st.title LIKE ?3 COLLATE NOCASE OR st.bvid LIKE ?3 COLLATE NOCASE) {} LIMIT ?4 OFFSET ?5",
           order_by
         ),
         (Some(_), None, Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+             WHERE latest_wi.task_id = st.task_id \
+             ORDER BY latest_wi.created_at DESC LIMIT 1 \
+           ) \
            LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
            WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND COALESCE(st.source_type, 'NORMAL') = ?3 {} LIMIT ?4 OFFSET ?5",
           order_by
         ),
         (Some(_), None, None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+             WHERE latest_wi.task_id = st.task_id \
+             ORDER BY latest_wi.created_at DESC LIMIT 1 \
+           ) \
            LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
            WHERE st.bilibili_uid = ?1 AND st.status = ?2 {} LIMIT ?3 OFFSET ?4",
           order_by
         ),
         (None, Some(_), Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+             WHERE latest_wi.task_id = st.task_id \
+             ORDER BY latest_wi.created_at DESC LIMIT 1 \
+           ) \
            LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
            WHERE st.bilibili_uid = ?1 AND COALESCE(st.source_type, 'NORMAL') = ?2 AND (st.title LIKE ?3 COLLATE NOCASE OR st.bvid LIKE ?3 COLLATE NOCASE) {} LIMIT ?4 OFFSET ?5",
           order_by
         ),
         (None, Some(_), None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+             WHERE latest_wi.task_id = st.task_id \
+             ORDER BY latest_wi.created_at DESC LIMIT 1 \
+           ) \
            LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
            WHERE st.bilibili_uid = ?1 AND (st.title LIKE ?2 COLLATE NOCASE OR st.bvid LIKE ?2 COLLATE NOCASE) {} LIMIT ?3 OFFSET ?4",
           order_by
         ),
         (None, None, Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+             WHERE latest_wi.task_id = st.task_id \
+             ORDER BY latest_wi.created_at DESC LIMIT 1 \
+           ) \
            LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
            WHERE st.bilibili_uid = ?1 AND COALESCE(st.source_type, 'NORMAL') = ?2 {} LIMIT ?3 OFFSET ?4",
           order_by
         ),
         (None, None, None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+             WHERE latest_wi.task_id = st.task_id \
+             ORDER BY latest_wi.created_at DESC LIMIT 1 \
+           ) \
            LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
            WHERE st.bilibili_uid = ?1 {} LIMIT ?2 OFFSET ?3",
           order_by
@@ -10511,23 +11808,23 @@ fn load_tasks(
 }
 
 fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTaskRecord> {
-    let import_mode_raw: Option<String> = row.get(21)?;
+    let import_mode_raw: Option<String> = row.get(22)?;
     let import_mode = normalize_import_mode(import_mode_raw.as_deref());
-    let source_type_raw: Option<String> = row.get(22)?;
+    let source_type_raw: Option<String> = row.get(23)?;
     let source_type = source_type_raw
         .as_deref()
         .unwrap_or("NORMAL")
         .trim()
         .to_string();
-    let workflow_config_raw: Option<String> = row.get(23)?;
+    let workflow_config_raw: Option<String> = row.get(24)?;
     let workflow_settings = parse_workflow_settings(
         workflow_config_raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),
     );
-    let has_integrated_downloads: i64 = row.get(27)?;
-    let workflow_status = row.get::<_, Option<String>>(28)?;
-    let workflow_step = row.get::<_, Option<String>>(29)?;
-    let workflow_progress: Option<f64> = row.get(30)?;
-    let workflow_error_message: Option<String> = row.get(31)?;
+    let has_integrated_downloads: i64 = row.get(28)?;
+    let workflow_status = row.get::<_, Option<String>>(29)?;
+    let workflow_step = row.get::<_, Option<String>>(30)?;
+    let workflow_progress: Option<f64> = row.get(31)?;
+    let workflow_error_message: Option<String> = row.get(32)?;
     let workflow_status = workflow_status.map(|status| WorkflowStatusRecord {
         status,
         current_step: workflow_step,
@@ -10541,30 +11838,31 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
         task_id: row.get(0)?,
         status: row.get(1)?,
         priority: row.get::<_, i64>(2)? != 0,
-        title: row.get(3)?,
-        description: row.get(4)?,
-        cover_url: row.get(5)?,
-        cover_local_path: row.get(6)?,
-        partition_id: row.get(7)?,
-        tags: row.get(8)?,
-        topic_id: row.get(9)?,
-        mission_id: row.get(10)?,
-        activity_title: row.get(11)?,
-        video_type: row.get(12)?,
-        collection_id: row.get(13)?,
-        bvid: row.get(14)?,
-        aid: row.get(15)?,
-        remote_state: row.get(16)?,
-        reject_reason: row.get(17)?,
-        created_at: row.get(18)?,
-        updated_at: row.get(19)?,
-        segment_prefix: row.get(20)?,
+        priority_at: row.get(3)?,
+        title: row.get(4)?,
+        description: row.get(5)?,
+        cover_url: row.get(6)?,
+        cover_local_path: row.get(7)?,
+        partition_id: row.get(8)?,
+        tags: row.get(9)?,
+        topic_id: row.get(10)?,
+        mission_id: row.get(11)?,
+        activity_title: row.get(12)?,
+        video_type: row.get(13)?,
+        collection_id: row.get(14)?,
+        bvid: row.get(15)?,
+        aid: row.get(16)?,
+        remote_state: row.get(17)?,
+        reject_reason: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
+        segment_prefix: row.get(21)?,
         import_mode,
         source_type,
         enable_segmentation,
-        baidu_sync_enabled: row.get::<_, i64>(24)? != 0,
-        baidu_sync_path: row.get(25)?,
-        baidu_sync_filename: row.get(26)?,
+        baidu_sync_enabled: row.get::<_, i64>(25)? != 0,
+        baidu_sync_path: row.get(26)?,
+        baidu_sync_filename: row.get(27)?,
         has_integrated_downloads: has_integrated_downloads != 0,
         workflow_status,
     })
@@ -10578,11 +11876,15 @@ fn load_task_record(
     .db
     .with_conn(|conn| {
       conn.query_row(
-        "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+        "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                 wi.status, wi.current_step, wi.progress, wi.error_message \
          FROM submission_task st \
-         LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+         LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+           SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+           WHERE latest_wi.task_id = st.task_id \
+           ORDER BY latest_wi.created_at DESC LIMIT 1 \
+         ) \
          LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
          WHERE st.task_id = ?1",
         [task_id],
@@ -10602,7 +11904,7 @@ fn load_task_detail(
     .db
     .with_conn(|conn| {
       let mut source_stmt = conn.prepare(
-        "SELECT id, task_id, source_file_path, sort_order, start_time, end_time, remote_bvid FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
+        "SELECT id, task_id, source_file_path, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
       )?;
       let source_videos = source_stmt
         .query_map([task_id], |row| {
@@ -10614,6 +11916,9 @@ fn load_task_detail(
             start_time: row.get(4)?,
             end_time: row.get(5)?,
             remote_bvid: row.get(6)?,
+            remote_aid: row.get(7)?,
+            remote_cid: row.get(8)?,
+            remote_part_title: row.get(9)?,
           })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -11315,6 +12620,8 @@ async fn run_submission_workflow(
             .ok_or_else(|| "Workflow instance not found".to_string())?;
     let is_update_workflow = workflow_type == "VIDEO_UPDATE";
     let (reprocess_mode, reprocess_merged_id) = load_reprocess_metadata(workflow_config.as_ref());
+    let media_process_mode = load_media_process_mode(workflow_config.as_ref());
+    let use_transcode_media = media_process_mode == MediaProcessMode::ClipAndMergeTranscode;
     let _ = wait_for_workflow_ready(&context, &task_id).await?;
 
     let sources = if is_update_workflow {
@@ -11405,10 +12712,15 @@ async fn run_submission_workflow(
         append_log(
             &context.app_log_path,
             &format!(
-                "submission_clip_start task_id={} groups={} output_dir={}",
+                "submission_clip_start task_id={} groups={} output_dir={} mode={}",
                 task_id,
                 prepared_groups.len(),
-                clip_dir.to_string_lossy()
+                clip_dir.to_string_lossy(),
+                if use_transcode_media {
+                    "clip_transcode"
+                } else {
+                    "clip_copy"
+                }
             ),
         );
         let mut all_clip_outputs: Vec<PathBuf> = Vec::new();
@@ -11428,19 +12740,51 @@ async fn run_submission_workflow(
                     ),
                 );
             }
-            // 每组独立判断是否可以 stream copy，单源视频组直接走 copy 模式
-            let group_use_copy = if group.sources.len() == 1 {
-                true
+            let group_clip_dir = clip_dir.join(format!("group_{:03}", index + 1));
+            let sources_clone = group.sources.clone();
+            let clip_dir_clone = group_clip_dir.clone();
+            let clip_outputs = if use_transcode_media {
+                match tauri::async_runtime::spawn_blocking(move || {
+                    clip_sources_transcode(
+                        &sources_clone,
+                        &clip_dir_clone,
+                        TranscodeProfile::ClipAndMergeClean,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(outputs)) => outputs,
+                    Ok(Err(err)) => {
+                        append_log(
+                            &context.app_log_path,
+                            &format!("submission_clip_fail task_id={} err={}", task_id, err),
+                        );
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        append_log(
+                            &context.app_log_path,
+                            &format!(
+                                "submission_clip_fail task_id={} err=spawn_blocking_failed",
+                                task_id
+                            ),
+                        );
+                        return Err("Failed to clip videos".to_string());
+                    }
+                }
             } else {
-                match decide_clip_copy(&group.sources) {
+                let group_use_copy = match decide_clip_copy(&group.sources) {
                     Ok(decision) => {
                         if let Some(reason) = decision.reason.as_deref() {
                             append_log(
                                 &context.app_log_path,
                                 &format!(
-                  "submission_clip_copy_decision task_id={} group={} use_copy={} reason={}",
-                  task_id, index + 1, decision.use_copy, reason
-                ),
+                                    "submission_clip_copy_decision task_id={} group={} use_copy={} reason={}",
+                                    task_id,
+                                    index + 1,
+                                    decision.use_copy,
+                                    reason
+                                ),
                             );
                         }
                         decision.use_copy
@@ -11457,33 +12801,30 @@ async fn run_submission_workflow(
                         );
                         false
                     }
-                }
-            };
-            let group_clip_dir = clip_dir.join(format!("group_{:03}", index + 1));
-            let sources_clone = group.sources.clone();
-            let clip_dir_clone = group_clip_dir.clone();
-            let clip_outputs = match tauri::async_runtime::spawn_blocking(move || {
-                clip_sources(&sources_clone, &clip_dir_clone, group_use_copy)
-            })
-            .await
-            {
-                Ok(Ok(outputs)) => outputs,
-                Ok(Err(err)) => {
-                    append_log(
-                        &context.app_log_path,
-                        &format!("submission_clip_fail task_id={} err={}", task_id, err),
-                    );
-                    return Err(err);
-                }
-                Err(_) => {
-                    append_log(
-                        &context.app_log_path,
-                        &format!(
-                            "submission_clip_fail task_id={} err=spawn_blocking_failed",
-                            task_id
-                        ),
-                    );
-                    return Err("Failed to clip videos".to_string());
+                };
+                match tauri::async_runtime::spawn_blocking(move || {
+                    clip_sources(&sources_clone, &clip_dir_clone, group_use_copy)
+                })
+                .await
+                {
+                    Ok(Ok(outputs)) => outputs,
+                    Ok(Err(err)) => {
+                        append_log(
+                            &context.app_log_path,
+                            &format!("submission_clip_fail task_id={} err={}", task_id, err),
+                        );
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        append_log(
+                            &context.app_log_path,
+                            &format!(
+                                "submission_clip_fail task_id={} err=spawn_blocking_failed",
+                                task_id
+                            ),
+                        );
+                        return Err("Failed to clip videos".to_string());
+                    }
                 }
             };
             all_clip_outputs.extend(clip_outputs.clone());
@@ -11525,7 +12866,7 @@ async fn run_submission_workflow(
             append_log(
                 &context.app_log_path,
                 &format!(
-          "submission_merge_start task_id={} inputs={} output={} list={} mode=concat_copy group={}",
+          "submission_merge_start task_id={} inputs={} output={} list={} mode={} group={}",
           task_id,
           group_clip_outputs
             .get(index)
@@ -11533,6 +12874,11 @@ async fn run_submission_workflow(
             .unwrap_or(0),
           merge_output.to_string_lossy(),
           merge_list_path.to_string_lossy(),
+          if use_transcode_media {
+            "merge_transcode"
+          } else {
+            "concat_copy"
+          },
           index + 1
         ),
             );
@@ -11551,11 +12897,23 @@ async fn run_submission_workflow(
             }
             let merge_output_clone = merge_output.clone();
             let merge_inputs = group_clip_outputs.get(index).cloned().unwrap_or_default();
-            tauri::async_runtime::spawn_blocking(move || {
-                merge_files(&merge_inputs, &merge_output_clone)
-            })
-            .await
-            .map_err(|_| "Failed to merge videos".to_string())??;
+            if use_transcode_media {
+                tauri::async_runtime::spawn_blocking(move || {
+                    merge_files_transcode(
+                        &merge_inputs,
+                        &merge_output_clone,
+                        TranscodeProfile::ClipAndMergeClean,
+                    )
+                })
+                .await
+                .map_err(|_| "Failed to merge videos".to_string())??;
+            } else {
+                tauri::async_runtime::spawn_blocking(move || {
+                    merge_files(&merge_inputs, &merge_output_clone)
+                })
+                .await
+                .map_err(|_| "Failed to merge videos".to_string())??;
+            }
             append_log(
                 &context.app_log_path,
                 &format!(
@@ -11565,6 +12923,13 @@ async fn run_submission_workflow(
                     index + 1
                 ),
             );
+            verify_generated_media_output(
+                &context,
+                &task_id,
+                &merge_output,
+                "submission_merge_verify",
+                Some(index + 1),
+            )?;
             let merged_id = save_merged_video_with_sort_order(
                 &context,
                 &task_id,
@@ -11604,17 +12969,6 @@ async fn run_submission_workflow(
             return Ok(());
         }
 
-        if let Err(err) = baidu_sync::enqueue_submission_sync(
-            context.db.as_ref(),
-            context.app_log_path.as_ref(),
-            &task_id,
-        ) {
-            append_log(
-                &context.app_log_path,
-                &format!("baidu_sync_enqueue_fail task_id={} err={}", task_id, err),
-            );
-        }
-
         let workflow_settings = load_workflow_settings(&context, &task_id);
         let mut next_part_order: i64 = 1;
         let mut next_name_index: usize = 1;
@@ -11637,21 +12991,28 @@ async fn run_submission_workflow(
                 append_log(
           &context.app_log_path,
           &format!(
-            "submission_segment_start task_id={} input={} output_dir={} segment_seconds={} mode=segment_copy group={}",
+            "submission_segment_start task_id={} input={} output_dir={} segment_seconds={} mode={} group={}",
             task_id,
             merged_path.to_string_lossy(),
             segment_dir.to_string_lossy(),
             workflow_settings.segment_duration_seconds,
+            if use_transcode_media {
+              "segment_transcode"
+            } else {
+              "segment_copy"
+            },
             index + 1
           ),
         );
                 let segment_dir_clone = segment_dir.clone();
                 let merged_path_clone = merged_path.clone();
                 let segment_outputs = tauri::async_runtime::spawn_blocking(move || {
-                    segment_file(
+                    segment_file_with_options(
                         &merged_path_clone,
                         &segment_dir_clone,
                         workflow_settings.segment_duration_seconds,
+                        false,
+                        use_transcode_media,
                     )
                 })
                 .await
@@ -11714,6 +13075,16 @@ async fn run_submission_workflow(
                 }
             }
         }
+        if let Err(err) = baidu_sync::enqueue_submission_sync(
+            context.db.as_ref(),
+            context.app_log_path.as_ref(),
+            &task_id,
+        ) {
+            append_log(
+                &context.app_log_path,
+                &format!("baidu_sync_enqueue_fail task_id={} err={}", task_id, err),
+            );
+        }
 
         if !ensure_workflow_instance_latest(
             &context,
@@ -11764,40 +13135,49 @@ async fn run_submission_workflow(
             .join(sanitize_filename(&workflow_instance_id))
     };
     let clip_dir = workflow_dir.join("cut");
-    let copy_decision = match decide_clip_copy(&sources) {
-        Ok(decision) => decision,
-        Err(err) => {
+    let use_copy = if use_transcode_media {
+        false
+    } else {
+        let copy_decision = match decide_clip_copy(&sources) {
+            Ok(decision) => decision,
+            Err(err) => {
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "submission_clip_copy_check_err task_id={} err={}",
+                        task_id, err
+                    ),
+                );
+                crate::processing::ClipCopyDecision {
+                    use_copy: true,
+                    reason: Some(format!("forced_copy_fallback err={}", err)),
+                }
+            }
+        };
+        if let Some(reason) = copy_decision.reason.as_deref() {
             append_log(
                 &context.app_log_path,
                 &format!(
-                    "submission_clip_copy_check_err task_id={} err={}",
-                    task_id, err
+                    "submission_clip_copy_decision task_id={} use_copy={} reason={}",
+                    task_id, copy_decision.use_copy, reason
                 ),
             );
-            crate::processing::ClipCopyDecision {
-                use_copy: false,
-                reason: Some(format!("timestamp_probe_failed err={}", err)),
-            }
         }
+        copy_decision.use_copy
     };
-    let use_copy = copy_decision.use_copy;
-    if let Some(reason) = copy_decision.reason.as_deref() {
-        append_log(
-            &context.app_log_path,
-            &format!(
-                "submission_clip_copy_decision task_id={} use_copy={} reason={}",
-                task_id, use_copy, reason
-            ),
-        );
-    }
     append_log(
         &context.app_log_path,
         &format!(
-            "submission_clip_start task_id={} sources={} use_copy={} output_dir={}",
+            "submission_clip_start task_id={} sources={} use_copy={} output_dir={} mode={}",
             task_id,
             sources.len(),
             use_copy,
-            clip_dir.to_string_lossy()
+            clip_dir.to_string_lossy(),
+            if use_transcode_media {
+                "clip_transcode"
+            } else {
+                "clip_copy"
+            }
         ),
     );
     for source in &sources {
@@ -11815,28 +13195,59 @@ async fn run_submission_workflow(
     }
     let sources_clone = sources.clone();
     let clip_dir_clone = clip_dir.clone();
-    let clip_outputs = match tauri::async_runtime::spawn_blocking(move || {
-        clip_sources(&sources_clone, &clip_dir_clone, use_copy)
-    })
-    .await
-    {
-        Ok(Ok(outputs)) => outputs,
-        Ok(Err(err)) => {
-            append_log(
-                &context.app_log_path,
-                &format!("submission_clip_fail task_id={} err={}", task_id, err),
-            );
-            return Err(err);
+    let clip_outputs = if use_transcode_media {
+        match tauri::async_runtime::spawn_blocking(move || {
+            clip_sources_transcode(
+                &sources_clone,
+                &clip_dir_clone,
+                TranscodeProfile::ClipAndMergeClean,
+            )
+        })
+        .await
+        {
+            Ok(Ok(outputs)) => outputs,
+            Ok(Err(err)) => {
+                append_log(
+                    &context.app_log_path,
+                    &format!("submission_clip_fail task_id={} err={}", task_id, err),
+                );
+                return Err(err);
+            }
+            Err(_) => {
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "submission_clip_fail task_id={} err=spawn_blocking_failed",
+                        task_id
+                    ),
+                );
+                return Err("Failed to clip videos".to_string());
+            }
         }
-        Err(_) => {
-            append_log(
-                &context.app_log_path,
-                &format!(
-                    "submission_clip_fail task_id={} err=spawn_blocking_failed",
-                    task_id
-                ),
-            );
-            return Err("Failed to clip videos".to_string());
+    } else {
+        match tauri::async_runtime::spawn_blocking(move || {
+            clip_sources(&sources_clone, &clip_dir_clone, use_copy)
+        })
+        .await
+        {
+            Ok(Ok(outputs)) => outputs,
+            Ok(Err(err)) => {
+                append_log(
+                    &context.app_log_path,
+                    &format!("submission_clip_fail task_id={} err={}", task_id, err),
+                );
+                return Err(err);
+            }
+            Err(_) => {
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "submission_clip_fail task_id={} err=spawn_blocking_failed",
+                        task_id
+                    ),
+                );
+                return Err("Failed to clip videos".to_string());
+            }
         }
     };
     append_log(
@@ -11869,11 +13280,16 @@ async fn run_submission_workflow(
     append_log(
         &context.app_log_path,
         &format!(
-            "submission_merge_start task_id={} inputs={} output={} list={} mode=concat_copy",
+            "submission_merge_start task_id={} inputs={} output={} list={} mode={}",
             task_id,
             clip_outputs.len(),
             merge_output.to_string_lossy(),
-            merge_list_path.to_string_lossy()
+            merge_list_path.to_string_lossy(),
+            if use_transcode_media {
+                "merge_transcode"
+            } else {
+                "concat_copy"
+            }
         ),
     );
     for path in &clip_outputs {
@@ -11887,9 +13303,23 @@ async fn run_submission_workflow(
         );
     }
     let merge_output_clone = merge_output.clone();
-    tauri::async_runtime::spawn_blocking(move || merge_files(&clip_outputs, &merge_output_clone))
+    if use_transcode_media {
+        tauri::async_runtime::spawn_blocking(move || {
+            merge_files_transcode(
+                &clip_outputs,
+                &merge_output_clone,
+                TranscodeProfile::ClipAndMergeClean,
+            )
+        })
         .await
         .map_err(|_| "Failed to merge videos".to_string())??;
+    } else {
+        tauri::async_runtime::spawn_blocking(move || {
+            merge_files(&clip_outputs, &merge_output_clone)
+        })
+        .await
+        .map_err(|_| "Failed to merge videos".to_string())??;
+    }
     append_log(
         &context.app_log_path,
         &format!(
@@ -11898,6 +13328,13 @@ async fn run_submission_workflow(
             merge_output.to_string_lossy()
         ),
     );
+    verify_generated_media_output(
+        &context,
+        &task_id,
+        &merge_output,
+        "submission_merge_verify",
+        None,
+    )?;
 
     if !ensure_workflow_instance_latest(&context, &task_id, &workflow_instance_id, "POST_MERGE")? {
         return Ok(());
@@ -11923,17 +13360,6 @@ async fn run_submission_workflow(
             ),
         );
     }
-    if let Err(err) = baidu_sync::enqueue_submission_sync(
-        context.db.as_ref(),
-        context.app_log_path.as_ref(),
-        &task_id,
-    ) {
-        append_log(
-            &context.app_log_path,
-            &format!("baidu_sync_enqueue_fail task_id={} err={}", task_id, err),
-        );
-    }
-
     let workflow_settings = load_workflow_settings(&context, &task_id);
     if workflow_settings.enable_segmentation {
         let _ = wait_for_workflow_ready(&context, &task_id).await?;
@@ -11942,21 +13368,28 @@ async fn run_submission_workflow(
         let segment_dir = workflow_dir.join("output");
         let merge_output_segment = merge_output.clone();
         append_log(
-      &context.app_log_path,
-      &format!(
-        "submission_segment_start task_id={} input={} output_dir={} segment_seconds={} mode=segment_copy",
+            &context.app_log_path,
+            &format!(
+        "submission_segment_start task_id={} input={} output_dir={} segment_seconds={} mode={}",
         task_id,
         merge_output_segment.to_string_lossy(),
         segment_dir.to_string_lossy(),
-        workflow_settings.segment_duration_seconds
+        workflow_settings.segment_duration_seconds,
+        if use_transcode_media {
+          "segment_transcode"
+        } else {
+          "segment_copy"
+        }
       ),
-    );
+        );
         let segment_dir_clone = segment_dir.clone();
         let segment_outputs = tauri::async_runtime::spawn_blocking(move || {
-            segment_file(
+            segment_file_with_options(
                 &merge_output_segment,
                 &segment_dir_clone,
                 workflow_settings.segment_duration_seconds,
+                false,
+                use_transcode_media,
             )
         })
         .await
@@ -12036,6 +13469,16 @@ async fn run_submission_workflow(
             name_start_index,
         )?;
     }
+    if let Err(err) = baidu_sync::enqueue_submission_sync(
+        context.db.as_ref(),
+        context.app_log_path.as_ref(),
+        &task_id,
+    ) {
+        append_log(
+            &context.app_log_path,
+            &format!("baidu_sync_enqueue_fail task_id={} err={}", task_id, err),
+        );
+    }
 
     if !ensure_workflow_instance_latest(
         &context,
@@ -12058,6 +13501,15 @@ async fn run_submission_workflow(
 async fn run_submission_workflow_guarded(context: SubmissionContext, task_id: String) {
     if let Err(err) = run_submission_workflow(context.clone(), task_id.clone()).await {
         if err == "Workflow cancelled" {
+            if let Err(cleanup_err) = terminate_submission_ffmpeg_processes(&context, &task_id) {
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "submission_workflow_cancel_cleanup_fail task_id={} err={}",
+                        task_id, cleanup_err
+                    ),
+                );
+            }
             append_log(
                 &context.app_log_path,
                 &format!(
@@ -12066,6 +13518,15 @@ async fn run_submission_workflow_guarded(context: SubmissionContext, task_id: St
                 ),
             );
             return;
+        }
+        if let Err(cleanup_err) = terminate_submission_ffmpeg_processes(&context, &task_id) {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_workflow_fail_cleanup_fail task_id={} err={}",
+                    task_id, cleanup_err
+                ),
+            );
         }
         let _ = update_workflow_status(&context, &task_id, "FAILED", None, 0.0);
         let _ = update_submission_status(&context, &task_id, "FAILED");
@@ -12341,6 +13802,12 @@ fn is_preupload_parse_error(err: &str) -> bool {
 }
 
 fn is_retryable_submission_error(err: &str) -> bool {
+    if is_submit_result_unknown_error(err) || is_reupload_required_submission_error(err) {
+        return false;
+    }
+    if is_already_submitted_submission_error(err) {
+        return false;
+    }
     let lower = err.to_lowercase();
     let keywords = [
         "预上传请求失败:",
@@ -12365,6 +13832,40 @@ fn is_retryable_submission_error(err: &str) -> bool {
     let cn_keywords = ["网络", "超时", "连接", "预上传解析失败重试次数已达上限"];
     keywords.iter().any(|keyword| lower.contains(keyword))
         || cn_keywords.iter().any(|keyword| err.contains(keyword))
+}
+
+fn is_already_submitted_submission_error(err: &str) -> bool {
+    err.contains("稿件已成功投稿，请勿重新提交")
+        || err.contains("同一视频不能重复投稿")
+        || err.contains("请勿重新提交哦")
+        || err.contains("(code: 21612)")
+        || err.contains("(code: 21503)")
+}
+
+fn is_submit_result_unknown_error(err: &str) -> bool {
+    err.contains("SUBMIT_RESULT_UNKNOWN:")
+}
+
+fn is_reupload_required_submission_error(err: &str) -> bool {
+    err.contains("REUPLOAD_REQUIRED:")
+}
+
+fn is_submit_network_busy_error(err: &str) -> bool {
+    err.contains("(code: 69800)") || err.contains("网络繁忙")
+}
+
+fn build_submit_result_unknown_error(err: &str) -> String {
+    format!(
+        "SUBMIT_RESULT_UNKNOWN: 最终提交返回网络繁忙，系统已停止自动重试，避免重复投稿。请先确认远端是否已生成稿件；若未生成，请执行重新上传后投稿。原始错误: {}",
+        err
+    )
+}
+
+fn build_reupload_required_error(err: &str) -> String {
+    format!(
+        "REUPLOAD_REQUIRED: 当前批次已被远端判定为重复投稿，不能继续复用本次已上传分P直接重试。请重新上传后投稿。原始错误: {}",
+        err
+    )
 }
 
 fn upload_target_label(target: &UploadTarget) -> String {
@@ -12486,15 +13987,13 @@ async fn wait_for_task_upload_rate_limit(
         let wait_state = {
             let state = TASK_UPLOAD_RATE_LIMITS.get_or_init(|| AsyncMutex::new(HashMap::new()));
             let state = state.lock().await;
-            state
-                .get(task_id)
-                .and_then(|entry| {
-                    entry.blocked_until.and_then(|blocked_until| {
-                        blocked_until
-                            .checked_duration_since(Instant::now())
-                            .map(|wait| (wait, entry.wake_tx.subscribe()))
-                    })
+            state.get(task_id).and_then(|entry| {
+                entry.blocked_until.and_then(|blocked_until| {
+                    blocked_until
+                        .checked_duration_since(Instant::now())
+                        .map(|wait| (wait, entry.wake_tx.subscribe()))
                 })
+            })
         };
         let Some((wait, mut wake_rx)) = wait_state else {
             return;
@@ -12798,6 +14297,68 @@ async fn verify_remote_part_count(
         }
     }
     Err(last_error.unwrap_or_else(|| "远程分P数量校验失败".to_string()))
+}
+
+async fn try_complete_existing_submission(
+    context: &UploadContext,
+    submission_context: &SubmissionContext,
+    task_id: &str,
+    auth: &AuthInfo,
+    expected_parts: usize,
+    reason: &str,
+) -> Result<bool, String> {
+    let detail = load_task_detail(submission_context, task_id)?;
+    let bvid = detail.task.bvid.clone().unwrap_or_default();
+    let mut aid = detail.task.aid.unwrap_or(0);
+    if bvid.trim().is_empty() && aid <= 0 {
+        append_log(
+            &context.app_log_path,
+            &format!(
+                "submission_existing_complete_skip task_id={} reason={} missing_refs=true",
+                task_id, reason
+            ),
+        );
+        return Ok(false);
+    }
+    if aid <= 0 && !bvid.trim().is_empty() {
+        if let Some(resolved_aid) = fetch_aid_with_refresh(context, auth, bvid.trim()).await {
+            aid = resolved_aid;
+            let _ = update_submission_aid(submission_context, task_id, aid);
+        }
+    }
+    if aid <= 0 {
+        append_log(
+            &context.app_log_path,
+            &format!(
+                "submission_existing_complete_skip task_id={} reason={} aid_missing=true bvid={}",
+                task_id, reason, bvid
+            ),
+        );
+        return Ok(false);
+    }
+    match verify_remote_part_count(context, auth, task_id, bvid.trim(), aid, expected_parts).await {
+        Ok(()) => {
+            update_submission_status(submission_context, task_id, "COMPLETED")?;
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_existing_complete_ok task_id={} reason={} bvid={} aid={} parts={}",
+                    task_id, reason, bvid, aid, expected_parts
+                ),
+            );
+            Ok(true)
+        }
+        Err(err) => {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_existing_complete_verify_fail task_id={} reason={} bvid={} aid={} expected_parts={} err={}",
+                    task_id, reason, bvid, aid, expected_parts, err
+                ),
+            );
+            Ok(false)
+        }
+    }
 }
 
 async fn upload_output_segments_with_worker_pool(
@@ -13185,6 +14746,20 @@ async fn run_submission_upload(context: UploadContext, task_id: String) -> Resul
         return Err("投稿文件为空".to_string());
     }
 
+    if !is_update_workflow
+        && try_complete_existing_submission(
+            &context,
+            &submission_context,
+            &task_id,
+            &auth,
+            parts.len(),
+            "pre_submit_guard",
+        )
+        .await?
+    {
+        return Ok(());
+    }
+
     if !is_update_workflow && parts.len() > MAX_PARTS_PER_BVID {
         update_submission_status_with_reason(
             &submission_context,
@@ -13306,20 +14881,40 @@ async fn run_submission_upload(context: UploadContext, task_id: String) -> Resul
                 Ok(())
             }
             Err(err) => {
+                if is_already_submitted_submission_error(&err)
+                    && try_complete_existing_submission(
+                        &context,
+                        &submission_context,
+                        &task_id,
+                        &auth,
+                        parts.len(),
+                        "submit_duplicate",
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+                let final_err = if is_submit_network_busy_error(&err) {
+                    build_submit_result_unknown_error(&err)
+                } else if is_already_submitted_submission_error(&err) {
+                    build_reupload_required_error(&err)
+                } else {
+                    err.clone()
+                };
                 update_submission_status_with_reason(
                     &submission_context,
                     &task_id,
                     "FAILED",
-                    Some(&err),
+                    Some(&final_err),
                 )?;
                 append_log(
                     &context.app_log_path,
                     &format!(
                         "submission_update_submit_fail task_id={} err={}",
-                        task_id, err
+                        task_id, final_err
                     ),
                 );
-                Err(err)
+                Err(final_err)
             }
         }
     } else {
@@ -13394,20 +14989,40 @@ async fn run_submission_upload(context: UploadContext, task_id: String) -> Resul
                 Ok(())
             }
             Err(err) => {
+                if is_already_submitted_submission_error(&err)
+                    && try_complete_existing_submission(
+                        &context,
+                        &submission_context,
+                        &task_id,
+                        &auth,
+                        parts.len(),
+                        "submit_duplicate",
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+                let final_err = if is_submit_network_busy_error(&err) {
+                    build_submit_result_unknown_error(&err)
+                } else if is_already_submitted_submission_error(&err) {
+                    build_reupload_required_error(&err)
+                } else {
+                    err.clone()
+                };
                 update_submission_status_with_reason(
                     &submission_context,
                     &task_id,
                     "FAILED",
-                    Some(&err),
+                    Some(&final_err),
                 )?;
                 append_log(
                     &context.app_log_path,
                     &format!(
                         "submission_upload_submit_fail task_id={} err={}",
-                        task_id, err
+                        task_id, final_err
                     ),
                 );
-                Err(err)
+                Err(final_err)
             }
         }
     }
@@ -14009,6 +15624,15 @@ async fn recover_submission_tasks(context: SubmissionQueueContext) {
                     ),
                 );
             }
+        }
+        if let Err(err) = terminate_submission_ffmpeg_processes(&submission_context, &task_id) {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_recover_ffmpeg_cleanup_fail task_id={} err={}",
+                    task_id, err
+                ),
+            );
         }
         let _ = update_submission_status(&submission_context, &task_id, "PENDING");
         let _ = set_workflow_instance_status(&submission_context, &task_id, "PENDING");
@@ -15902,7 +17526,7 @@ fn load_task_source_video_records(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, task_id, source_file_path, sort_order, start_time, end_time, remote_bvid \
+                "SELECT id, task_id, source_file_path, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title \
          FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
             )?;
             let rows = stmt.query_map([task_id], |row| {
@@ -15914,6 +17538,9 @@ fn load_task_source_video_records(
                     start_time: row.get(4)?,
                     end_time: row.get(5)?,
                     remote_bvid: row.get(6)?,
+                    remote_aid: row.get(7)?,
+                    remote_cid: row.get(8)?,
+                    remote_part_title: row.get(9)?,
                 })
             })?;
             let mut list = rows.collect::<Result<Vec<_>, _>>()?;
@@ -16066,20 +17693,6 @@ fn collect_sources_for_merge_all(
     normalize_binding_sources(sources)
 }
 
-fn resolve_merged_target_path(base_dir: &Path, merged: &MergedVideoRecord) -> Option<PathBuf> {
-    if let Some(path) = merged.video_path.as_deref() {
-        if !path.trim().is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    if let Some(file_name) = merged.file_name.as_deref() {
-        if !file_name.trim().is_empty() {
-            return Some(base_dir.join("merge").join(file_name));
-        }
-    }
-    None
-}
-
 fn merged_display_name(merged: &MergedVideoRecord) -> String {
     if let Some(name) = merged
         .file_name
@@ -16128,36 +17741,6 @@ fn update_merged_video_path(
             Ok(())
         })
         .map_err(|err| err.to_string())
-}
-
-fn rebuild_missing_merged_video(
-    context: &SubmissionContext,
-    task_id: &str,
-    merged: &MergedVideoRecord,
-    sources: &[ClipSource],
-    base_dir: &Path,
-) -> Result<PathBuf, String> {
-    if sources.is_empty() {
-        return Err("源视频为空，无法重建合并视频".to_string());
-    }
-    let target_path = resolve_merged_target_path(base_dir, merged)
-        .ok_or_else(|| "合并视频路径为空".to_string())?;
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("创建合并目录失败: {}", err))?;
-    }
-    let rebuild_dir = base_dir
-        .join("resegment")
-        .join(sanitize_filename(&format!("rebuild_{}", now_rfc3339())))
-        .join("cut");
-    let copy_decision = decide_clip_copy(sources).unwrap_or(crate::processing::ClipCopyDecision {
-        use_copy: false,
-        reason: Some("rebuild_copy_decision_failed".to_string()),
-    });
-    let clip_outputs = clip_sources(sources, &rebuild_dir, copy_decision.use_copy)?;
-    merge_files(&clip_outputs, &target_path)?;
-    update_merged_video_path(context, merged.id, &target_path)?;
-    save_merged_source_bindings(context, task_id, merged.id, sources)?;
-    Ok(target_path)
 }
 
 fn recreate_selected_merged_video_record(
@@ -16395,8 +17978,60 @@ fn validate_source_video_inputs(sources: &[SourceVideoInput]) -> Result<(), Stri
         if start >= end {
             return Err(format!("第{}行开始时间必须小于结束时间", row));
         }
+        if let Some(remote_cid) = source.remote_cid {
+            if remote_cid <= 0 {
+                return Err(format!("第{}行绑定分P无效", row));
+            }
+        }
     }
     Ok(())
+}
+
+fn normalize_source_remote_binding(
+    source: &SourceVideoInput,
+) -> (
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+) {
+    let remote_bvid = source
+        .remote_bvid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let remote_aid = if remote_bvid.is_some() {
+        source.remote_aid.filter(|value| *value > 0)
+    } else {
+        None
+    };
+    let remote_cid = if remote_bvid.is_some() {
+        source.remote_cid.filter(|value| *value > 0)
+    } else {
+        None
+    };
+    let remote_part_title = if remote_bvid.is_some() {
+        source
+            .remote_part_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    } else {
+        None
+    };
+    let remote_video_url = remote_bvid
+        .as_ref()
+        .map(|value| format!("https://www.bilibili.com/video/{}", value));
+    (
+        remote_bvid,
+        remote_aid,
+        remote_cid,
+        remote_part_title,
+        remote_video_url,
+    )
 }
 
 fn replace_source_videos(
@@ -16411,14 +18046,11 @@ fn replace_source_videos(
       for source in sources {
         let source_id = uuid::Uuid::new_v4().to_string();
         let stored_source_path = to_stored_submission_path(context, &source.source_file_path);
-        let remote_bvid = source
-          .remote_bvid
-          .as_deref()
-          .map(str::trim)
-          .filter(|value| !value.is_empty());
+        let (remote_bvid, remote_aid, remote_cid, remote_part_title, remote_video_url) =
+          normalize_source_remote_binding(source);
         conn.execute(
-          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_bvid) \
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
           (
             source_id,
             task_id,
@@ -16426,7 +18058,11 @@ fn replace_source_videos(
             source.sort_order,
             source.start_time.as_deref(),
             source.end_time.as_deref(),
-            remote_bvid,
+            remote_video_url.as_deref(),
+            remote_bvid.as_deref(),
+            remote_aid,
+            remote_cid,
+            remote_part_title.as_deref(),
           ),
         )?;
       }
@@ -16454,14 +18090,11 @@ fn append_source_videos(
         let source_id = uuid::Uuid::new_v4().to_string();
         let sort_order = base_order + index as i64 + 1;
         let stored_source_path = to_stored_submission_path(context, &source.source_file_path);
-        let remote_bvid = source
-          .remote_bvid
-          .as_deref()
-          .map(str::trim)
-          .filter(|value| !value.is_empty());
+        let (remote_bvid, remote_aid, remote_cid, remote_part_title, remote_video_url) =
+          normalize_source_remote_binding(source);
         conn.execute(
-          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_bvid) \
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
           (
             source_id,
             task_id,
@@ -16469,7 +18102,11 @@ fn append_source_videos(
             sort_order,
             source.start_time.as_deref(),
             source.end_time.as_deref(),
-            remote_bvid,
+            remote_video_url.as_deref(),
+            remote_bvid.as_deref(),
+            remote_aid,
+            remote_cid,
+            remote_part_title.as_deref(),
           ),
         )?;
       }
@@ -16556,6 +18193,87 @@ fn save_video_clips(
       Ok(())
     })
     .map_err(|err| err.to_string())
+}
+
+fn verify_generated_media_output(
+    context: &SubmissionContext,
+    task_id: &str,
+    path: &Path,
+    stage: &str,
+    group: Option<usize>,
+) -> Result<f64, String> {
+    let mut last_err = None;
+    let group_suffix = group
+        .map(|value| format!(" group={}", value))
+        .unwrap_or_default();
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "{}_start task_id={} path={}{}",
+            stage,
+            task_id,
+            path.to_string_lossy(),
+            group_suffix
+        ),
+    );
+    for attempt in 1..=5 {
+        let result = match fs::metadata(path) {
+            Ok(metadata) if !metadata.is_file() => {
+                Err(format!("path_is_not_file path={}", path.to_string_lossy()))
+            }
+            Ok(metadata) if metadata.len() == 0 => {
+                Err(format!("path_is_empty path={}", path.to_string_lossy()))
+            }
+            Ok(metadata) => probe_duration_seconds(path)
+                .map(|duration| (metadata.len(), duration))
+                .map_err(|err| {
+                    format!("ffprobe_failed path={} err={}", path.to_string_lossy(), err)
+                }),
+            Err(err) => Err(format!(
+                "metadata_failed path={} err={}",
+                path.to_string_lossy(),
+                err
+            )),
+        };
+        match result {
+            Ok((size, duration)) => {
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "{}_ok task_id={} path={} size={} duration={:.3} attempt={}{}",
+                        stage,
+                        task_id,
+                        path.to_string_lossy(),
+                        size,
+                        duration,
+                        attempt,
+                        group_suffix
+                    ),
+                );
+                return Ok(duration);
+            }
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < 5 {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+    }
+    let err = last_err
+        .unwrap_or_else(|| format!("unknown_media_verify_error path={}", path.to_string_lossy()));
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "{}_fail task_id={} path={} err={}{}",
+            stage,
+            task_id,
+            path.to_string_lossy(),
+            err,
+            group_suffix
+        ),
+    );
+    Err(err)
 }
 
 fn save_merged_video(
@@ -17977,114 +19695,6 @@ fn load_merged_video_by_id(
     })
 }
 
-fn collect_merge_video_paths(base_dir: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    collect_merge_files_from_dir(&base_dir.join("merge"), &mut result);
-    collect_nested_merge_files(&base_dir.join("updates"), &mut result);
-    collect_nested_merge_files(&base_dir.join("runs"), &mut result);
-    result
-}
-
-fn collect_merge_files_from_dir(dir: &Path, output: &mut Vec<PathBuf>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("mp4"))
-            .unwrap_or(false)
-        {
-            output.push(path);
-        }
-    }
-}
-
-fn collect_nested_merge_files(parent_dir: &Path, output: &mut Vec<PathBuf>) {
-    let entries = match fs::read_dir(parent_dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let nested_dir = entry.path();
-        if nested_dir.is_dir() {
-            collect_merge_files_from_dir(&nested_dir.join("merge"), output);
-        }
-    }
-}
-
-fn insert_merged_video_record(
-    context: &SubmissionContext,
-    task_id: &str,
-    merged_path: &Path,
-    timestamp: &str,
-) -> Result<i64, String> {
-    let file_name = merged_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("merged.mp4");
-    let total_bytes = fs::metadata(merged_path)
-        .map(|meta| meta.len())
-        .unwrap_or(0);
-    let stored_path = to_stored_submission_path(context, merged_path.to_string_lossy().as_ref());
-    context
-    .db
-    .with_conn(|conn| {
-      conn.execute(
-        "INSERT INTO merged_video (task_id, file_name, video_path, duration, status, upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_cid, upload_file_name, upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index, create_time, update_time) \
-         VALUES (?1, ?2, ?3, NULL, 2, 0, 0, ?4, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0, 0, ?5, ?6)",
-        (
-          task_id,
-          file_name,
-          stored_path,
-          total_bytes as i64,
-          timestamp,
-          timestamp,
-        ),
-      )?;
-      Ok(conn.last_insert_rowid())
-    })
-    .map_err(|err| err.to_string())
-}
-
-fn ensure_merged_video_records(context: &SubmissionContext, task_id: &str) -> Result<(), String> {
-    let base_dir = resolve_submission_base_dir(context, task_id);
-    let candidates = collect_merge_video_paths(&base_dir);
-    if candidates.is_empty() {
-        return Ok(());
-    }
-    let existing: HashSet<String> = context
-        .db
-        .with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT video_path FROM merged_video WHERE task_id = ?1 AND video_path IS NOT NULL",
-            )?;
-            let rows = stmt.query_map([task_id], |row| row.get::<_, String>(0))?;
-            Ok(rows.collect::<Result<HashSet<_>, _>>()?)
-        })
-        .map_err(|err| err.to_string())?;
-    let mut known = existing;
-    for path in candidates {
-        let path_str = to_stored_submission_path(context, path.to_string_lossy().as_ref());
-        if known.contains(&path_str) {
-            continue;
-        }
-        if !path.exists() {
-            continue;
-        }
-        let timestamp = fs::metadata(&path)
-            .and_then(|meta| meta.modified())
-            .map(|time| chrono::DateTime::<Utc>::from(time).to_rfc3339())
-            .unwrap_or_else(|_| now_rfc3339());
-        let _ = insert_merged_video_record(context, task_id, &path, &timestamp)?;
-        known.insert(path_str);
-    }
-    Ok(())
-}
-
 fn load_merged_videos_by_task(
     context: &SubmissionContext,
     task_id: &str,
@@ -18390,10 +20000,17 @@ fn update_submission_status_with_reason(
     context
         .db
         .with_conn(|conn| {
-            conn.execute(
-                "UPDATE submission_task SET status = ?1, updated_at = ?2 WHERE task_id = ?3",
-                (status, &now, task_id),
-            )?;
+            if status == "COMPLETED" {
+                conn.execute(
+                    "UPDATE submission_task SET status = ?1, updated_at = ?2, priority = 0, priority_at = NULL WHERE task_id = ?3",
+                    (status, &now, task_id),
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE submission_task SET status = ?1, updated_at = ?2 WHERE task_id = ?3",
+                    (status, &now, task_id),
+                )?;
+            }
             if status == "FAILED" {
                 conn.execute(
           "UPDATE workflow_instances SET error_message = ?1, updated_at = ?2 WHERE task_id = ?3",
@@ -18678,7 +20295,159 @@ fn ensure_workflow_instance_latest(
     Ok(false)
 }
 
+fn list_submission_ffmpeg_pids(task_id: &str) -> Result<Vec<(u32, String)>, String> {
+    let ffmpeg_path = crate::config::resolve_ffmpeg_path();
+    let ffmpeg_path = ffmpeg_path.to_string_lossy().to_string();
+    let task_marker = format!("/{}/", task_id);
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .map_err(|err| format!("读取 ffmpeg 进程失败: {}", err))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("读取 ffmpeg 进程失败: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut result = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let pid_text = parts.next().unwrap_or("").trim();
+        let command = parts.next().unwrap_or("").trim();
+        if pid_text.is_empty() || command.is_empty() {
+            continue;
+        }
+        if !command.contains(&ffmpeg_path) || !command.contains(&task_marker) {
+            continue;
+        }
+        let pid = match pid_text.parse::<u32>() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        result.push((pid, command.to_string()));
+    }
+    Ok(result)
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn send_signal_to_process(pid: u32, signal: &str) -> Result<(), String> {
+    let status = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .map_err(|err| format!("发送 {} 信号失败 pid={} err={}", signal, pid, err))?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "发送 {} 信号失败 pid={} status={}",
+        signal, pid, status
+    ))
+}
+
+fn terminate_submission_ffmpeg_processes(
+    context: &SubmissionContext,
+    task_id: &str,
+) -> Result<(), String> {
+    let processes = list_submission_ffmpeg_pids(task_id)?;
+    if processes.is_empty() {
+        return Ok(());
+    }
+
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "submission_ffmpeg_cleanup_start task_id={} count={}",
+            task_id,
+            processes.len()
+        ),
+    );
+
+    let mut failed = Vec::new();
+    for (pid, command) in processes {
+        append_log(
+            &context.app_log_path,
+            &format!(
+                "submission_ffmpeg_cleanup_term task_id={} pid={} command={}",
+                task_id, pid, command
+            ),
+        );
+        if let Err(err) = send_signal_to_process(pid, "-TERM") {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_ffmpeg_cleanup_term_fail task_id={} pid={} err={}",
+                    task_id, pid, err
+                ),
+            );
+        }
+
+        let mut stopped = false;
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(200));
+            if !is_process_alive(pid) {
+                stopped = true;
+                break;
+            }
+        }
+
+        if !stopped && is_process_alive(pid) {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_ffmpeg_cleanup_kill task_id={} pid={}",
+                    task_id, pid
+                ),
+            );
+            if let Err(err) = send_signal_to_process(pid, "-KILL") {
+                failed.push(format!("pid={} err={}", pid, err));
+                continue;
+            }
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(200));
+                if !is_process_alive(pid) {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+
+        if !stopped && is_process_alive(pid) {
+            failed.push(format!("pid={} err=still_alive", pid));
+        } else {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_ffmpeg_cleanup_done task_id={} pid={}",
+                    task_id, pid
+                ),
+            );
+        }
+    }
+
+    if failed.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "终止旧剪辑进程失败 task_id={} details={}",
+        task_id,
+        failed.join("; ")
+    ))
+}
+
 fn reset_workflow_instances(context: &SubmissionContext, task_id: &str) -> Result<(), String> {
+    terminate_submission_ffmpeg_processes(context, task_id)?;
     context
     .db
     .with_conn(|conn| {
@@ -18890,7 +20659,10 @@ fn load_next_queued_tasks(
                 "SELECT task_id, bilibili_uid \
          FROM submission_task \
          WHERE status = 'WAITING_UPLOAD' \
-         ORDER BY priority DESC, updated_at ASC",
+         ORDER BY \
+           priority DESC, \
+           CASE WHEN COALESCE(priority, 0) = 1 THEN COALESCE(priority_at, updated_at) ELSE NULL END DESC, \
+           CASE WHEN COALESCE(priority, 0) = 0 THEN updated_at ELSE NULL END ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(QueuedSubmissionTask {
@@ -19022,6 +20794,7 @@ mod tests {
             task_id: "task-1".to_string(),
             status: "PENDING".to_string(),
             priority: false,
+            priority_at: None,
             title: "test".to_string(),
             description: None,
             cover_url: None,

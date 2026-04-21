@@ -1,15 +1,8 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
-use crate::config::resolve_ffprobe_path;
 use crate::ffmpeg::{run_ffmpeg, run_ffprobe_json};
-use crate::utils::apply_no_window;
-
-const START_DIFF_THRESHOLD_SECONDS: f64 = 1.0;
-const TIMESTAMP_GAP_THRESHOLD_SECONDS: f64 = 2.0;
-const NEGATIVE_JUMP_THRESHOLD_SECONDS: f64 = -0.5;
+use serde_json::Value;
 
 #[derive(Clone)]
 pub struct ClipSource {
@@ -24,6 +17,17 @@ pub struct ClipCopyDecision {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TranscodeProfile {
+    ClipAndMergeClean,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegmentCopyMode {
+    Fast,
+    Precise,
+}
+
 pub fn clip_sources(
     sources: &[ClipSource],
     output_dir: &Path,
@@ -32,15 +36,28 @@ pub fn clip_sources(
     fs::create_dir_all(output_dir)
         .map_err(|err| format!("Failed to create output dir: {}", err))?;
 
-    let transcode_profile = if use_copy {
-        None
-    } else {
-        build_transcode_profile(sources)?
-    };
     let mut outputs = Vec::new();
     for source in sources {
         let output_path = output_dir.join(format!("clip_{:03}.mp4", source.order));
-        clip_single(source, &output_path, use_copy, transcode_profile.as_ref())?;
+        clip_single(source, &output_path, use_copy, None)?;
+        outputs.push(output_path);
+    }
+
+    Ok(outputs)
+}
+
+pub fn clip_sources_transcode(
+    sources: &[ClipSource],
+    output_dir: &Path,
+    profile: TranscodeProfile,
+) -> Result<Vec<PathBuf>, String> {
+    fs::create_dir_all(output_dir)
+        .map_err(|err| format!("Failed to create output dir: {}", err))?;
+
+    let mut outputs = Vec::new();
+    for source in sources {
+        let output_path = output_dir.join(format!("clip_{:03}.mp4", source.order));
+        clip_single(source, &output_path, false, Some(&profile))?;
         outputs.push(output_path);
     }
 
@@ -82,357 +99,53 @@ pub fn merge_files(files: &[PathBuf], output_path: &Path) -> Result<(), String> 
     Ok(())
 }
 
-struct VideoProbeInfo {
-    codec_name: String,
-    width: i64,
-    height: i64,
-    fps: f64,
-    time_base: String,
-}
-
-struct AudioProbeInfo {
-    codec_name: String,
-    sample_rate: i64,
-    channels: i64,
-}
-
-struct MediaProbeInfo {
-    video: VideoProbeInfo,
-    audio: Option<AudioProbeInfo>,
-}
-
-struct ClipTranscodeProfile {
-    width: i64,
-    height: i64,
-    normalize_video: bool,
-}
-
-fn clip_video_encoder() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "h264_videotoolbox"
-    } else {
-        "libx264"
-    }
-}
-
-fn parse_fraction(value: &str) -> Option<f64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some((num, den)) = trimmed.split_once('/') {
-        let num: f64 = num.trim().parse().ok()?;
-        let den: f64 = den.trim().parse().ok()?;
-        if den == 0.0 {
-            return None;
-        }
-        return Some(num / den);
-    }
-    trimmed.parse::<f64>().ok()
-}
-
-fn probe_media_info(path: &Path) -> Result<MediaProbeInfo, String> {
-    let args = vec![
-        "-v".to_string(),
-        "error".to_string(),
-        "-show_streams".to_string(),
-        "-of".to_string(),
-        "json".to_string(),
-        path.to_string_lossy().to_string(),
-    ];
-    let args_line = args.join(" ");
-    let data = run_ffprobe_json(&args).map_err(|err| {
-        format!(
-            "ffprobe_fail path={} args={} err={}",
-            path.to_string_lossy(),
-            args_line,
-            err
-        )
-    })?;
-    let streams = data
-        .get("streams")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| "无法读取媒体流信息".to_string())?;
-    let mut video: Option<VideoProbeInfo> = None;
-    let mut audio: Option<AudioProbeInfo> = None;
-
-    for stream in streams {
-        let codec_type = stream
-            .get("codec_type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        if codec_type == "video" && video.is_none() {
-            let codec_name = stream
-                .get("codec_name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_string();
-            let width = stream
-                .get("width")
-                .and_then(|value| value.as_i64())
-                .unwrap_or(0);
-            let height = stream
-                .get("height")
-                .and_then(|value| value.as_i64())
-                .unwrap_or(0);
-            let time_base = stream
-                .get("time_base")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_string();
-            let avg_frame_rate = stream
-                .get("avg_frame_rate")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let r_frame_rate = stream
-                .get("r_frame_rate")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let fps = parse_fraction(avg_frame_rate)
-                .filter(|value| *value > 0.0)
-                .or_else(|| parse_fraction(r_frame_rate).filter(|value| *value > 0.0))
-                .unwrap_or(0.0);
-            video = Some(VideoProbeInfo {
-                codec_name,
-                width,
-                height,
-                fps,
-                time_base,
-            });
-        }
-        if codec_type == "audio" && audio.is_none() {
-            let codec_name = stream
-                .get("codec_name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_string();
-            let sample_rate = stream
-                .get("sample_rate")
-                .and_then(|value| value.as_str())
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(0);
-            let channels = stream
-                .get("channels")
-                .and_then(|value| value.as_i64())
-                .unwrap_or(0);
-            audio = Some(AudioProbeInfo {
-                codec_name,
-                sample_rate,
-                channels,
-            });
-        }
+pub fn merge_files_transcode(
+    files: &[PathBuf],
+    output_path: &Path,
+    profile: TranscodeProfile,
+) -> Result<(), String> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create output dir: {}", err))?;
     }
 
-    let video = video.ok_or_else(|| "缺少视频流".to_string())?;
-    Ok(MediaProbeInfo { video, audio })
-}
-
-fn build_transcode_profile(sources: &[ClipSource]) -> Result<Option<ClipTranscodeProfile>, String> {
-    if sources.is_empty() {
-        return Ok(None);
-    }
-    let mut infos = Vec::with_capacity(sources.len());
-    for source in sources {
-        infos.push(probe_media_info(Path::new(&source.input_path))?);
-    }
-
-    let mut min_pixels = None;
-    let mut target = (0i64, 0i64);
-    for info in &infos {
-        if info.video.width <= 0 || info.video.height <= 0 {
-            return Err("无法读取视频分辨率".to_string());
-        }
-        let pixels = info.video.width.saturating_mul(info.video.height);
-        if min_pixels.map(|value| pixels < value).unwrap_or(true) {
-            min_pixels = Some(pixels);
-            target = (info.video.width, info.video.height);
-        }
-    }
-
-    let normalize_video = sources.len() > 1
-        && infos
-            .iter()
-            .any(|info| info.video.width != target.0 || info.video.height != target.1);
-
-    Ok(Some(ClipTranscodeProfile {
-        width: target.0,
-        height: target.1,
-        normalize_video,
-    }))
-}
-
-fn can_concat_copy(files: &[PathBuf]) -> Result<bool, String> {
-    if files.is_empty() {
-        return Ok(false);
-    }
-    let base = probe_media_info(&files[0])?;
-    let base_audio = match base.audio {
-        Some(audio) => audio,
-        None => return Ok(false),
-    };
-    if base.video.codec_name.is_empty()
-        || base.video.width <= 0
-        || base.video.height <= 0
-        || base.video.time_base.is_empty()
-        || base.video.fps <= 0.0
-        || base_audio.codec_name.is_empty()
-        || base_audio.sample_rate <= 0
-        || base_audio.channels <= 0
-    {
-        return Ok(false);
-    }
-
-    for path in files.iter().skip(1) {
-        let current = probe_media_info(path)?;
-        let current_audio = match current.audio {
-            Some(audio) => audio,
-            None => return Ok(false),
-        };
-        if current.video.codec_name != base.video.codec_name {
-            return Ok(false);
-        }
-        if current.video.width != base.video.width || current.video.height != base.video.height {
-            return Ok(false);
-        }
-        if current.video.time_base != base.video.time_base {
-            return Ok(false);
-        }
-        if (current.video.fps - base.video.fps).abs() > 0.01 {
-            return Ok(false);
-        }
-        if current_audio.codec_name != base_audio.codec_name {
-            return Ok(false);
-        }
-        if current_audio.sample_rate != base_audio.sample_rate {
-            return Ok(false);
-        }
-        if current_audio.channels != base_audio.channels {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-pub fn can_concat_copy_sources(sources: &[ClipSource]) -> Result<bool, String> {
-    let files: Vec<PathBuf> = sources
+    let list_path = output_path.with_extension("txt");
+    let list_content = files
         .iter()
-        .map(|source| PathBuf::from(&source.input_path))
-        .collect();
-    can_concat_copy(&files)
+        .map(|path| format!("file '{}'", path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    fs::write(&list_path, list_content)
+        .map_err(|err| format!("Failed to write concat file: {}", err))?;
+
+    let input_args = vec![
+        "-f".to_string(),
+        "concat".to_string(),
+        "-safe".to_string(),
+        "0".to_string(),
+        "-fflags".to_string(),
+        "+genpts".to_string(),
+        "-i".to_string(),
+        list_path.to_string_lossy().to_string(),
+    ];
+
+    let result =
+        run_transcode_with_fallback(&input_args, output_path, profile, "merge_transcode_fail");
+    let _ = fs::remove_file(list_path);
+    result
 }
 
-pub fn decide_clip_copy(sources: &[ClipSource]) -> Result<ClipCopyDecision, String> {
-    let can_copy = can_concat_copy_sources(sources)?;
-    if !can_copy {
-        return Ok(ClipCopyDecision {
-            use_copy: false,
-            reason: Some("codec_mismatch".to_string()),
-        });
-    }
-
-    for source in sources {
-        match detect_timestamp_anomaly(source) {
-            Ok(Some(reason)) => {
-                return Ok(ClipCopyDecision {
-                    use_copy: false,
-                    reason: Some(format!(
-                        "timestamp_anomaly input={} {}",
-                        source.input_path, reason
-                    )),
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Ok(ClipCopyDecision {
-                    use_copy: false,
-                    reason: Some(format!(
-                        "timestamp_probe_failed input={} err={}",
-                        source.input_path, err
-                    )),
-                });
-            }
-        }
-    }
-
+pub fn decide_clip_copy(_sources: &[ClipSource]) -> Result<ClipCopyDecision, String> {
     Ok(ClipCopyDecision {
         use_copy: true,
-        reason: None,
+        reason: Some("forced_copy_mode".to_string()),
     })
-}
-
-struct TimestampScanResult {
-    video_start: Option<f64>,
-    audio_start: Option<f64>,
-    max_gap_video: f64,
-    max_gap_audio: f64,
-    neg_jump_video: usize,
-    neg_jump_audio: usize,
-}
-
-fn detect_timestamp_anomaly(source: &ClipSource) -> Result<Option<String>, String> {
-    let input_path = Path::new(&source.input_path);
-    let interval = build_read_intervals(source);
-    let scan = scan_timestamp_gaps(input_path, interval.clone())?;
-    let range_label = interval.unwrap_or_else(|| "full".to_string());
-
-    if let (Some(video_start), Some(audio_start)) = (scan.video_start, scan.audio_start) {
-        let diff = (video_start - audio_start).abs();
-        if diff > START_DIFF_THRESHOLD_SECONDS {
-            return Ok(Some(format!(
-                "start_diff={:.3} range={}",
-                diff, range_label
-            )));
-        }
-    }
-    if scan.max_gap_video > TIMESTAMP_GAP_THRESHOLD_SECONDS {
-        return Ok(Some(format!(
-            "video_gap={:.3} range={}",
-            scan.max_gap_video, range_label
-        )));
-    }
-    if scan.max_gap_audio > TIMESTAMP_GAP_THRESHOLD_SECONDS {
-        return Ok(Some(format!(
-            "audio_gap={:.3} range={}",
-            scan.max_gap_audio, range_label
-        )));
-    }
-    if scan.neg_jump_video > 0 {
-        return Ok(Some(format!(
-            "video_negative_jump={} range={}",
-            scan.neg_jump_video, range_label
-        )));
-    }
-    if scan.neg_jump_audio > 0 {
-        return Ok(Some(format!(
-            "audio_negative_jump={} range={}",
-            scan.neg_jump_audio, range_label
-        )));
-    }
-
-    Ok(None)
-}
-
-fn build_read_intervals(source: &ClipSource) -> Option<String> {
-    let start = source
-        .start_time
-        .as_deref()
-        .and_then(|value| parse_time_to_seconds(value));
-    let end = source
-        .end_time
-        .as_deref()
-        .and_then(|value| parse_time_to_seconds(value));
-    match (start, end) {
-        (Some(start), Some(end)) if end > start => {
-            let duration = end - start;
-            Some(format!("{:.3}%+{:.3}", start, duration))
-        }
-        _ => None,
-    }
 }
 
 pub fn parse_time_to_seconds(value: &str) -> Option<f64> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed == "00:00:00" {
+    if trimmed.is_empty() {
         return None;
     }
     let parts: Vec<&str> = trimmed.split(':').collect();
@@ -453,105 +166,281 @@ pub fn parse_time_to_seconds(value: &str) -> Option<f64> {
     Some(hours * 3600.0 + minutes * 60.0 + seconds)
 }
 
-fn scan_timestamp_gaps(
-    path: &Path,
-    interval: Option<String>,
-) -> Result<TimestampScanResult, String> {
-    let ffprobe_path = resolve_ffprobe_path();
-    let mut command = Command::new(ffprobe_path);
-    apply_no_window(&mut command);
-    command
-        .arg("-v")
-        .arg("error")
-        .arg("-show_entries")
-        .arg("packet=stream_index,pts_time")
-        .arg("-of")
-        .arg("compact=p=0:nk=1");
-    if let Some(interval_value) = &interval {
-        command.arg("-read_intervals").arg(interval_value);
-    }
-    command.arg(path);
+fn finalize_clip_output(_source: &ClipSource, _output_path: &Path) -> Result<(), String> {
+    Ok(())
+}
 
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| format!("Failed to start FFprobe: {}", err))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to capture FFprobe stdout".to_string())?;
-    let reader = BufReader::new(stdout);
-
-    let mut video_prev: Option<f64> = None;
-    let mut audio_prev: Option<f64> = None;
-    let mut video_start: Option<f64> = None;
-    let mut audio_start: Option<f64> = None;
-    let mut max_gap_video = 0.0;
-    let mut max_gap_audio = 0.0;
-    let mut neg_jump_video = 0;
-    let mut neg_jump_audio = 0;
-
-    for line in reader.lines().flatten() {
-        let value = line.trim();
-        if value.is_empty() {
-            continue;
-        }
-        let mut parts = value.split('|');
-        let stream_index = parts.next().and_then(|item| item.parse::<i64>().ok());
-        let pts = parts.next().and_then(|item| item.parse::<f64>().ok());
-        let (stream_index, pts) = match (stream_index, pts) {
-            (Some(idx), Some(value)) => (idx, value),
-            _ => continue,
-        };
-
-        if stream_index == 0 {
-            if video_start.is_none() {
-                video_start = Some(pts);
+fn transcode_video_codec_args(profile: TranscodeProfile, use_hardware: bool) -> Vec<String> {
+    match profile {
+        TranscodeProfile::ClipAndMergeClean => {
+            if use_hardware {
+                vec![
+                    "-c:v".to_string(),
+                    "h264_videotoolbox".to_string(),
+                    "-profile:v".to_string(),
+                    "high".to_string(),
+                    "-pix_fmt".to_string(),
+                    "yuv420p".to_string(),
+                    "-g".to_string(),
+                    "60".to_string(),
+                ]
+            } else {
+                vec![
+                    "-c:v".to_string(),
+                    "libx264".to_string(),
+                    "-preset".to_string(),
+                    "veryfast".to_string(),
+                    "-crf".to_string(),
+                    "18".to_string(),
+                    "-pix_fmt".to_string(),
+                    "yuv420p".to_string(),
+                    "-g".to_string(),
+                    "60".to_string(),
+                ]
             }
-            if let Some(prev) = video_prev {
-                let gap = pts - prev;
-                if gap < NEGATIVE_JUMP_THRESHOLD_SECONDS {
-                    neg_jump_video += 1;
-                }
-                if gap > max_gap_video {
-                    max_gap_video = gap;
-                }
-            }
-            video_prev = Some(pts);
-        } else if stream_index == 1 {
-            if audio_start.is_none() {
-                audio_start = Some(pts);
-            }
-            if let Some(prev) = audio_prev {
-                let gap = pts - prev;
-                if gap < NEGATIVE_JUMP_THRESHOLD_SECONDS {
-                    neg_jump_audio += 1;
-                }
-                if gap > max_gap_audio {
-                    max_gap_audio = gap;
-                }
-            }
-            audio_prev = Some(pts);
         }
     }
+}
 
-    let status = child
-        .wait()
-        .map_err(|err| format!("Failed to wait FFprobe: {}", err))?;
-    if !status.success() {
-        return Err("FFprobe failed".to_string());
+fn transcode_audio_filter(profile: TranscodeProfile) -> Option<&'static str> {
+    match profile {
+        // Rebuild the audio timeline during transcode so broken AAC packet timestamps
+        // do not leak into clipped / merged / segmented outputs.
+        TranscodeProfile::ClipAndMergeClean => Some("aresample=async=1:first_pts=0"),
+    }
+}
+
+fn build_transcode_attempts(
+    input_args: &[String],
+    output_path: &Path,
+    profile: TranscodeProfile,
+) -> [Vec<String>; 2] {
+    let output = output_path.to_string_lossy().to_string();
+    let mut hardware_args = input_args.to_vec();
+    hardware_args.extend([
+        "-map".to_string(),
+        "0:v:0".to_string(),
+        "-map".to_string(),
+        "0:a?".to_string(),
+    ]);
+    hardware_args.extend(transcode_video_codec_args(profile, true));
+    if let Some(filter) = transcode_audio_filter(profile) {
+        hardware_args.extend(["-af".to_string(), filter.to_string()]);
+    }
+    hardware_args.extend([
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-ar".to_string(),
+        "48000".to_string(),
+        "-ac".to_string(),
+        "2".to_string(),
+        "-b:a".to_string(),
+        "192k".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
+        output.clone(),
+    ]);
+
+    let mut software_args = input_args.to_vec();
+    software_args.extend([
+        "-map".to_string(),
+        "0:v:0".to_string(),
+        "-map".to_string(),
+        "0:a?".to_string(),
+    ]);
+    software_args.extend(transcode_video_codec_args(profile, false));
+    if let Some(filter) = transcode_audio_filter(profile) {
+        software_args.extend(["-af".to_string(), filter.to_string()]);
+    }
+    software_args.extend([
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-ar".to_string(),
+        "48000".to_string(),
+        "-ac".to_string(),
+        "2".to_string(),
+        "-b:a".to_string(),
+        "192k".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
+        output,
+    ]);
+
+    [hardware_args, software_args]
+}
+
+fn build_segment_batch_transcode_attempts(
+    input_path: &Path,
+    output_dir: &Path,
+    segment_seconds: i64,
+    profile: TranscodeProfile,
+) -> [Vec<String>; 2] {
+    let pattern = output_dir.join("part_%03d.mp4");
+    let force_key_frames_expr = format!("expr:gte(t,n_forced*{})", segment_seconds.max(1));
+    let build_args = |use_hardware: bool| {
+        let mut args = vec![
+            "-fflags".to_string(),
+            "+genpts".to_string(),
+            "-i".to_string(),
+            input_path.to_string_lossy().to_string(),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-map".to_string(),
+            "0:a?".to_string(),
+        ];
+        args.extend(transcode_video_codec_args(profile, use_hardware));
+        if let Some(filter) = transcode_audio_filter(profile) {
+            args.extend(["-af".to_string(), filter.to_string()]);
+        }
+        args.extend([
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-ar".to_string(),
+            "48000".to_string(),
+            "-ac".to_string(),
+            "2".to_string(),
+            "-b:a".to_string(),
+            "192k".to_string(),
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+            "-avoid_negative_ts".to_string(),
+            "make_zero".to_string(),
+            "-force_key_frames".to_string(),
+            force_key_frames_expr.clone(),
+            "-f".to_string(),
+            "segment".to_string(),
+            "-segment_time".to_string(),
+            segment_seconds.to_string(),
+            "-segment_time_delta".to_string(),
+            "0.05".to_string(),
+            "-reset_timestamps".to_string(),
+            "1".to_string(),
+            pattern.to_string_lossy().to_string(),
+        ]);
+        args
+    };
+
+    [build_args(true), build_args(false)]
+}
+
+fn run_transcode_with_fallback(
+    input_args: &[String],
+    output_path: &Path,
+    profile: TranscodeProfile,
+    error_prefix: &str,
+) -> Result<(), String> {
+    let attempts = build_transcode_attempts(input_args, output_path, profile);
+    let mut errors = Vec::new();
+    for args in attempts {
+        if output_path.exists() {
+            let _ = fs::remove_file(output_path);
+        }
+        match run_ffmpeg(&args) {
+            Ok(_) => return Ok(()),
+            Err(err) => errors.push(err),
+        }
+    }
+    Err(format!("{}: {}", error_prefix, errors.join(" | ")))
+}
+
+fn segment_file_batch_transcode(
+    input_path: &Path,
+    output_dir: &Path,
+    segment_seconds: i64,
+    profile: TranscodeProfile,
+) -> Result<Vec<PathBuf>, String> {
+    cleanup_segment_outputs(output_dir)?;
+    let attempts =
+        build_segment_batch_transcode_attempts(input_path, output_dir, segment_seconds, profile);
+    let mut errors = Vec::new();
+    for args in attempts {
+        cleanup_segment_outputs(output_dir)?;
+        match run_ffmpeg(&args) {
+            Ok(_) => return collect_segment_outputs(output_dir),
+            Err(err) => errors.push(err),
+        }
+    }
+    Err(format!(
+        "segment_batch_transcode_fail: {}",
+        errors.join(" | ")
+    ))
+}
+
+fn format_ffmpeg_time(seconds: f64) -> String {
+    let safe = if seconds.is_finite() {
+        seconds.max(0.0)
+    } else {
+        0.0
+    };
+    let total_millis = (safe * 1000.0).round() as i64;
+    let hours = total_millis / 3_600_000;
+    let minutes = (total_millis % 3_600_000) / 60_000;
+    let secs = (total_millis % 60_000) / 1000;
+    let millis = total_millis % 1000;
+    format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, secs, millis)
+}
+
+fn last_keyframe_at_or_before(data: &Value, start_seconds: f64) -> Option<f64> {
+    let frames = data.get("frames")?.as_array()?;
+    let mut last_match = None;
+    for frame in frames {
+        let timestamp = frame
+            .get("best_effort_timestamp_time")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse::<f64>().ok())?;
+        if timestamp <= start_seconds + 0.001 {
+            last_match = Some(timestamp);
+        } else {
+            break;
+        }
+    }
+    last_match
+}
+
+fn probe_previous_keyframe_seconds(path: &Path, start_seconds: f64) -> Result<Option<f64>, String> {
+    if start_seconds <= 0.0 {
+        return Ok(None);
     }
 
-    Ok(TimestampScanResult {
-        video_start,
-        audio_start,
-        max_gap_video,
-        max_gap_audio,
-        neg_jump_video,
-        neg_jump_audio,
-    })
+    let mut probe_end = start_seconds + 0.5;
+    let mut window = 12.0;
+
+    for _ in 0..4 {
+        let probe_start = (probe_end - window).max(0.0);
+        let interval = format!("{:.3}%+{:.3}", probe_start, probe_end - probe_start);
+        let args = vec![
+            "-v".to_string(),
+            "error".to_string(),
+            "-read_intervals".to_string(),
+            interval,
+            "-skip_frame".to_string(),
+            "nokey".to_string(),
+            "-select_streams".to_string(),
+            "v:0".to_string(),
+            "-show_frames".to_string(),
+            "-show_entries".to_string(),
+            "frame=best_effort_timestamp_time".to_string(),
+            "-of".to_string(),
+            "json".to_string(),
+            path.to_string_lossy().to_string(),
+        ];
+        let data = run_ffprobe_json(&args)?;
+        if let Some(keyframe) = last_keyframe_at_or_before(&data, start_seconds) {
+            return Ok(Some(keyframe));
+        }
+
+        if probe_start <= 0.0 {
+            break;
+        }
+        probe_end = probe_start;
+        window = (window * 2.0).min(start_seconds + 0.5);
+    }
+
+    Ok(None)
 }
 
 pub fn probe_duration_seconds(path: &Path) -> Result<f64, String> {
@@ -575,6 +464,153 @@ pub fn probe_duration_seconds(path: &Path) -> Result<f64, String> {
         return Err("无法读取视频时长".to_string());
     }
     Ok(duration)
+}
+
+fn segment_single_copy_fast(
+    input_path: &Path,
+    output_path: &Path,
+    start_seconds: f64,
+    duration_seconds: f64,
+) -> Result<(), String> {
+    let args = vec![
+        "-ss".to_string(),
+        format_ffmpeg_time(start_seconds),
+        "-i".to_string(),
+        input_path.to_string_lossy().to_string(),
+        "-t".to_string(),
+        format_ffmpeg_time(duration_seconds),
+        "-c".to_string(),
+        "copy".to_string(),
+        output_path.to_string_lossy().to_string(),
+    ];
+    run_ffmpeg(&args)
+}
+
+fn segment_single_copy_precise(
+    input_path: &Path,
+    output_path: &Path,
+    start_seconds: f64,
+    duration_seconds: f64,
+) -> Result<(), String> {
+    let args = vec![
+        "-i".to_string(),
+        input_path.to_string_lossy().to_string(),
+        "-ss".to_string(),
+        format_ffmpeg_time(start_seconds),
+        "-t".to_string(),
+        format_ffmpeg_time(duration_seconds),
+        "-map".to_string(),
+        "0".to_string(),
+        "-c".to_string(),
+        "copy".to_string(),
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
+        "-muxpreload".to_string(),
+        "0".to_string(),
+        "-muxdelay".to_string(),
+        "0".to_string(),
+        output_path.to_string_lossy().to_string(),
+    ];
+    run_ffmpeg(&args)
+}
+
+fn segment_single_copy(
+    mode: SegmentCopyMode,
+    input_path: &Path,
+    output_path: &Path,
+    start_seconds: f64,
+    duration_seconds: f64,
+) -> Result<(), String> {
+    match mode {
+        SegmentCopyMode::Fast => {
+            segment_single_copy_fast(input_path, output_path, start_seconds, duration_seconds)
+        }
+        SegmentCopyMode::Precise => {
+            segment_single_copy_precise(input_path, output_path, start_seconds, duration_seconds)
+        }
+    }
+}
+
+fn segment_single_transcode(
+    input_path: &Path,
+    output_path: &Path,
+    start_seconds: f64,
+    duration_seconds: f64,
+    profile: TranscodeProfile,
+) -> Result<(), String> {
+    let args = vec![
+        "-fflags".to_string(),
+        "+genpts".to_string(),
+        "-i".to_string(),
+        input_path.to_string_lossy().to_string(),
+        "-ss".to_string(),
+        format_ffmpeg_time(start_seconds),
+        "-t".to_string(),
+        format_ffmpeg_time(duration_seconds),
+    ];
+    run_transcode_with_fallback(&args, output_path, profile, "segment_transcode_fail").map_err(
+        |err| {
+            format!(
+                "segment_transcode_fail input={} output={} start={} duration={} err={}",
+                input_path.to_string_lossy(),
+                output_path.to_string_lossy(),
+                format_ffmpeg_time(start_seconds),
+                format_ffmpeg_time(duration_seconds),
+                err
+            )
+        },
+    )
+}
+
+fn collect_segment_outputs(output_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut outputs = fs::read_dir(output_dir)
+        .map_err(|err| format!("Failed to read segment dir: {}", err))?
+        .filter_map(|entry| entry.ok().map(|item| item.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("part_") && name.ends_with(".mp4"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    outputs.sort();
+    Ok(outputs)
+}
+
+fn cleanup_segment_outputs(output_dir: &Path) -> Result<(), String> {
+    if !output_dir.exists() {
+        return Ok(());
+    }
+    for path in collect_segment_outputs(output_dir)? {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn segment_file_batch_copy(
+    input_path: &Path,
+    output_dir: &Path,
+    segment_seconds: i64,
+) -> Result<Vec<PathBuf>, String> {
+    cleanup_segment_outputs(output_dir)?;
+    let pattern = output_dir.join("part_%03d.mp4");
+    let args = vec![
+        "-i".to_string(),
+        input_path.to_string_lossy().to_string(),
+        "-map".to_string(),
+        "0".to_string(),
+        "-c".to_string(),
+        "copy".to_string(),
+        "-f".to_string(),
+        "segment".to_string(),
+        "-segment_time".to_string(),
+        segment_seconds.to_string(),
+        "-reset_timestamps".to_string(),
+        "1".to_string(),
+        pattern.to_string_lossy().to_string(),
+    ];
+    run_ffmpeg(&args)?;
+    collect_segment_outputs(output_dir)
 }
 
 fn merge_last_short_segment(outputs: &mut Vec<PathBuf>, min_seconds: f64) -> Result<(), String> {
@@ -628,32 +664,150 @@ pub fn segment_file(
     output_dir: &Path,
     segment_seconds: i64,
 ) -> Result<Vec<PathBuf>, String> {
+    segment_file_with_options(input_path, output_dir, segment_seconds, false, false)
+}
+
+pub fn segment_file_with_options(
+    input_path: &Path,
+    output_dir: &Path,
+    segment_seconds: i64,
+    prefer_precise_copy: bool,
+    force_transcode: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let metadata = fs::metadata(input_path).map_err(|err| {
+        format!(
+            "segment_input_missing path={} err={}",
+            input_path.to_string_lossy(),
+            err
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "segment_input_invalid path={} reason=not_file",
+            input_path.to_string_lossy()
+        ));
+    }
+    if metadata.len() == 0 {
+        return Err(format!(
+            "segment_input_invalid path={} reason=empty_file",
+            input_path.to_string_lossy()
+        ));
+    }
+    let total_duration = probe_duration_seconds(input_path).map_err(|err| {
+        format!(
+            "segment_input_unreadable path={} err={}",
+            input_path.to_string_lossy(),
+            err
+        )
+    })?;
     fs::create_dir_all(output_dir)
         .map_err(|err| format!("Failed to create segment dir: {}", err))?;
 
-    let output_pattern = output_dir.join("part_%03d.mp4");
-    let args = vec![
-        "-i".to_string(),
-        input_path.to_string_lossy().to_string(),
-        "-c".to_string(),
-        "copy".to_string(),
-        "-f".to_string(),
-        "segment".to_string(),
-        "-segment_time".to_string(),
-        segment_seconds.to_string(),
-        "-reset_timestamps".to_string(),
-        "1".to_string(),
-        output_pattern.to_string_lossy().to_string(),
-    ];
+    let mut outputs = Vec::new();
+    let mut part_index = 0usize;
+    let mut start_seconds = 0.0;
+    let segment_length = segment_seconds as f64;
+    if !force_transcode {
+        if let Ok(mut batch_outputs) =
+            segment_file_batch_copy(input_path, output_dir, segment_seconds)
+        {
+            if !batch_outputs.is_empty() {
+                merge_last_short_segment(&mut batch_outputs, 10.0)?;
+                return Ok(batch_outputs);
+            }
+            cleanup_segment_outputs(output_dir)?;
+        }
+    } else if let Ok(mut batch_outputs) = segment_file_batch_transcode(
+        input_path,
+        output_dir,
+        segment_seconds,
+        TranscodeProfile::ClipAndMergeClean,
+    ) {
+        if !batch_outputs.is_empty() {
+            merge_last_short_segment(&mut batch_outputs, 10.0)?;
+            return Ok(batch_outputs);
+        }
+        cleanup_segment_outputs(output_dir)?;
+    }
+    while start_seconds < total_duration - 0.001 {
+        let remaining = total_duration - start_seconds;
+        let current_duration = remaining.min(segment_length);
+        let output_path = output_dir.join(format!("part_{:03}.mp4", part_index));
+        if force_transcode {
+            if let Err(err) = segment_single_transcode(
+                input_path,
+                &output_path,
+                start_seconds,
+                current_duration,
+                TranscodeProfile::ClipAndMergeClean,
+            ) {
+                let _ = fs::remove_file(&output_path);
+                return Err(err);
+            }
+        } else {
+            let mut copy_failures = Vec::new();
+            let primary_mode = if prefer_precise_copy {
+                SegmentCopyMode::Precise
+            } else {
+                SegmentCopyMode::Fast
+            };
+            let secondary_mode = if primary_mode == SegmentCopyMode::Precise {
+                SegmentCopyMode::Fast
+            } else {
+                SegmentCopyMode::Precise
+            };
+            let copy_modes = [primary_mode, secondary_mode];
 
-    run_ffmpeg(&args)?;
+            for mode in copy_modes {
+                let copy_result = segment_single_copy(
+                    mode,
+                    input_path,
+                    &output_path,
+                    start_seconds,
+                    current_duration,
+                );
+                match copy_result {
+                    Ok(_) if output_path.exists() => break,
+                    Ok(_) => {
+                        copy_failures.push(format!(
+                            "{}:output_missing",
+                            match mode {
+                                SegmentCopyMode::Fast => "fast_copy_fail",
+                                SegmentCopyMode::Precise => "precise_copy_fail",
+                            }
+                        ));
+                        let _ = fs::remove_file(&output_path);
+                    }
+                    Err(err) => {
+                        copy_failures.push(format!(
+                            "{}:{}",
+                            match mode {
+                                SegmentCopyMode::Fast => "fast_copy_fail",
+                                SegmentCopyMode::Precise => "precise_copy_fail",
+                            },
+                            err
+                        ));
+                        let _ = fs::remove_file(&output_path);
+                    }
+                }
+            }
 
-    let mut outputs: Vec<PathBuf> = fs::read_dir(output_dir)
-        .map_err(|err| format!("Failed to read segment dir: {}", err))?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .collect();
+            if !output_path.exists() {
+                return Err(format!(
+                    "segment_copy_only_fail input={} output={} start={} duration={} copy_errs={}",
+                    input_path.to_string_lossy(),
+                    output_path.to_string_lossy(),
+                    format_ffmpeg_time(start_seconds),
+                    format_ffmpeg_time(current_duration),
+                    copy_failures.join(" | ")
+                ));
+            }
+        }
+
+        outputs.push(output_path);
+        part_index += 1;
+        start_seconds += current_duration;
+    }
 
     outputs.sort();
     merge_last_short_segment(&mut outputs, 10.0)?;
@@ -664,72 +818,136 @@ fn clip_single(
     source: &ClipSource,
     output_path: &Path,
     use_copy: bool,
-    profile: Option<&ClipTranscodeProfile>,
+    profile: Option<&TranscodeProfile>,
 ) -> Result<(), String> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create clip output dir: {}", err))?;
     }
-    let mut args = vec!["-i".to_string(), source.input_path.clone()];
 
-    if let Some(start) = source.start_time.as_deref() {
-        if !start.is_empty() && start != "00:00:00" {
-            args.push("-ss".to_string());
-            args.push(start.to_string());
+    let input_path = Path::new(&source.input_path);
+    let original_start_seconds = source.start_time.as_deref().and_then(parse_time_to_seconds);
+    let clip_end_seconds = source.end_time.as_deref().and_then(parse_time_to_seconds);
+    let aligned_start_seconds = if use_copy {
+        match original_start_seconds {
+            Some(start_seconds) if start_seconds > 0.0 => {
+                probe_previous_keyframe_seconds(input_path, start_seconds)?
+            }
+            _ => None,
         }
-    }
-
-    if let Some(end) = source.end_time.as_deref() {
-        if !end.is_empty() && end != "00:00:00" {
-            args.push("-to".to_string());
-            args.push(end.to_string());
-        }
-    }
-
-    if use_copy {
-        args.extend(["-c".to_string(), "copy".to_string()]);
     } else {
-        if let Some(profile) = profile {
-            let mut filters = Vec::new();
-            filters.push("fps=60".to_string());
-            if profile.normalize_video && profile.width > 0 && profile.height > 0 {
-                filters.push(format!(
-                    "scale={}:{}:force_original_aspect_ratio=decrease",
-                    profile.width, profile.height
-                ));
-                filters.push(format!(
-                    "pad={}:{}:(ow-iw)/2:(oh-ih)/2",
-                    profile.width, profile.height
-                ));
-            }
-            if !filters.is_empty() {
-                args.push("-vf".to_string());
-                args.push(filters.join(","));
-            }
-            args.push("-af".to_string());
-            args.push("aresample=48000:async=1:first_pts=0".to_string());
-            args.extend([
-                "-c:v".to_string(),
-                clip_video_encoder().to_string(),
-                "-b:v".to_string(),
-                "5M".to_string(),
-                "-c:a".to_string(),
-                "aac".to_string(),
-                "-ar".to_string(),
-                "48000".to_string(),
-            ]);
+        None
+    };
+    let effective_start_seconds = aligned_start_seconds.or(original_start_seconds);
+    let clip_duration_seconds = match (effective_start_seconds, clip_end_seconds) {
+        (Some(start_seconds), Some(end_seconds)) if end_seconds > start_seconds => {
+            Some(end_seconds - start_seconds)
         }
-    }
-    args.push(output_path.to_string_lossy().to_string());
+        (None, Some(end_seconds)) if end_seconds > 0.0 => Some(end_seconds),
+        _ => None,
+    };
 
-    let args_line = args.join(" ");
-    run_ffmpeg(&args).map_err(|err| {
-        format!(
-            "clip_ffmpeg_fail input={} output={} args={} err={}",
-            source.input_path,
-            output_path.to_string_lossy(),
-            args_line,
-            err
-        )
-    })
+    let mut args = Vec::new();
+    if let Some(active_profile) = profile {
+        args.push("-fflags".to_string());
+        args.push("+genpts".to_string());
+        args.push("-i".to_string());
+        args.push(source.input_path.clone());
+
+        if let Some(start_seconds) = effective_start_seconds {
+            if start_seconds > 0.0 {
+                args.push("-ss".to_string());
+                args.push(format_ffmpeg_time(start_seconds));
+            }
+        }
+
+        if let Some(duration_seconds) = clip_duration_seconds {
+            args.push("-t".to_string());
+            args.push(format_ffmpeg_time(duration_seconds));
+        }
+
+        let args_line = args.join(" ");
+        run_transcode_with_fallback(&args, output_path, *active_profile, "clip_transcode_fail")
+            .map_err(|err| {
+                format!(
+                    "clip_ffmpeg_fail input={} output={} start_aligned={} duration={} args={} err={}",
+                    source.input_path,
+                    output_path.to_string_lossy(),
+                    aligned_start_seconds
+                        .map(format_ffmpeg_time)
+                        .unwrap_or_else(|| "-".to_string()),
+                    clip_duration_seconds
+                        .map(format_ffmpeg_time)
+                        .unwrap_or_else(|| "-".to_string()),
+                    args_line,
+                    err
+                )
+            })?;
+    } else {
+        if let Some(start_seconds) = effective_start_seconds {
+            if start_seconds > 0.0 {
+                args.push("-ss".to_string());
+                args.push(format_ffmpeg_time(start_seconds));
+            }
+        }
+        args.push("-i".to_string());
+        args.push(source.input_path.clone());
+
+        if let Some(duration_seconds) = clip_duration_seconds {
+            args.push("-t".to_string());
+            args.push(format_ffmpeg_time(duration_seconds));
+        }
+
+        args.extend(["-c".to_string(), "copy".to_string()]);
+        args.push(output_path.to_string_lossy().to_string());
+
+        let args_line = args.join(" ");
+        run_ffmpeg(&args).map_err(|err| {
+            format!(
+                "clip_ffmpeg_fail input={} output={} start_aligned={} duration={} args={} err={}",
+                source.input_path,
+                output_path.to_string_lossy(),
+                aligned_start_seconds
+                    .map(format_ffmpeg_time)
+                    .unwrap_or_else(|| "-".to_string()),
+                clip_duration_seconds
+                    .map(format_ffmpeg_time)
+                    .unwrap_or_else(|| "-".to_string()),
+                args_line,
+                err
+            )
+        })?;
+    }
+
+    finalize_clip_output(source, output_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_ffmpeg_time, last_keyframe_at_or_before};
+    use serde_json::json;
+
+    #[test]
+    fn format_ffmpeg_time_keeps_millis() {
+        assert_eq!(format_ffmpeg_time(2545.833), "00:42:25.833");
+        assert_eq!(format_ffmpeg_time(0.0), "00:00:00.000");
+    }
+
+    #[test]
+    fn last_keyframe_finds_previous_frame_before_start() {
+        let payload = json!({
+            "frames": [
+                { "best_effort_timestamp_time": "2540.833" },
+                { "best_effort_timestamp_time": "2545.833" },
+                { "best_effort_timestamp_time": "2550.833" }
+            ]
+        });
+
+        assert_eq!(last_keyframe_at_or_before(&payload, 2544.0), Some(2540.833));
+        assert_eq!(
+            last_keyframe_at_or_before(&payload, 2545.833),
+            Some(2545.833)
+        );
+        assert_eq!(last_keyframe_at_or_before(&payload, 2539.0), None);
+    }
 }

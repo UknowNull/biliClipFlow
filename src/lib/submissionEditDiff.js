@@ -44,6 +44,9 @@ export function buildSourceSnapshot(items) {
     .map((item, index) => ({
       sourceFilePath: normalizeText(item.sourceFilePath),
       remoteBvid: normalizeText(item.remoteBvid),
+      remoteAid: Number(item.remoteAid || 0),
+      remoteCid: Number(item.remoteCid || 0),
+      remotePartTitle: normalizeText(item.remotePartTitle),
       sortOrder: index + 1,
       startTime: normalizeText(item.startTime || "00:00:00"),
       endTime: normalizeText(item.endTime || "00:00:00"),
@@ -125,6 +128,9 @@ export function validateSourceVideos({ items, parseHmsToSeconds, isVideoFilePath
       ...item,
       sourceFilePath: normalizeText(item.sourceFilePath),
       remoteBvid: normalizeText(item.remoteBvid),
+      remoteAid: Number(item.remoteAid || 0) || 0,
+      remoteCid: Number(item.remoteCid || 0) || 0,
+      remotePartTitle: normalizeText(item.remotePartTitle),
       startTime: normalizeText(item.startTime || "00:00:00"),
       endTime: normalizeText(item.endTime || "00:00:00"),
     }));

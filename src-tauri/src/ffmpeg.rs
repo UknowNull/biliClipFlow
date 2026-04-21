@@ -23,6 +23,25 @@ pub fn run_ffmpeg(args: &[String]) -> Result<(), String> {
     Err(format!("FFmpeg failed: {}", stderr.trim()))
 }
 
+pub fn run_ffmpeg_capture(args: &[String]) -> Result<(String, String), String> {
+    let ffmpeg_path = resolve_ffmpeg_path();
+    let mut command = Command::new(ffmpeg_path);
+    apply_no_window(&mut command);
+    let output = command
+        .args(args)
+        .output()
+        .map_err(|err| format!("Failed to start FFmpeg: {}", err))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    if output.status.success() {
+        return Ok((stdout, stderr));
+    }
+
+    Err(format!("FFmpeg failed: {}", stderr.trim()))
+}
+
 pub fn run_ffmpeg_with_progress<F>(
     args: &[String],
     duration_ms: Option<i64>,
@@ -118,6 +137,25 @@ pub fn run_ffprobe_json(args: &[String]) -> Result<Value, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).map_err(|err| format!("Failed to parse FFprobe json: {}", err))
+}
+
+pub fn run_ffprobe_capture(args: &[String]) -> Result<(String, String), String> {
+    let ffprobe_path = resolve_ffprobe_path();
+    let mut command = Command::new(ffprobe_path);
+    apply_no_window(&mut command);
+    let output = command
+        .args(args)
+        .output()
+        .map_err(|err| format!("Failed to start FFprobe: {}", err))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    if output.status.success() {
+        return Ok((stdout, stderr));
+    }
+
+    Err(format!("FFprobe failed: {}", stderr.trim()))
 }
 
 fn parse_out_time_ms(value: &str) -> Option<i64> {

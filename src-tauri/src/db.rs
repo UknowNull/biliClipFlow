@@ -74,6 +74,10 @@ impl Db {
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE submission_task ADD COLUMN priority_at TEXT",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE submission_task ADD COLUMN baidu_sync_enabled INTEGER DEFAULT 0",
             [],
         );
@@ -103,6 +107,10 @@ impl Db {
         );
         let _ = conn.execute(
             "ALTER TABLE submission_task ADD COLUMN import_mode TEXT DEFAULT 'NON_SEGMENTED'",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_submission_task_queue_priority ON submission_task (status, priority, priority_at)",
             [],
         );
         let _ = conn.execute("ALTER TABLE video_download ADD COLUMN cid INTEGER", []);

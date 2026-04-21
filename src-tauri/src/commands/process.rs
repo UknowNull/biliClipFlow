@@ -146,8 +146,8 @@ async fn run_process_task(
     let temp_dir = default_temp_dir().join(format!("process_{}", task_id));
     let copy_decision =
         decide_clip_copy(&sources).unwrap_or_else(|_| crate::processing::ClipCopyDecision {
-            use_copy: false,
-            reason: None,
+            use_copy: true,
+            reason: Some("forced_copy_fallback".to_string()),
         });
     let use_copy = copy_decision.use_copy;
     let clip_outputs =

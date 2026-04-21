@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS submission_task (
   task_id TEXT PRIMARY KEY,
   status TEXT NOT NULL,
   priority INTEGER DEFAULT 0,
+  priority_at TEXT,
   title TEXT NOT NULL,
   description TEXT,
   cover_url TEXT,
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS submission_task (
 );
 
 CREATE INDEX IF NOT EXISTS idx_submission_task_bilibili_uid ON submission_task (bilibili_uid);
+CREATE INDEX IF NOT EXISTS idx_submission_task_queue_priority ON submission_task (status, priority, priority_at);
 
 CREATE TABLE IF NOT EXISTS merged_video (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

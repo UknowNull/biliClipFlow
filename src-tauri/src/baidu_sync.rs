@@ -1,5 +1,5 @@
-use std::fs;
 use std::collections::HashSet;
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -994,10 +994,13 @@ async fn run_baidu_sync_scheduler_iteration(context: BaiduSyncContext) -> Result
         let settings_clone = settings.clone();
         let task_id = task.id;
         tauri::async_runtime::spawn(async move {
-            let result =
-                std::panic::AssertUnwindSafe(run_baidu_sync_task(task_context, settings_clone, task))
-                    .catch_unwind()
-                    .await;
+            let result = std::panic::AssertUnwindSafe(run_baidu_sync_task(
+                task_context,
+                settings_clone,
+                task,
+            ))
+            .catch_unwind()
+            .await;
             if let Ok(mut guard) = runtime.active_task_ids.lock() {
                 guard.remove(&task_id);
             }
@@ -1058,14 +1061,16 @@ fn describe_panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
 fn reconcile_runtime_active_tasks(context: &BaiduSyncContext) -> i64 {
     let mut removed_ids = Vec::new();
     let active = if let Ok(mut guard) = context.runtime.active_task_ids.lock() {
-        guard.retain(|task_id| match is_baidu_sync_task_uploading(context.db.as_ref(), *task_id) {
-            Ok(true) => true,
-            Ok(false) => {
-                removed_ids.push(*task_id);
-                false
-            }
-            Err(_) => true,
-        });
+        guard.retain(
+            |task_id| match is_baidu_sync_task_uploading(context.db.as_ref(), *task_id) {
+                Ok(true) => true,
+                Ok(false) => {
+                    removed_ids.push(*task_id);
+                    false
+                }
+                Err(_) => true,
+            },
+        );
         guard.len() as i64
     } else {
         0
@@ -1073,7 +1078,10 @@ fn reconcile_runtime_active_tasks(context: &BaiduSyncContext) -> i64 {
     for task_id in removed_ids {
         append_log(
             context.app_log_path.as_ref(),
-            &format!("baidu_sync_runtime_prune task_id={} reason=status_changed", task_id),
+            &format!(
+                "baidu_sync_runtime_prune task_id={} reason=status_changed",
+                task_id
+            ),
         );
     }
     active
@@ -1154,11 +1162,17 @@ fn recover_baidu_sync_tasks_internal(
         if let Err(err) = recover_single_baidu_sync_task(db, app_log_path, &task, reason) {
             append_log(
                 app_log_path,
-                &format!("baidu_sync_recover_unhandled id={} reason={} err={}", task.id, reason, err),
+                &format!(
+                    "baidu_sync_recover_unhandled id={} reason={} err={}",
+                    task.id, reason, err
+                ),
             );
         }
     }
-    append_log(app_log_path, &format!("baidu_sync_recover_ok reason={}", reason));
+    append_log(
+        app_log_path,
+        &format!("baidu_sync_recover_ok reason={}", reason),
+    );
 }
 
 fn recover_single_baidu_sync_task(
@@ -1169,10 +1183,15 @@ fn recover_single_baidu_sync_task(
 ) -> Result<(), String> {
     match resolve_existing_uploaded_entry_for_task(db, task) {
         Ok(Some(remote_entry)) => {
-            if let Err(err) = finalize_baidu_sync_task_success(db, app_log_path, task, remote_entry, reason) {
+            if let Err(err) =
+                finalize_baidu_sync_task_success(db, app_log_path, task, remote_entry, reason)
+            {
                 append_log(
                     app_log_path,
-                    &format!("baidu_sync_recover_finalize_fail id={} reason={} err={}", task.id, reason, err),
+                    &format!(
+                        "baidu_sync_recover_finalize_fail id={} reason={} err={}",
+                        task.id, reason, err
+                    ),
                 );
                 mark_baidu_sync_task_pending(db, task.id)?;
             }
@@ -1183,35 +1202,51 @@ fn recover_single_baidu_sync_task(
                 update_baidu_sync_status(db, task.id, "FAILED", 0.0, Some(err.clone()))?;
                 append_log(
                     app_log_path,
-                    &format!("baidu_sync_recover_missing_local id={} reason={} err={}", task.id, reason, err),
+                    &format!(
+                        "baidu_sync_recover_missing_local id={} reason={} err={}",
+                        task.id, reason, err
+                    ),
                 );
             } else {
                 let remote_path = join_baidu_path(&task.remote_dir, &task.remote_name);
                 mark_baidu_sync_task_pending(db, task.id)?;
                 append_log(
                     app_log_path,
-                    &format!("baidu_sync_recover_pending id={} reason={} remote={}", task.id, reason, remote_path),
+                    &format!(
+                        "baidu_sync_recover_pending id={} reason={} remote={}",
+                        task.id, reason, remote_path
+                    ),
                 );
             }
         }
         Err(err) => {
             append_log(
                 app_log_path,
-                &format!("baidu_sync_recover_lookup_fail id={} reason={} err={}", task.id, reason, err),
+                &format!(
+                    "baidu_sync_recover_lookup_fail id={} reason={} err={}",
+                    task.id, reason, err
+                ),
             );
             if !Path::new(&task.local_path).exists() {
-                let missing_err = format!("本地同步源文件已删除，无法恢复同步: {}", task.local_path);
+                let missing_err =
+                    format!("本地同步源文件已删除，无法恢复同步: {}", task.local_path);
                 update_baidu_sync_status(db, task.id, "FAILED", 0.0, Some(missing_err.clone()))?;
                 append_log(
                     app_log_path,
-                    &format!("baidu_sync_recover_missing_local id={} reason={} err={}", task.id, reason, missing_err),
+                    &format!(
+                        "baidu_sync_recover_missing_local id={} reason={} err={}",
+                        task.id, reason, missing_err
+                    ),
                 );
             } else {
                 let remote_path = join_baidu_path(&task.remote_dir, &task.remote_name);
                 mark_baidu_sync_task_pending(db, task.id)?;
                 append_log(
                     app_log_path,
-                    &format!("baidu_sync_recover_pending id={} reason={} remote={}", task.id, reason, remote_path),
+                    &format!(
+                        "baidu_sync_recover_pending id={} reason={} remote={}",
+                        task.id, reason, remote_path
+                    ),
                 );
             }
         }
@@ -1254,11 +1289,7 @@ pub fn fail_missing_local_submission_sync_tasks(
                 )
                 .to_string_lossy()
                 .to_string();
-                items.push((
-                    row.get::<_, i64>(0)?,
-                    local_path,
-                    row.get::<_, String>(2)?,
-                ));
+                items.push((row.get::<_, i64>(0)?, local_path, row.get::<_, String>(2)?));
             }
             Ok(items)
         })
@@ -2297,8 +2328,11 @@ fn finalize_baidu_sync_task_success(
         let target_path = join_baidu_path(&task.remote_dir, &task.remote_name);
         match load_baidu_login_credential(db)? {
             Some(credential) => {
-                match rename_baidu_remote_dir_via_http(&credential, &remote_entry.path, &task.remote_name)
-                {
+                match rename_baidu_remote_dir_via_http(
+                    &credential,
+                    &remote_entry.path,
+                    &task.remote_name,
+                ) {
                     Ok(()) => {
                         remote_entry.name = task.remote_name.clone();
                         remote_entry.path = target_path;
@@ -2354,7 +2388,10 @@ fn finalize_baidu_sync_task_success(
             ) {
                 append_log(
                     app_log_path,
-                    &format!("baidu_sync_bind_merged_fail task_id={} err={}", task_id, err),
+                    &format!(
+                        "baidu_sync_bind_merged_fail task_id={} err={}",
+                        task_id, err
+                    ),
                 );
             }
         }
@@ -2545,12 +2582,17 @@ async fn run_baidu_sync_task(
             if output.stderr.contains("pipe_drain_timeout") {
                 append_log(
                     context.app_log_path.as_ref(),
-                    &format!("baidu_sync_task_pipe_warning id={} detail={}", task.id, output.stderr),
+                    &format!(
+                        "baidu_sync_task_pipe_warning id={} detail={}",
+                        task.id, output.stderr
+                    ),
                 );
             }
-            let uploaded_entry =
-                resolve_existing_uploaded_entry_for_task_async(Arc::clone(&context.db), task.clone())
-                    .await?;
+            let uploaded_entry = resolve_existing_uploaded_entry_for_task_async(
+                Arc::clone(&context.db),
+                task.clone(),
+            )
+            .await?;
             let Some(remote_entry) = uploaded_entry else {
                 let local_size = fs::metadata(&task.local_path)
                     .map(|meta| meta.len())
@@ -2572,7 +2614,10 @@ async fn run_baidu_sync_task(
             };
             append_log(
                 context.app_log_path.as_ref(),
-                &format!("baidu_sync_task_uploaded id={} remote={}", task.id, remote_entry.path),
+                &format!(
+                    "baidu_sync_task_uploaded id={} remote={}",
+                    task.id, remote_entry.path
+                ),
             );
             if let Err(err) = finalize_baidu_sync_task_success_async(
                 Arc::clone(&context.db),
@@ -2616,7 +2661,12 @@ async fn resolve_existing_uploaded_entry_for_task_async(
     let task_id = task.id;
     task::spawn_blocking(move || resolve_existing_uploaded_entry_for_task(db.as_ref(), &task))
         .await
-        .map_err(|err| format!("baidu_sync_resolve_uploaded_join_fail id={} err={}", task_id, err))?
+        .map_err(|err| {
+            format!(
+                "baidu_sync_resolve_uploaded_join_fail id={} err={}",
+                task_id, err
+            )
+        })?
 }
 
 async fn finalize_baidu_sync_task_success_async(
