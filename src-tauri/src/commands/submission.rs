@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{ErrorKind, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -118,6 +119,14 @@ pub fn start_submission_background_tasks(
     app_log_path: Arc<PathBuf>,
     edit_upload_state: Arc<Mutex<EditUploadState>>,
 ) {
+    static SUBMISSION_BACKGROUND_TASKS_STARTED: AtomicBool = AtomicBool::new(false);
+    if SUBMISSION_BACKGROUND_TASKS_STARTED.swap(true, Ordering::SeqCst) {
+        append_log(
+            app_log_path.as_ref(),
+            "submission_background_tasks_skip reason=already_started",
+        );
+        return;
+    }
     let context = SubmissionQueueContext {
         db,
         bilibili,
@@ -1716,17 +1725,11 @@ pub async fn submission_repost(
                         ) {
                             Ok(value) => value,
                             Err(err) => {
-                                let _ = update_submission_status(
+                                let _ = mark_submission_failure(
                                     &context_clone,
                                     &task_id_clone,
-                                    "FAILED",
-                                );
-                                let _ = update_workflow_status(
-                                    &context_clone,
-                                    &task_id_clone,
-                                    "FAILED",
                                     Some("SEGMENTING"),
-                                    0.0,
+                                    &format!("重新投稿替换合并视频失败: {}", err),
                                 );
                                 append_log(
                                     app_log_path.as_ref(),
@@ -1745,13 +1748,11 @@ pub async fn submission_repost(
                         &[replaced_merged_path],
                         segment_prefix.as_deref(),
                     ) {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿保存分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -1766,14 +1767,11 @@ pub async fn submission_repost(
                         if let Err(err) =
                             reset_segments_for_new_bvid(&context_clone, &task_id_clone)
                         {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新投稿重置分段元数据失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -1802,13 +1800,11 @@ pub async fn submission_repost(
                 ) {
                     Ok(value) => value,
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿替换合并视频失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -1836,13 +1832,11 @@ pub async fn submission_repost(
                 let outputs = match outputs {
                     Ok(list) => list,
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -1855,13 +1849,11 @@ pub async fn submission_repost(
                     }
                 };
                 if outputs.is_empty() {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        "重新投稿未生成任何分段文件",
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -1876,13 +1868,11 @@ pub async fn submission_repost(
                     &outputs,
                     segment_prefix.as_deref(),
                 ) {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        &format!("重新投稿保存分段失败: {}", err),
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -1895,13 +1885,11 @@ pub async fn submission_repost(
                 }
                 if !integrate_current_bvid {
                     if let Err(err) = reset_segments_for_new_bvid(&context_clone, &task_id_clone) {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿重置分段元数据失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -1955,13 +1943,11 @@ pub async fn submission_repost(
             match merge_result {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        &format!("重新投稿合并失败: {}", err),
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -1973,13 +1959,11 @@ pub async fn submission_repost(
                     return;
                 }
                 Err(err) => {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        &format!("重新投稿合并失败: {}", err),
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -2017,13 +2001,11 @@ pub async fn submission_repost(
             match segment_outputs {
                 Ok(outputs) => {
                     if should_segment && outputs.is_empty() {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            "重新投稿未生成任何分段文件",
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -2042,13 +2024,11 @@ pub async fn submission_repost(
                         )?;
                         Ok(())
                     }) {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿清理旧合并/分段记录失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -2066,14 +2046,11 @@ pub async fn submission_repost(
                     ) {
                         Ok(merged_id) => merged_id,
                         Err(err) => {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新投稿保存合并视频失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -2107,14 +2084,11 @@ pub async fn submission_repost(
                             Some(merged_id),
                             segment_prefix.as_deref(),
                         ) {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新投稿保存分段失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -2133,13 +2107,11 @@ pub async fn submission_repost(
                     );
                 }
                 Err(err) => {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        &format!("重新投稿分段失败: {}", err),
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -3276,6 +3248,58 @@ fn parse_ffprobe_time(value: Option<&Value>) -> Option<f64> {
         .and_then(|raw| raw.parse::<f64>().ok())
 }
 
+fn detect_merged_video_decode_issue(stderr: &str) -> Option<&'static str> {
+    let normalized = stderr.to_ascii_lowercase();
+    let patterns = [
+        ("missing picture in access unit", "missing_picture_in_access_unit"),
+        ("non-existing pps", "non_existing_pps"),
+        ("non-existing sps", "non_existing_sps"),
+        ("sps_id", "invalid_sps_id"),
+        ("pps_id", "invalid_pps_id"),
+        ("illegal poc type", "illegal_poc_type"),
+        (
+            "illegal memory management control operation",
+            "illegal_memory_management_control",
+        ),
+        (
+            "a non-intra slice in an idr nal unit",
+            "non_intra_slice_in_idr",
+        ),
+        ("reference count overflow", "reference_count_overflow"),
+        ("reference count 1 overflow", "reference_count_overflow"),
+        ("cabac_init_idc", "invalid_cabac_init_idc"),
+        ("slice type", "invalid_slice_type"),
+        ("truncated at", "truncated_nal_or_sei"),
+    ];
+    patterns
+        .into_iter()
+        .find_map(|(needle, reason)| normalized.contains(needle).then_some(reason))
+}
+
+fn merged_video_decode_probe_issue(
+    path: &Path,
+    start_seconds: f64,
+    span_seconds: f64,
+) -> Result<Option<String>, String> {
+    let interval = format!("{:.3}%+{:.3}", start_seconds.max(0.0), span_seconds.max(0.5));
+    let args = vec![
+        "-v".to_string(),
+        "warning".to_string(),
+        "-read_intervals".to_string(),
+        interval,
+        "-select_streams".to_string(),
+        "v:0".to_string(),
+        "-show_frames".to_string(),
+        "-show_entries".to_string(),
+        "frame=best_effort_timestamp_time,key_frame,pict_type".to_string(),
+        "-of".to_string(),
+        "json".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let (_, stderr) = run_ffprobe_capture(&args)?;
+    Ok(detect_merged_video_decode_issue(&stderr).map(|reason| reason.to_string()))
+}
+
 fn merged_probe_has_packets(
     path: &Path,
     stream_selector: &str,
@@ -3503,15 +3527,30 @@ fn is_merged_video_reusable_for_transcode_repost(
         .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     sample_points.dedup_by(|left, right| (*left - *right).abs() < 0.5);
 
-    for sample in sample_points {
-        let has_video = merged_probe_has_packets(&path, "v:0", sample)?;
-        let has_audio = merged_probe_has_packets(&path, "a:0", sample)?;
+    for sample in &sample_points {
+        let has_video = merged_probe_has_packets(&path, "v:0", *sample)?;
+        let has_audio = merged_probe_has_packets(&path, "a:0", *sample)?;
         if !has_video || !has_audio {
             append_log(
                 app_log_path,
                 &format!(
                     "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=packet_probe_missing sample={:.3} has_video={} has_audio={}",
                     task_id, merged.id, sample, has_video, has_audio
+                ),
+            );
+            return Ok(false);
+        }
+    }
+
+    let decode_probe_span = 20.0f64;
+    for sample in &sample_points {
+        let span = decode_probe_span.min((duration - *sample).max(1.0));
+        if let Some(reason) = merged_video_decode_probe_issue(&path, *sample, span)? {
+            append_log(
+                app_log_path,
+                &format!(
+                    "submission_transcode_reuse_merged_skip task_id={} merged_id={} reason=video_decode_probe_issue detail={} sample={:.3} span={:.3}",
+                    task_id, merged.id, reason, sample, span
                 ),
             );
             return Ok(false);
@@ -4296,14 +4335,11 @@ async fn resume_resegment_after_restore(
                 match segment_outputs {
                     Ok(outputs) => {
                         if outputs.is_empty() {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                "重新分段未生成任何分段文件",
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -4332,14 +4368,11 @@ async fn resume_resegment_after_restore(
                             )
                         };
                         if let Err(err) = save_result {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新分段保存分段失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -4354,17 +4387,11 @@ async fn resume_resegment_after_restore(
                             if let Err(err) =
                                 reset_segments_for_new_bvid(&context_clone, &task_id_clone)
                             {
-                                let _ = update_submission_status(
+                                let _ = mark_submission_failure(
                                     &context_clone,
                                     &task_id_clone,
-                                    "FAILED",
-                                );
-                                let _ = update_workflow_status(
-                                    &context_clone,
-                                    &task_id_clone,
-                                    "FAILED",
                                     Some("SEGMENTING"),
-                                    0.0,
+                                    &format!("重新分段重置分段元数据失败: {}", err),
                                 );
                                 append_log(
                                     app_log_path.as_ref(),
@@ -4383,13 +4410,11 @@ async fn resume_resegment_after_restore(
                         );
                     }
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -4474,13 +4499,11 @@ async fn resume_resegment_after_restore(
                 match merge_result {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新分段合并失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -4492,13 +4515,11 @@ async fn resume_resegment_after_restore(
                         return;
                     }
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新分段合并失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -4528,14 +4549,11 @@ async fn resume_resegment_after_restore(
                 match segment_outputs {
                     Ok(outputs) => {
                         if outputs.is_empty() {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                "重新分段未生成任何分段文件",
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -4553,17 +4571,11 @@ async fn resume_resegment_after_restore(
                         ) {
                             Ok(merged_id) => merged_id,
                             Err(err) => {
-                                let _ = update_submission_status(
+                                let _ = mark_submission_failure(
                                     &context_clone,
                                     &task_id_clone,
-                                    "FAILED",
-                                );
-                                let _ = update_workflow_status(
-                                    &context_clone,
-                                    &task_id_clone,
-                                    "FAILED",
                                     Some("SEGMENTING"),
-                                    0.0,
+                                    &format!("重新分段保存合并视频失败: {}", err),
                                 );
                                 append_log(
                                     app_log_path.as_ref(),
@@ -4596,14 +4608,11 @@ async fn resume_resegment_after_restore(
                             Some(merged_id),
                             segment_prefix.as_deref(),
                         ) {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新分段保存分段失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -4624,14 +4633,11 @@ async fn resume_resegment_after_restore(
                             &task_id_clone,
                             &stale_merged_ids,
                         ) {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新分段清理旧合并记录失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -4646,17 +4652,11 @@ async fn resume_resegment_after_restore(
                             if let Err(err) =
                                 reset_segments_for_new_bvid(&context_clone, &task_id_clone)
                             {
-                                let _ = update_submission_status(
+                                let _ = mark_submission_failure(
                                     &context_clone,
                                     &task_id_clone,
-                                    "FAILED",
-                                );
-                                let _ = update_workflow_status(
-                                    &context_clone,
-                                    &task_id_clone,
-                                    "FAILED",
                                     Some("SEGMENTING"),
-                                    0.0,
+                                    &format!("重新分段重置分段元数据失败: {}", err),
                                 );
                                 append_log(
                                     app_log_path.as_ref(),
@@ -4675,13 +4675,11 @@ async fn resume_resegment_after_restore(
                         );
                     }
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -4737,14 +4735,11 @@ async fn resume_resegment_after_restore(
                 match segment_outputs {
                     Ok(outputs) => {
                         if outputs.is_empty() {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                "重新分段未生成任何分段文件",
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -4762,14 +4757,11 @@ async fn resume_resegment_after_restore(
                             Some(merged_id),
                             segment_prefix.as_deref(),
                         ) {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新分段保存分段失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -4784,17 +4776,11 @@ async fn resume_resegment_after_restore(
                             if let Err(err) =
                                 reset_segments_for_new_bvid(&context_clone, &task_id_clone)
                             {
-                                let _ = update_submission_status(
+                                let _ = mark_submission_failure(
                                     &context_clone,
                                     &task_id_clone,
-                                    "FAILED",
-                                );
-                                let _ = update_workflow_status(
-                                    &context_clone,
-                                    &task_id_clone,
-                                    "FAILED",
                                     Some("SEGMENTING"),
-                                    0.0,
+                                    &format!("重新分段重置分段元数据失败: {}", err),
                                 );
                                 append_log(
                                     app_log_path.as_ref(),
@@ -4813,13 +4799,11 @@ async fn resume_resegment_after_restore(
                         );
                     }
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -4941,13 +4925,11 @@ async fn resume_repost_after_restore(
                         &[replaced_merged_path],
                         segment_prefix.as_deref(),
                     ) {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿保存分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -4962,14 +4944,11 @@ async fn resume_repost_after_restore(
                         if let Err(err) =
                             reset_segments_for_new_bvid(&context_clone, &task_id_clone)
                         {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新投稿重置分段元数据失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -4998,13 +4977,11 @@ async fn resume_repost_after_restore(
                 ) {
                     Ok(value) => value,
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿替换合并视频失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -5050,13 +5027,11 @@ async fn resume_repost_after_restore(
                 let outputs = match outputs {
                     Ok(list) => list,
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -5069,13 +5044,11 @@ async fn resume_repost_after_restore(
                     }
                 };
                 if outputs.is_empty() {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        "重新投稿未生成任何分段文件",
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -5090,13 +5063,11 @@ async fn resume_repost_after_restore(
                     &outputs,
                     segment_prefix.as_deref(),
                 ) {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        &format!("重新投稿保存分段失败: {}", err),
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -5109,13 +5080,11 @@ async fn resume_repost_after_restore(
                 }
                 if !integrate_current_bvid {
                     if let Err(err) = reset_segments_for_new_bvid(&context_clone, &task_id_clone) {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿重置分段元数据失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -5168,13 +5137,11 @@ async fn resume_repost_after_restore(
                 match merge_result {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿合并失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -5186,13 +5153,11 @@ async fn resume_repost_after_restore(
                         return;
                     }
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿合并失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -5242,14 +5207,11 @@ async fn resume_repost_after_restore(
                 match segment_outputs {
                     Ok(outputs) => {
                         if should_segment && outputs.is_empty() {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                "重新投稿未生成任何分段文件",
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -5271,14 +5233,11 @@ async fn resume_repost_after_restore(
                             )?;
                             Ok(())
                         }) {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新投稿清理旧合并/分段记录失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -5296,17 +5255,11 @@ async fn resume_repost_after_restore(
                         ) {
                             Ok(merged_id) => merged_id,
                             Err(err) => {
-                                let _ = update_submission_status(
+                                let _ = mark_submission_failure(
                                     &context_clone,
                                     &task_id_clone,
-                                    "FAILED",
-                                );
-                                let _ = update_workflow_status(
-                                    &context_clone,
-                                    &task_id_clone,
-                                    "FAILED",
                                     Some("SEGMENTING"),
-                                    0.0,
+                                    &format!("重新投稿保存合并视频失败: {}", err),
                                 );
                                 append_log(
                                     app_log_path.as_ref(),
@@ -5340,17 +5293,11 @@ async fn resume_repost_after_restore(
                                 Some(merged_id),
                                 segment_prefix.as_deref(),
                             ) {
-                                let _ = update_submission_status(
+                                let _ = mark_submission_failure(
                                     &context_clone,
                                     &task_id_clone,
-                                    "FAILED",
-                                );
-                                let _ = update_workflow_status(
-                                    &context_clone,
-                                    &task_id_clone,
-                                    "FAILED",
                                     Some("SEGMENTING"),
-                                    0.0,
+                                    &format!("重新投稿保存分段失败: {}", err),
                                 );
                                 append_log(
                                     app_log_path.as_ref(),
@@ -5369,13 +5316,11 @@ async fn resume_repost_after_restore(
                         );
                     }
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新投稿分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -6155,14 +6100,11 @@ pub async fn submission_resegment(
                 match segment_outputs {
                     Ok(outputs) => {
                         if outputs.is_empty() {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                "重新分段未生成任何分段文件",
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -6191,14 +6133,11 @@ pub async fn submission_resegment(
                             )
                         };
                         if let Err(err) = save_result {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新分段保存分段失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -6213,17 +6152,11 @@ pub async fn submission_resegment(
                             if let Err(err) =
                                 reset_segments_for_new_bvid(&context_clone, &task_id_clone)
                             {
-                                let _ = update_submission_status(
+                                let _ = mark_submission_failure(
                                     &context_clone,
                                     &task_id_clone,
-                                    "FAILED",
-                                );
-                                let _ = update_workflow_status(
-                                    &context_clone,
-                                    &task_id_clone,
-                                    "FAILED",
                                     Some("SEGMENTING"),
-                                    0.0,
+                                    &format!("重新分段重置分段元数据失败: {}", err),
                                 );
                                 append_log(
                                     app_log_path.as_ref(),
@@ -6242,13 +6175,11 @@ pub async fn submission_resegment(
                         );
                     }
                     Err(err) => {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -6380,13 +6311,11 @@ pub async fn submission_resegment(
             match merge_result {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        &format!("重新分段合并失败: {}", err),
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -6398,13 +6327,11 @@ pub async fn submission_resegment(
                     return;
                 }
                 Err(err) => {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        &format!("重新分段合并失败: {}", err),
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -6454,13 +6381,11 @@ pub async fn submission_resegment(
             match segment_outputs {
                 Ok(outputs) => {
                     if outputs.is_empty() {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            "重新分段未生成任何分段文件",
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -6478,14 +6403,11 @@ pub async fn submission_resegment(
                     ) {
                         Ok(merged_id) => merged_id,
                         Err(err) => {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新分段保存合并视频失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -6518,13 +6440,11 @@ pub async fn submission_resegment(
                         Some(merged_id),
                         segment_prefix.as_deref(),
                     ) {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新分段保存分段失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -6545,13 +6465,11 @@ pub async fn submission_resegment(
                         &task_id_clone,
                         &stale_merged_ids,
                     ) {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新分段清理旧合并记录失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -6566,14 +6484,11 @@ pub async fn submission_resegment(
                         if let Err(err) =
                             reset_segments_for_new_bvid(&context_clone, &task_id_clone)
                         {
-                            let _ =
-                                update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                            let _ = update_workflow_status(
+                            let _ = mark_submission_failure(
                                 &context_clone,
                                 &task_id_clone,
-                                "FAILED",
                                 Some("SEGMENTING"),
-                                0.0,
+                                &format!("重新分段重置分段元数据失败: {}", err),
                             );
                             append_log(
                                 app_log_path.as_ref(),
@@ -6592,13 +6507,11 @@ pub async fn submission_resegment(
                     );
                 }
                 Err(err) => {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        &format!("重新分段失败: {}", err),
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -6780,13 +6693,11 @@ pub async fn submission_resegment(
         match segment_outputs {
             Ok(outputs) => {
                 if outputs.is_empty() {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        "重新分段未生成任何分段文件",
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -6804,13 +6715,11 @@ pub async fn submission_resegment(
                     Some(merged_id),
                     segment_prefix.as_deref(),
                 ) {
-                    let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                    let _ = update_workflow_status(
+                    let _ = mark_submission_failure(
                         &context_clone,
                         &task_id_clone,
-                        "FAILED",
                         Some("SEGMENTING"),
-                        0.0,
+                        &format!("重新分段保存分段失败: {}", err),
                     );
                     append_log(
                         app_log_path.as_ref(),
@@ -6823,13 +6732,11 @@ pub async fn submission_resegment(
                 }
                 if !integrate_current_bvid {
                     if let Err(err) = reset_segments_for_new_bvid(&context_clone, &task_id_clone) {
-                        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                        let _ = update_workflow_status(
+                        let _ = mark_submission_failure(
                             &context_clone,
                             &task_id_clone,
-                            "FAILED",
                             Some("SEGMENTING"),
-                            0.0,
+                            &format!("重新分段重置分段元数据失败: {}", err),
                         );
                         append_log(
                             app_log_path.as_ref(),
@@ -6848,13 +6755,11 @@ pub async fn submission_resegment(
                 );
             }
             Err(err) => {
-                let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
-                let _ = update_workflow_status(
+                let _ = mark_submission_failure(
                     &context_clone,
                     &task_id_clone,
-                    "FAILED",
                     Some("SEGMENTING"),
-                    0.0,
+                    &format!("重新分段失败: {}", err),
                 );
                 append_log(
                     app_log_path.as_ref(),
@@ -12599,8 +12504,7 @@ async fn ensure_sources_ready(
                 let _ = update_workflow_status(context, task_id, "VIDEO_DOWNLOADING", None, 0.0);
                 let _ = update_submission_status(context, task_id, "PENDING");
                 if attempt >= SOURCE_READY_MAX_RETRIES {
-                    let _ = update_workflow_status(context, task_id, "FAILED", None, 0.0);
-                    let _ = update_submission_status(context, task_id, "FAILED");
+                    let _ = mark_submission_failure(context, task_id, None, &err);
                     return Err(err);
                 }
                 let sleep_secs = wait_secs.min(SOURCE_READY_MAX_WAIT_SECS);
@@ -12655,8 +12559,8 @@ async fn run_submission_workflow(
         load_source_videos(&context, &task_id)?
     };
     if sources.is_empty() {
-        update_submission_status(&context, &task_id, "FAILED")?;
-        return Err("No source videos".to_string());
+        mark_submission_failure(&context, &task_id, None, "未找到可用的源视频")?;
+        return Err("未找到可用的源视频".to_string());
     }
 
     let merge_groups = if !is_update_workflow {
@@ -13528,8 +13432,7 @@ async fn run_submission_workflow_guarded(context: SubmissionContext, task_id: St
                 ),
             );
         }
-        let _ = update_workflow_status(&context, &task_id, "FAILED", None, 0.0);
-        let _ = update_submission_status(&context, &task_id, "FAILED");
+        let _ = mark_submission_failure(&context, &task_id, None, &err);
         append_log(
             &context.app_log_path,
             &format!("submission_workflow_failed task_id={} err={}", task_id, err),
@@ -13688,6 +13591,7 @@ const SUBMISSION_QUEUE_RETRY_LIMIT: u32 = 3;
 const SUBMISSION_QUEUE_OWNER_GRACE_SECS: u64 = 30;
 const SUBMISSION_UPLOAD_STALE_TIMEOUT_SECS: i64 = 45 * 60;
 const SUBMISSION_UPLOAD_STALE_CHECK_INTERVAL_SECS: u64 = 30;
+const SUBMISSION_UPLOAD_STARTUP_RECOVER_GRACE_SECS: i64 = 2 * 60;
 const SUBMISSION_QUEUE_RETRY_BASE_DELAY_SECS: u64 = 10;
 const SUBMISSION_QUEUE_RETRY_MAX_DELAY_SECS: u64 = 120;
 const COLLECTION_BIND_RETRY_LIMIT: u32 = 3;
@@ -15594,14 +15498,18 @@ async fn recover_submission_tasks(context: SubmissionQueueContext) {
             processing_ids.extend(list);
         }
     }
-    let uploading_ids =
-        load_task_ids_by_status(&submission_context, "UPLOADING").unwrap_or_default();
-
-    for task_id in uploading_ids {
-        let _ = update_submission_status(&submission_context, &task_id, "WAITING_UPLOAD");
+    let startup_recover_before =
+        (Utc::now() - ChronoDuration::seconds(SUBMISSION_UPLOAD_STARTUP_RECOVER_GRACE_SECS))
+            .to_rfc3339();
+    if let Err(err) = recover_uploading_tasks_before(
+        &submission_context,
+        startup_recover_before.as_str(),
+        "submission_recover_uploading",
+        SUBMISSION_UPLOAD_STARTUP_RECOVER_GRACE_SECS,
+    ) {
         append_log(
             &context.app_log_path,
-            &format!("submission_recover_uploading task_id={}", task_id),
+            &format!("submission_recover_uploading_fail err={}", err),
         );
     }
 
@@ -20041,6 +19949,48 @@ fn update_submission_status_with_reason(
     Ok(())
 }
 
+fn normalize_submission_failure_reason(reason: &str) -> String {
+    const LIMIT: usize = 1000;
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return "任务执行失败，请查看日志".to_string();
+    }
+    let mut normalized = trimmed.chars().take(LIMIT).collect::<String>();
+    if trimmed.chars().count() > LIMIT {
+        normalized.push_str("...");
+    }
+    normalized
+}
+
+fn mark_submission_failure(
+    context: &SubmissionContext,
+    task_id: &str,
+    current_step: Option<&str>,
+    reason: &str,
+) -> Result<(), String> {
+    let normalized_reason = normalize_submission_failure_reason(reason);
+    let mut first_err: Option<String> = None;
+
+    if let Err(err) = update_submission_status_with_reason(
+        context,
+        task_id,
+        "FAILED",
+        Some(normalized_reason.as_str()),
+    ) {
+        first_err = Some(err);
+    }
+    if let Err(err) = update_workflow_status(context, task_id, "FAILED", current_step, 0.0) {
+        if first_err.is_none() {
+            first_err = Some(err);
+        }
+    }
+
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 fn cleanup_unbound_run_dirs_for_task(
     context: &SubmissionContext,
     task_id: &str,
@@ -20702,6 +20652,20 @@ fn load_uploading_owner_keys(context: &SubmissionContext) -> Result<HashSet<i64>
 fn recover_stalled_uploading_tasks(context: &SubmissionContext) -> Result<(), String> {
     let stale_before = Utc::now() - ChronoDuration::seconds(SUBMISSION_UPLOAD_STALE_TIMEOUT_SECS);
     let stale_before_rfc3339 = stale_before.to_rfc3339();
+    recover_uploading_tasks_before(
+        context,
+        stale_before_rfc3339.as_str(),
+        "submission_queue_recover_stalled_upload",
+        SUBMISSION_UPLOAD_STALE_TIMEOUT_SECS,
+    )
+}
+
+fn recover_uploading_tasks_before(
+    context: &SubmissionContext,
+    stale_before_rfc3339: &str,
+    log_reason: &str,
+    timeout_secs: i64,
+) -> Result<(), String> {
     let stale_tasks: Vec<(String, String)> = context
         .db
         .with_conn(|conn| {
@@ -20711,7 +20675,7 @@ fn recover_stalled_uploading_tasks(context: &SubmissionContext) -> Result<(), St
          WHERE status = 'UPLOADING' AND updated_at != '' AND updated_at < ?1 \
          ORDER BY updated_at ASC",
             )?;
-            let rows = stmt.query_map([stale_before_rfc3339.as_str()], |row| {
+            let rows = stmt.query_map([stale_before_rfc3339], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -20732,15 +20696,12 @@ fn recover_stalled_uploading_tasks(context: &SubmissionContext) -> Result<(), St
             .map_err(|err| err.to_string())?;
         update_submission_status(context, &task_id, "WAITING_UPLOAD")?;
         append_log(
-      &context.app_log_path,
-      &format!(
-        "submission_queue_recover_stalled_upload task_id={} updated_at={} reset_segments={} timeout_secs={}",
-        task_id,
-        updated_at,
-        reset_segments,
-        SUBMISSION_UPLOAD_STALE_TIMEOUT_SECS
-      ),
-    );
+            &context.app_log_path,
+            &format!(
+                "{} task_id={} updated_at={} reset_segments={} timeout_secs={}",
+                log_reason, task_id, updated_at, reset_segments, timeout_secs
+            ),
+        );
     }
 
     Ok(())
@@ -21109,6 +21070,10 @@ mod tests {
             sort_order: 1,
             start_time: Some("00:00:00".to_string()),
             end_time: Some("00:00:05".to_string()),
+            remote_bvid: None,
+            remote_aid: None,
+            remote_cid: None,
+            remote_part_title: None,
         }];
         let result = validate_source_video_inputs(&sources);
         assert!(result.is_ok());
@@ -21121,6 +21086,10 @@ mod tests {
             sort_order: 1,
             start_time: Some("00:00:00".to_string()),
             end_time: Some("00:00:00".to_string()),
+            remote_bvid: None,
+            remote_aid: None,
+            remote_cid: None,
+            remote_part_title: None,
         }];
         let result = validate_source_video_inputs(&sources);
         assert_eq!(result.unwrap_err(), "第1行时间范围不合法");
@@ -21130,6 +21099,19 @@ mod tests {
     fn format_timecode_seconds_handles_rounding_carry() {
         assert_eq!(format_timecode_seconds(7199.999667), "02:00:00");
         assert_eq!(format_timecode_seconds(59.9996), "00:01:00");
+    }
+
+    #[test]
+    fn detect_merged_video_decode_issue_matches_h264_corruption_patterns() {
+        let stderr = "\
+[h264 @ 0x1] missing picture in access unit with size 451
+[h264 @ 0x1] non-existing PPS 7 referenced
+[h264 @ 0x1] illegal POC type 20
+";
+        assert_eq!(
+            detect_merged_video_decode_issue(stderr),
+            Some("missing_picture_in_access_unit")
+        );
     }
 
     #[test]
