@@ -3251,7 +3251,10 @@ fn parse_ffprobe_time(value: Option<&Value>) -> Option<f64> {
 fn detect_merged_video_decode_issue(stderr: &str) -> Option<&'static str> {
     let normalized = stderr.to_ascii_lowercase();
     let patterns = [
-        ("missing picture in access unit", "missing_picture_in_access_unit"),
+        (
+            "missing picture in access unit",
+            "missing_picture_in_access_unit",
+        ),
         ("non-existing pps", "non_existing_pps"),
         ("non-existing sps", "non_existing_sps"),
         ("sps_id", "invalid_sps_id"),
@@ -3281,7 +3284,11 @@ fn merged_video_decode_probe_issue(
     start_seconds: f64,
     span_seconds: f64,
 ) -> Result<Option<String>, String> {
-    let interval = format!("{:.3}%+{:.3}", start_seconds.max(0.0), span_seconds.max(0.5));
+    let interval = format!(
+        "{:.3}%+{:.3}",
+        start_seconds.max(0.0),
+        span_seconds.max(0.5)
+    );
     let args = vec![
         "-v".to_string(),
         "warning".to_string(),
@@ -3328,8 +3335,16 @@ fn merged_probe_has_packets(
         .unwrap_or(false))
 }
 
-fn merged_audio_packet_gap_delta(path: &Path, start_seconds: f64, span_seconds: f64) -> Result<f64, String> {
-    let interval = format!("{:.3}%+{:.3}", start_seconds.max(0.0), span_seconds.max(0.1));
+fn merged_audio_packet_gap_delta(
+    path: &Path,
+    start_seconds: f64,
+    span_seconds: f64,
+) -> Result<f64, String> {
+    let interval = format!(
+        "{:.3}%+{:.3}",
+        start_seconds.max(0.0),
+        span_seconds.max(0.1)
+    );
     let args = vec![
         "-v".to_string(),
         "error".to_string(),
@@ -3354,7 +3369,10 @@ fn merged_audio_packet_gap_delta(path: &Path, start_seconds: f64, span_seconds: 
         if trimmed.is_empty() {
             continue;
         }
-        let mut parts = trimmed.split(',').map(|item| item.trim()).filter(|item| !item.is_empty());
+        let mut parts = trimmed
+            .split(',')
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty());
         let Some(pts_raw) = parts.next() else {
             continue;
         };
@@ -9394,7 +9412,16 @@ pub async fn submission_retry_segment_upload(
         Err(err) => return Ok(ApiResponse::error(err)),
     };
     if segment.upload_status == "SUCCESS" {
-        return Ok(ApiResponse::success("分段已上传成功".to_string()));
+        let queued = match enqueue_submission_after_segment_retry(&context, &segment.task_id) {
+            Ok(value) => value,
+            Err(err) => return Ok(ApiResponse::error(format!("加入投稿队列失败: {}", err))),
+        };
+        let message = if queued {
+            "分段已上传成功，任务已加入投稿队列"
+        } else {
+            "分段已上传成功"
+        };
+        return Ok(ApiResponse::success(message.to_string()));
     }
     let status = match load_task_status(&context, &segment.task_id) {
         Ok(status) => status,
@@ -9439,15 +9466,16 @@ pub async fn submission_retry_segment_upload(
                 Some(upload_result.cid),
                 Some(upload_result.filename),
             )?;
-            let remaining = count_incomplete_segments(&context, &segment.task_id)?;
-            if remaining == 0 {
-                if let Ok(status) = load_task_status(&context, &segment.task_id) {
-                    if status == "FAILED" {
-                        update_submission_status(&context, &segment.task_id, "WAITING_UPLOAD")?;
-                    }
-                }
-            }
-            Ok(ApiResponse::success("分段上传成功".to_string()))
+            let queued = match enqueue_submission_after_segment_retry(&context, &segment.task_id) {
+                Ok(value) => value,
+                Err(err) => return Ok(ApiResponse::error(format!("加入投稿队列失败: {}", err))),
+            };
+            let message = if queued {
+                "分段上传成功，任务已加入投稿队列"
+            } else {
+                "分段上传成功"
+            };
+            Ok(ApiResponse::success(message.to_string()))
         }
         Err(err) => {
             update_segment_upload_status(&context, &segment_id, "FAILED")?;
@@ -13606,6 +13634,7 @@ const REMOTE_PART_VERIFY_RETRY_LIMIT: u32 = 5;
 const REMOTE_PART_VERIFY_RETRY_WAIT_SECS: u64 = 2;
 const UPLOAD_RETRY_BASE_DELAY_SECS: u64 = 2;
 const UPLOAD_RETRY_MAX_DELAY_SECS: u64 = 30;
+const UPLOAD_SESSION_RESET_REQUIRED_PREFIX: &str = "UPLOAD_SESSION_RESET_REQUIRED:";
 const PREUPLOAD_PARSE_RETRY_BASE_SECS: u64 = 60;
 const PREUPLOAD_PARSE_RETRY_MAX_SECS: u64 = 30 * 60;
 const PREUPLOAD_PARSE_RETRY_LIMIT: u32 = 6;
@@ -13669,6 +13698,45 @@ impl Default for TaskUploadRateLimitState {
 
 fn is_rate_limit_error(err: &str) -> bool {
     err.contains("21540") || err.contains("请求过于频繁")
+}
+
+fn is_upload_rate_limit_response(status: StatusCode, body: &str) -> bool {
+    if status == StatusCode::NOT_ACCEPTABLE || status == StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    let lower = body.to_lowercase();
+    is_rate_limit_error(body)
+        || lower.contains("rate limit")
+        || lower.contains("too many")
+        || lower.contains("frequent")
+        || body.contains("限流")
+        || body.contains("频繁")
+}
+
+fn is_upload_auth_response(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN || is_auth_error(body)
+}
+
+fn is_upload_session_response(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("uploadid")
+        || lower.contains("upload_id")
+        || lower.contains("upload id")
+        || lower.contains("upload session")
+        || lower.contains("session")
+        || lower.contains("expired")
+        || lower.contains("invalid")
+        || lower.contains("not exist")
+        || lower.contains("no such upload")
+        || lower.contains("biz_id")
+        || body.contains("会话")
+        || body.contains("过期")
+        || body.contains("不存在")
+        || body.contains("无效")
+}
+
+fn is_upload_session_reset_required(err: &str) -> bool {
+    err.contains(UPLOAD_SESSION_RESET_REQUIRED_PREFIX)
 }
 
 fn upload_retry_delay_secs(attempt: u32) -> u64 {
@@ -13807,6 +13875,19 @@ fn truncate_log_text(value: &str) -> String {
     let mut truncated = value.chars().take(LIMIT).collect::<String>();
     truncated.push_str("...<truncated>");
     truncated
+}
+
+fn mask_upload_id(upload_id: &str) -> String {
+    let value = upload_id.trim();
+    if value.len() <= 12 {
+        return format!("*** len={}", value.len());
+    }
+    format!(
+        "{}...{} len={}",
+        &value[..8],
+        &value[value.len() - 6..],
+        value.len()
+    )
 }
 
 fn format_error_chain(err: &dyn Error) -> String {
@@ -15498,9 +15579,9 @@ async fn recover_submission_tasks(context: SubmissionQueueContext) {
             processing_ids.extend(list);
         }
     }
-    let startup_recover_before =
-        (Utc::now() - ChronoDuration::seconds(SUBMISSION_UPLOAD_STARTUP_RECOVER_GRACE_SECS))
-            .to_rfc3339();
+    let startup_recover_before = (Utc::now()
+        - ChronoDuration::seconds(SUBMISSION_UPLOAD_STARTUP_RECOVER_GRACE_SECS))
+    .to_rfc3339();
     if let Err(err) = recover_uploading_tasks_before(
         &submission_context,
         startup_recover_before.as_str(),
@@ -16000,6 +16081,16 @@ async fn upload_segment_with_retry(
                         Err(refresh_err) => return Err(refresh_err),
                     }
                 }
+                if is_upload_session_reset_required(&err) {
+                    let _ = clear_upload_session(context, &target);
+                    append_log(
+                        log_path,
+                        &format!(
+                            "submission_segment_session_reset segment_id={} attempt={} err={}",
+                            segment_id, attempt, err
+                        ),
+                    );
+                }
                 append_log(
                     log_path,
                     &format!(
@@ -16064,6 +16155,16 @@ async fn upload_edit_segment_with_retry(
                         }
                         Err(refresh_err) => return Err(refresh_err),
                     }
+                }
+                if is_upload_session_reset_required(&err) {
+                    let _ = clear_upload_session(context, &target);
+                    append_log(
+                        log_path,
+                        &format!(
+                            "submission_edit_segment_session_reset segment_id={} attempt={} err={}",
+                            segment_id, attempt, err
+                        ),
+                    );
                 }
                 append_log(
                     log_path,
@@ -16398,8 +16499,15 @@ async fn upload_video_chunks(
                     );
                     format!("上传分片失败: {}", detail)
                 })?;
-            if response.status() == StatusCode::NOT_ACCEPTABLE {
-                let retry_after = retry_after_seconds(response.headers());
+            let status = response.status();
+            let retry_after = retry_after_seconds(response.headers());
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|val| val.to_str().ok())
+                .unwrap_or("-")
+                .to_string();
+            if status == StatusCode::NOT_ACCEPTABLE {
                 wait_on_rate_limit(
                     context,
                     task_id,
@@ -16416,7 +16524,67 @@ async fn upload_video_chunks(
                 .await
                 .map_err(|err| format!("读取分片响应失败: {}", err))?;
             if !text.contains("MULTIPART_PUT_SUCCESS") {
-                return Err("分片上传失败".to_string());
+                let truncated_body = truncate_log_text(&text);
+                append_log(
+                    log_path,
+                    &format!(
+                        "upload_chunk_unexpected_response task_id={} target={} status={} content_type={} endpoint={} upload_id={} chunk={} part_number={} start={} end={} total={} body={}",
+                        task_id,
+                        upload_target_label(target),
+                        status.as_u16(),
+                        content_type,
+                        preupload.endpoint,
+                        mask_upload_id(upload_id),
+                        index,
+                        index + 1,
+                        start,
+                        end,
+                        file_size,
+                        truncated_body
+                    ),
+                );
+                if is_upload_rate_limit_response(status, &text) {
+                    wait_on_rate_limit(
+                        context,
+                        task_id,
+                        target,
+                        log_path,
+                        retry_after,
+                        "upload_chunk_body",
+                    )
+                    .await;
+                    continue;
+                }
+                if is_upload_auth_response(status, &text) {
+                    return Err(format!(
+                        "上传分片鉴权失败: status={} body={}",
+                        status.as_u16(),
+                        truncated_body
+                    ));
+                }
+                let detail = format!(
+                    "status={} content_type={} chunk={} part_number={} start={} end={} total={} endpoint={} upload_id={} body={}",
+                    status.as_u16(),
+                    content_type,
+                    index,
+                    index + 1,
+                    start,
+                    end,
+                    file_size,
+                    preupload.endpoint,
+                    mask_upload_id(upload_id),
+                    truncated_body
+                );
+                if is_upload_session_response(&text) {
+                    return Err(format!(
+                        "{} 上传会话异常，已准备重建会话: {}",
+                        UPLOAD_SESSION_RESET_REQUIRED_PREFIX, detail
+                    ));
+                }
+                return Err(format!(
+                    "{} 分片上传返回非成功响应: {}",
+                    UPLOAD_SESSION_RESET_REQUIRED_PREFIX, detail
+                ));
             }
             reset_task_upload_rate_limit(task_id).await;
             break;
@@ -18865,6 +19033,58 @@ fn count_incomplete_segments(context: &SubmissionContext, task_id: &str) -> Resu
     .map_err(|err| err.to_string())
 }
 
+fn enqueue_submission_after_segment_retry(
+    context: &SubmissionContext,
+    task_id: &str,
+) -> Result<bool, String> {
+    let remaining = count_incomplete_segments(context, task_id)?;
+    if remaining > 0 {
+        append_log(
+            context.app_log_path.as_ref(),
+            &format!(
+                "submission_retry_segment_enqueue_skip task_id={} reason=incomplete_segments remaining={}",
+                task_id, remaining
+            ),
+        );
+        return Ok(false);
+    }
+
+    let status = load_task_status(context, task_id)?;
+    if status == "COMPLETED" {
+        append_log(
+            context.app_log_path.as_ref(),
+            &format!(
+                "submission_retry_segment_enqueue_skip task_id={} reason=completed",
+                task_id
+            ),
+        );
+        return Ok(false);
+    }
+    if status == "UPLOADING" {
+        append_log(
+            context.app_log_path.as_ref(),
+            &format!(
+                "submission_retry_segment_enqueue_skip task_id={} reason=uploading",
+                task_id
+            ),
+        );
+        return Ok(false);
+    }
+
+    if status != "WAITING_UPLOAD" {
+        update_submission_status(context, task_id, "WAITING_UPLOAD")?;
+    }
+    update_workflow_status(context, task_id, "COMPLETED", None, 100.0)?;
+    append_log(
+        context.app_log_path.as_ref(),
+        &format!(
+            "submission_retry_segment_enqueue_ok task_id={} previous_status={}",
+            task_id, status
+        ),
+    );
+    Ok(true)
+}
+
 fn load_output_segment_by_id(
     context: &SubmissionContext,
     segment_id: &str,
@@ -19921,7 +20141,7 @@ fn update_submission_status_with_reason(
             }
             if status == "FAILED" {
                 conn.execute(
-          "UPDATE workflow_instances SET error_message = ?1, updated_at = ?2 WHERE task_id = ?3",
+          "UPDATE workflow_instances SET status = 'FAILED', progress = 0, error_message = ?1, completed_at = COALESCE(completed_at, ?2), updated_at = ?2 WHERE task_id = ?3",
           (final_reason.as_deref(), &now, task_id),
         )?;
             } else {

@@ -4580,8 +4580,11 @@ async fn refresh_integration_status(
                     context.edit_upload_state.clone(),
                     submission_task_id.clone(),
                 );
-                let _ =
-                    update_relation_workflow_status(context, &submission_task_id, "WORKFLOW_STARTED");
+                let _ = update_relation_workflow_status(
+                    context,
+                    &submission_task_id,
+                    "WORKFLOW_STARTED",
+                );
                 append_log(
                     &context.app_log_path,
                     &format!(
