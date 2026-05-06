@@ -261,6 +261,11 @@ export default function SubmissionSection({
     useState(false);
   const [transcodeRepostSubmitting, setTranscodeRepostSubmitting] =
     useState(false);
+  const [transcodeRepostBaiduSync, setTranscodeRepostBaiduSync] = useState({
+    enabled: false,
+    path: "",
+    filename: "",
+  });
   const [createSubmitting, setCreateSubmitting] = useState(false);
   const [exportingTasks, setExportingTasks] = useState(false);
   const [importingTasks, setImportingTasks] = useState(false);
@@ -984,6 +989,11 @@ export default function SubmissionSection({
     setTranscodeRepostHasBvid(hasBvid);
     setTranscodeRepostUseCurrentBvid(hasBvid);
     setTranscodeRepostSubmitting(false);
+    setTranscodeRepostBaiduSync({
+      enabled: Boolean(task?.baiduSyncEnabled),
+      path: task?.baiduSyncPath || "",
+      filename: task?.baiduSyncFilename || "",
+    });
   };
 
   const closeTranscodeRepostModal = () => {
@@ -992,6 +1002,7 @@ export default function SubmissionSection({
     setTranscodeRepostHasBvid(false);
     setTranscodeRepostUseCurrentBvid(false);
     setTranscodeRepostSubmitting(false);
+    setTranscodeRepostBaiduSync({ enabled: false, path: "", filename: "" });
     setMessage("");
   };
 
@@ -1685,6 +1696,9 @@ export default function SubmissionSection({
     if (target === "repost") {
       return repostBaiduSync.path || fallbackPath;
     }
+    if (target === "transcodeRepost") {
+      return transcodeRepostBaiduSync.path || fallbackPath;
+    }
     return taskForm.baiduSyncPath || fallbackPath;
   };
 
@@ -1695,6 +1709,10 @@ export default function SubmissionSection({
     }
     if (target === "repost") {
       setRepostBaiduSync((prev) => ({ ...prev, path }));
+      return;
+    }
+    if (target === "transcodeRepost") {
+      setTranscodeRepostBaiduSync((prev) => ({ ...prev, path }));
       return;
     }
     setTaskForm((prev) => ({ ...prev, baiduSyncPath: path }));
@@ -3614,6 +3632,20 @@ export default function SubmissionSection({
     });
   };
 
+  const updateImportSelectableKeys = updateImportResults.flatMap((preview) =>
+    (preview.pages || [])
+      .filter((page) => Number(page?.cid || 0) > 0)
+      .map((page) => `${preview.bvid}:${page.cid}`),
+  );
+  const updateImportAllSelected =
+    updateImportSelectableKeys.length > 0 &&
+    updateImportSelectableKeys.every((key) => updateImportSelection.has(key));
+  const toggleUpdateImportSelectAll = (checked) => {
+    setUpdateImportSelection(
+      checked ? new Set(updateImportSelectableKeys) : new Set(),
+    );
+  };
+
   const handleApplyUpdateImportedSources = () => {
     const rows = [];
     for (const preview of updateImportResults) {
@@ -4142,6 +4174,9 @@ export default function SubmissionSection({
         request: {
           taskId: transcodeRepostTaskId,
           integrateCurrentBvid: transcodeRepostUseCurrentBvid,
+          baiduSyncEnabled: Boolean(transcodeRepostBaiduSync.enabled),
+          baiduSyncPath: transcodeRepostBaiduSync.path || null,
+          baiduSyncFilename: transcodeRepostBaiduSync.filename || null,
         },
       });
       setMessage(result || "转码投稿已启动");
@@ -6940,7 +6975,20 @@ export default function SubmissionSection({
               <table className="w-full text-left text-sm">
                 <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                   <tr>
-                    <th className="px-4 py-2">选择</th>
+	                    <th className="px-4 py-2">
+	                      <label className="flex items-center gap-2">
+	                        <input
+	                          type="checkbox"
+	                          checked={updateImportAllSelected}
+	                          onChange={(event) =>
+	                            toggleUpdateImportSelectAll(event.target.checked)
+	                          }
+	                          disabled={updateImportSelectableKeys.length === 0}
+	                          aria-label="全选导入分P"
+	                        />
+	                        <span>选择</span>
+	                      </label>
+	                    </th>
                     <th className="px-4 py-2">BV号</th>
                     <th className="px-4 py-2">分P</th>
                     <th className="px-4 py-2">标题</th>
@@ -7856,9 +7904,59 @@ export default function SubmissionSection({
                       <div className="text-xs text-amber-700">
                         当前任务没有BV号，将创建新投稿。
                       </div>
-                    ) : null}
-                  </div>
-                </div>
+	                    ) : null}
+	                  </div>
+	                  <div className="rounded-lg border border-black/5 bg-white/80 p-3">
+	                    <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+	                      百度网盘同步
+	                    </div>
+	                    <label className="mt-2 flex items-center gap-2 text-sm text-[var(--muted)]">
+	                      <input
+	                        type="checkbox"
+	                        checked={transcodeRepostBaiduSync.enabled}
+	                        onChange={(event) =>
+	                          setTranscodeRepostBaiduSync((prev) => ({
+	                            ...prev,
+	                            enabled: event.target.checked,
+	                          }))
+	                        }
+	                      />
+	                      同步上传到百度网盘
+	                    </label>
+	                    {transcodeRepostBaiduSync.enabled ? (
+	                      <div className="mt-3 grid gap-2">
+	                        <div>
+	                          <div className="text-xs text-[var(--muted)]">远端路径</div>
+	                          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+	                            <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
+	                              {transcodeRepostBaiduSync.path || defaultBaiduSyncPath || "/录播"}
+	                            </div>
+	                            <button
+	                              className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
+	                              onClick={() => handleOpenSyncPicker("transcodeRepost")}
+	                            >
+	                              选择目录
+	                            </button>
+	                          </div>
+	                        </div>
+	                        <div>
+	                          <div className="text-xs text-[var(--muted)]">上传文件名</div>
+	                          <input
+	                            value={transcodeRepostBaiduSync.filename}
+	                            onChange={(event) =>
+	                              setTranscodeRepostBaiduSync((prev) => ({
+	                                ...prev,
+	                                filename: event.target.value,
+	                              }))
+	                            }
+	                            placeholder="文件名"
+	                            className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+	                          />
+	                        </div>
+	                      </div>
+	                    ) : null}
+	                  </div>
+	                </div>
                 <div className="mt-4 flex justify-end gap-2">
                   <button
                     className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"

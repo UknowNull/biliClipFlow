@@ -229,6 +229,9 @@ pub struct SubmissionRepostRequest {
 pub struct SubmissionTranscodeRepostRequest {
     pub task_id: String,
     pub integrate_current_bvid: bool,
+    pub baidu_sync_enabled: Option<bool>,
+    pub baidu_sync_path: Option<String>,
+    pub baidu_sync_filename: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1918,7 +1921,7 @@ pub async fn submission_repost(
             }
             merge_inputs.push(path_buf);
         }
-        let merge_output = build_merge_output_path(&base_dir, &task_id);
+        let merge_output = build_merge_output_path_for_task(&base_dir, &detail.task);
         let context_clone = context.clone();
         let task_id_clone = task_id.clone();
         let output_dir_clone = output_dir.clone();
@@ -2836,6 +2839,21 @@ pub async fn submission_repost_transcode(
         None => return Ok(ApiResponse::error("未找到工作流配置")),
     };
     let integrate_current_bvid = request.integrate_current_bvid;
+    if let Err(err) = update_baidu_sync_config(
+        &context,
+        &task_id,
+        request.baidu_sync_enabled,
+        normalize_optional_text(request.baidu_sync_path),
+        normalize_optional_text(request.baidu_sync_filename),
+    ) {
+        append_log(
+            &state.app_log_path,
+            &format!(
+                "submission_repost_transcode_baidu_sync_update_fail task_id={} err={}",
+                task_id, err
+            ),
+        );
+    }
     apply_reprocess_metadata(&mut workflow_config, ReprocessMode::FullReprocess, None);
     apply_integrate_current_bvid(&mut workflow_config, integrate_current_bvid);
     apply_media_process_mode(
@@ -4492,7 +4510,8 @@ async fn resume_resegment_after_restore(
                     .map(|path| path.to_path_buf())
                     .unwrap_or_else(|| base_dir.clone())
             };
-            let merge_output = build_merge_output_path(&merge_workflow_dir, task_id);
+            let merge_output =
+                build_merge_output_path_for_task_id(context, &merge_workflow_dir, task_id)?;
             let context_clone = context.clone();
             let task_id_clone = task_id.to_string();
             let output_dir_clone = output_dir.clone();
@@ -5131,7 +5150,7 @@ async fn resume_repost_after_restore(
                 }
                 merge_inputs.push(PathBuf::from(path));
             }
-            let merge_output = build_merge_output_path(&base_dir, task_id);
+            let merge_output = build_merge_output_path_for_task_id(context, &base_dir, task_id)?;
             let context_clone = context.clone();
             let task_id_clone = task_id.to_string();
             let output_dir_clone = output_dir.clone();
@@ -6302,7 +6321,7 @@ pub async fn submission_resegment(
                 .map(|path| path.to_path_buf())
                 .unwrap_or_else(|| base_dir.clone())
         };
-        let merge_output = build_merge_output_path(&merge_workflow_dir, &task_id);
+        let merge_output = build_merge_output_path_for_task(&merge_workflow_dir, &detail.task);
         let context_clone = context.clone();
         let task_id_clone = task_id.clone();
         let output_dir_clone = output_dir.clone();
@@ -13207,7 +13226,7 @@ async fn run_submission_workflow(
 
     update_submission_status(&context, &task_id, "MERGING")?;
     let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("MERGING"), 40.0);
-    let merge_output = build_merge_output_path(&workflow_dir, &task_id);
+    let merge_output = build_merge_output_path_for_task_id(&context, &workflow_dir, &task_id)?;
     let merge_list_path = merge_output.with_extension("txt");
     append_log(
         &context.app_log_path,
@@ -17862,7 +17881,7 @@ fn recreate_selected_merged_for_repost(
     let workflow_dir = output_dir
         .parent()
         .ok_or_else(|| "重新投稿输出目录无效".to_string())?;
-    let target_merge_path = build_merge_output_path(workflow_dir, task_id);
+    let target_merge_path = build_merge_output_path_for_task_id(context, workflow_dir, task_id)?;
     if let Some(parent) = target_merge_path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("创建合并目录失败: {}", err))?;
     }
@@ -17884,7 +17903,7 @@ fn recreate_selected_merged_for_resegment(
     let workflow_dir = output_dir
         .parent()
         .ok_or_else(|| "重新分段输出目录无效".to_string())?;
-    let target_merge_path = build_merge_output_path(workflow_dir, task_id);
+    let target_merge_path = build_merge_output_path_for_task_id(context, workflow_dir, task_id)?;
     if let Some(parent) = target_merge_path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("创建合并目录失败: {}", err))?;
     }
@@ -20059,6 +20078,56 @@ fn build_merge_output_path(workflow_dir: &Path, task_id: &str) -> PathBuf {
     workflow_dir
         .join("merge")
         .join(format!("{}_merged_{}.mp4", task, stamp))
+}
+
+fn build_merge_output_path_with_remote_name(
+    workflow_dir: &Path,
+    remote_name: Option<&str>,
+    fallback_task_id: &str,
+) -> PathBuf {
+    if let Some(remote_name) = normalize_baidu_sync_filename(remote_name) {
+        let file_name = sanitize_filename(&remote_name);
+        if !file_name.trim().is_empty() {
+            return workflow_dir.join("merge").join(file_name);
+        }
+    }
+    build_merge_output_path(workflow_dir, fallback_task_id)
+}
+
+fn build_merge_output_path_for_task(workflow_dir: &Path, task: &SubmissionTaskRecord) -> PathBuf {
+    if task.baidu_sync_enabled {
+        return build_merge_output_path_with_remote_name(
+            workflow_dir,
+            task.baidu_sync_filename.as_deref(),
+            &task.task_id,
+        );
+    }
+    build_merge_output_path(workflow_dir, &task.task_id)
+}
+
+fn build_merge_output_path_for_task_id(
+    context: &SubmissionContext,
+    workflow_dir: &Path,
+    task_id: &str,
+) -> Result<PathBuf, String> {
+    let (enabled, filename): (i64, Option<String>) = context
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT IFNULL(baidu_sync_enabled, 0), baidu_sync_filename FROM submission_task WHERE task_id = ?1",
+                [task_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+        })
+        .map_err(|err| err.to_string())?;
+    if enabled != 0 {
+        return Ok(build_merge_output_path_with_remote_name(
+            workflow_dir,
+            filename.as_deref(),
+            task_id,
+        ));
+    }
+    Ok(build_merge_output_path(workflow_dir, task_id))
 }
 
 fn build_merge_output_path_for_group(
