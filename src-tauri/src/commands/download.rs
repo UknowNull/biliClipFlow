@@ -37,6 +37,7 @@ use crate::AppState;
 
 pub const DOWNLOAD_SOURCE_BILIBILI: &str = "BILIBILI";
 pub const DOWNLOAD_SOURCE_BAIDU: &str = "BAIDU";
+pub const DOWNLOAD_SOURCE_DIRECT: &str = "DIRECT";
 const BAIDU_DOWNLOAD_SUFFIX: &str = ".BaiduPCS-Go-downloading";
 const BAIDU_DOWNLOAD_SIZE_CHECK_TIMEOUT_SECS: u64 = 8;
 
@@ -146,6 +147,7 @@ pub struct DownloadRequest {
     pub video_url: String,
     pub parts: Vec<DownloadPart>,
     pub config: DownloadConfig,
+    pub source_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -238,6 +240,7 @@ struct DownloadTaskCreateResult {
     cid: i64,
     expected_path: String,
     actual_path: String,
+    duration: Option<i64>,
 }
 
 fn resolve_runtime_local_path(db: &Db, value: &str) -> String {
@@ -247,6 +250,103 @@ fn resolve_runtime_local_path(db: &Db, value: &str) -> String {
     } else {
         path.to_string_lossy().to_string()
     }
+}
+
+fn normalize_local_path_key(value: &str) -> String {
+    value.replace('\\', "/")
+}
+
+fn format_duration_hms(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    format!("{:02}:{:02}:{:02}", hours, minutes, secs)
+}
+
+fn timecode_to_seconds(value: &str) -> Option<i64> {
+    let parts: Vec<&str> = value.trim().split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hours = parts[0].parse::<i64>().ok()?;
+    let minutes = parts[1].parse::<i64>().ok()?;
+    let seconds = parts[2].parse::<i64>().ok()?;
+    Some(hours * 3600 + minutes * 60 + seconds)
+}
+
+fn is_empty_or_zero_time(value: Option<&str>) -> bool {
+    match value.map(|item| item.trim()).filter(|item| !item.is_empty()) {
+        Some(item) => timecode_to_seconds(item).map(|seconds| seconds <= 0).unwrap_or(false),
+        None => true,
+    }
+}
+
+fn normalize_download_source_type(value: Option<&str>) -> String {
+    match value.unwrap_or(DOWNLOAD_SOURCE_BILIBILI).trim().to_ascii_uppercase().as_str() {
+        DOWNLOAD_SOURCE_BAIDU => DOWNLOAD_SOURCE_BAIDU.to_string(),
+        DOWNLOAD_SOURCE_DIRECT => DOWNLOAD_SOURCE_DIRECT.to_string(),
+        "URL" | "THIRD_PARTY" | "DIRECT_URL" | "REMOTE_URL" => DOWNLOAD_SOURCE_DIRECT.to_string(),
+        _ => DOWNLOAD_SOURCE_BILIBILI.to_string(),
+    }
+}
+
+fn is_direct_download_source(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(DOWNLOAD_SOURCE_DIRECT)
+}
+
+fn parse_direct_download_url(raw: &str) -> Result<Url, String> {
+    let url = Url::parse(raw.trim()).map_err(|_| "请输入有效的第三方下载链接".to_string())?;
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        _ => Err("第三方下载链接仅支持 http/https".to_string()),
+    }
+}
+
+fn decode_url_path_segment(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &value[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                decoded.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
+}
+
+fn direct_url_file_name(url: &Url) -> String {
+    url.path_segments()
+        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).last())
+        .map(decode_url_path_segment)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "download.mp4".to_string())
+}
+
+fn direct_url_title(url: &Url) -> String {
+    let file_name = direct_url_file_name(url);
+    Path::new(&file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(file_name)
+}
+
+fn extension_from_file_name(file_name: &str) -> String {
+    Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "mp4".to_string())
 }
 
 #[tauri::command]
@@ -551,6 +651,48 @@ pub async fn download_retry(
         schedule_pending_downloads(context.clone()).await;
         return Ok(ApiResponse::success("Retry started".to_string()));
     }
+    if source_type == DOWNLOAD_SOURCE_DIRECT {
+        if status == 1 {
+            return Ok(ApiResponse::error("任务正在下载"));
+        }
+        if status == 0 {
+            return Ok(ApiResponse::error("任务已在队列中"));
+        }
+        if status == 4 {
+            return Ok(ApiResponse::error("任务已暂停，请使用继续下载"));
+        }
+        let local_path = match local_path {
+            Some(value) => resolve_runtime_local_path(context.db.as_ref(), &value),
+            None => return Ok(ApiResponse::error("缺少本地路径，无法重试")),
+        };
+        if local_path.trim().is_empty() {
+            return Ok(ApiResponse::error("缺少本地路径，无法重试"));
+        }
+        let direct_url = match download_url {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => return Ok(ApiResponse::error("缺少下载链接，无法重试")),
+        };
+        if let Err(err) = parse_direct_download_url(&direct_url) {
+            return Ok(ApiResponse::error(err));
+        }
+        let _ = reset_integrated_submission_status(&context, task_id);
+        cleanup_download_outputs(&PathBuf::from(&local_path));
+        reset_download_record_progress(&context, task_id)?;
+        clear_download_progress(&context, task_id);
+        let started = try_start_direct_download_job(
+            context.clone(),
+            task_id,
+            0,
+            direct_url,
+            PathBuf::from(local_path),
+            None,
+        )?;
+        if !started {
+            let _ = update_download_status_only(&context, task_id, 0);
+        }
+        schedule_pending_downloads(context.clone()).await;
+        return Ok(ApiResponse::success("Retry started".to_string()));
+    }
 
     if status == 1 {
         return Ok(ApiResponse::error("任务正在下载"));
@@ -733,6 +875,48 @@ pub async fn download_resume(
         schedule_pending_downloads(context.clone()).await;
         return Ok(ApiResponse::success("Resume started".to_string()));
     }
+    if source_type == DOWNLOAD_SOURCE_DIRECT {
+        if status == 1 {
+            return Ok(ApiResponse::error("任务正在下载"));
+        }
+        if status == 0 {
+            return Ok(ApiResponse::error("任务已在队列中"));
+        }
+        if status != 4 {
+            return Ok(ApiResponse::error("任务未处于暂停状态"));
+        }
+        let local_path = match local_path {
+            Some(value) => resolve_runtime_local_path(context.db.as_ref(), &value),
+            None => return Ok(ApiResponse::error("缺少本地路径，无法继续下载")),
+        };
+        if local_path.trim().is_empty() {
+            return Ok(ApiResponse::error("缺少本地路径，无法继续下载"));
+        }
+        let direct_url = match download_url {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => return Ok(ApiResponse::error("缺少下载链接，无法继续下载")),
+        };
+        if let Err(err) = parse_direct_download_url(&direct_url) {
+            return Ok(ApiResponse::error(err));
+        }
+        let resume_progress = progress.max(0).min(99);
+        let started = try_start_direct_download_job(
+            context.clone(),
+            task_id,
+            4,
+            direct_url,
+            PathBuf::from(local_path),
+            Some(resume_progress),
+        )?;
+        let message = if started {
+            "Resume started"
+        } else {
+            let _ = update_download_status_only(&context, task_id, 0);
+            "Resume queued"
+        };
+        schedule_pending_downloads(context.clone()).await;
+        return Ok(ApiResponse::success(message.to_string()));
+    }
 
     if status == 1 {
         return Ok(ApiResponse::error("任务正在下载"));
@@ -803,6 +987,18 @@ pub async fn download_resume(
     Ok(ApiResponse::success(message.to_string()))
 }
 
+#[tauri::command]
+pub async fn download_direct_duration(url: String) -> Result<ApiResponse<i64>, String> {
+    let url = match parse_direct_download_url(&url) {
+        Ok(value) => value,
+        Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    match probe_direct_url_duration(url.as_str()).await {
+        Ok(duration) => Ok(ApiResponse::success(duration)),
+        Err(err) => Ok(ApiResponse::error(err)),
+    }
+}
+
 pub async fn requeue_integrated_downloads(
     state: &State<'_, AppState>,
     download_ids: &[i64],
@@ -823,7 +1019,7 @@ async fn requeue_download_record(context: &DownloadContext, record_id: i64) -> R
         .db
         .with_conn(|conn| {
             conn.query_row(
-        "SELECT bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status \
+        "SELECT bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status, source_type, download_url \
          FROM video_download WHERE id = ?1",
         [record_id],
         |row| {
@@ -838,16 +1034,64 @@ async fn requeue_download_record(context: &DownloadContext, record_id: i64) -> R
             row.get::<_, Option<i64>>(7)?,
             row.get::<_, Option<String>>(8)?,
             row.get::<_, i64>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
           ))
         },
       )
         })
         .map_err(|err| format!("读取下载任务失败: {}", err))?;
 
-    let (bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status) =
-        record;
+    let (
+        bvid,
+        aid,
+        part_title,
+        local_path,
+        resolution,
+        codec,
+        format,
+        cid,
+        content,
+        status,
+        source_type,
+        download_url,
+    ) = record;
+    let source_type = source_type
+        .unwrap_or_else(|| DOWNLOAD_SOURCE_BILIBILI.to_string())
+        .to_ascii_uppercase();
 
     if status == 1 || status == 0 {
+        return Ok(());
+    }
+
+    if source_type == DOWNLOAD_SOURCE_DIRECT {
+        let local_path = match local_path {
+            Some(value) => resolve_runtime_local_path(context.db.as_ref(), &value),
+            None => return Err("缺少本地路径，无法重新下载".to_string()),
+        };
+        if local_path.trim().is_empty() {
+            return Err("缺少本地路径，无法重新下载".to_string());
+        }
+        let direct_url = match download_url {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => return Err("缺少下载链接，无法重新下载".to_string()),
+        };
+        parse_direct_download_url(&direct_url)?;
+        let _ = reset_integrated_submission_status(context, record_id);
+        cleanup_download_outputs(&PathBuf::from(&local_path));
+        reset_download_record_progress(context, record_id)?;
+        clear_download_progress(context, record_id);
+        let started = try_start_direct_download_job(
+            context.clone(),
+            record_id,
+            0,
+            direct_url,
+            PathBuf::from(local_path),
+            None,
+        )?;
+        if !started {
+            let _ = update_download_status_only(context, record_id, 0);
+        }
         return Ok(());
     }
 
@@ -1083,7 +1327,10 @@ async fn handle_integration_download(
         for record in &download_results {
             path_by_cid.insert(record.cid, record.actual_path.clone());
             if record.expected_path != record.actual_path {
-                path_by_expected.insert(record.expected_path.clone(), record.actual_path.clone());
+                path_by_expected.insert(
+                    normalize_local_path_key(&record.expected_path),
+                    record.actual_path.clone(),
+                );
             }
         }
         for part in submission.video_parts.iter_mut() {
@@ -1093,24 +1340,56 @@ async fn handle_integration_download(
                     continue;
                 }
             }
-            if let Some(actual_path) = path_by_expected.get(&part.file_path) {
+            let file_path_key = normalize_local_path_key(&part.file_path);
+            if let Some(actual_path) = path_by_expected.get(&file_path_key) {
                 part.file_path = actual_path.clone();
             }
         }
     }
+    let mut record_id_by_actual_path: HashMap<String, i64> = HashMap::new();
+    let mut duration_by_actual_path: HashMap<String, i64> = HashMap::new();
+    for record in &download_results {
+        let path_key = normalize_local_path_key(&record.actual_path);
+        record_id_by_actual_path.insert(path_key.clone(), record.id);
+        if let Some(duration) = record.duration.filter(|value| *value > 0) {
+            duration_by_actual_path.insert(path_key, duration);
+        }
+    }
 
-    let mut source_remote_meta_by_cid: HashMap<i64, (Option<String>, Option<i64>, Option<String>)> =
-        HashMap::new();
+    let mut source_remote_meta_by_record_id: HashMap<
+        i64,
+        (Option<String>, Option<i64>, Option<String>, Option<String>),
+    > = HashMap::new();
+    let mut source_remote_meta_by_cid: HashMap<
+        i64,
+        (Option<String>, Option<i64>, Option<String>, Option<String>),
+    > = HashMap::new();
     if !download_results.is_empty() {
         let load_meta_result = context.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT cid, bvid, aid, part_title FROM video_download WHERE id = ?1 LIMIT 1",
+                "SELECT id, cid, bvid, aid, part_title, download_url, source_type FROM video_download WHERE id = ?1 LIMIT 1",
             )?;
             let mut rows = Vec::new();
             for record in &download_results {
-                let row: Option<(Option<i64>, Option<String>, Option<String>, Option<String>)> =
+                let row: Option<(
+                    i64,
+                    Option<i64>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )> =
                     stmt.query_row([record.id], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
                     })
                     .optional()?;
                 if let Some(value) = row {
@@ -1120,12 +1399,23 @@ async fn handle_integration_download(
             Ok(rows)
         });
         if let Ok(rows) = load_meta_result {
-            for (cid, bvid, aid, part_title) in rows {
-                let Some(cid) = cid else {
-                    continue;
-                };
+            for (record_id, cid, bvid, aid, part_title, download_url, source_type) in rows {
                 let aid = aid.and_then(|value| value.trim().parse::<i64>().ok());
-                source_remote_meta_by_cid.insert(cid, (bvid, aid, part_title));
+                let remote_video_url = if source_type
+                    .as_deref()
+                    .map(|value| value.eq_ignore_ascii_case(DOWNLOAD_SOURCE_DIRECT))
+                    .unwrap_or(false)
+                {
+                    download_url
+                } else {
+                    bvid.as_ref()
+                        .map(|value| format!("https://www.bilibili.com/video/{}", value))
+                };
+                let remote_meta = (bvid, aid, part_title, remote_video_url);
+                source_remote_meta_by_record_id.insert(record_id, remote_meta.clone());
+                if let Some(cid) = cid {
+                    source_remote_meta_by_cid.insert(cid, remote_meta);
+                }
             }
         }
     }
@@ -1173,9 +1463,16 @@ async fn handle_integration_download(
       let part_id = uuid::Uuid::new_v4().to_string();
       let stored_file_path =
         to_stored_local_path_with_prefix(local_path_prefix.as_path(), &part.file_path);
-      let remote_meta = part
-        .cid
-        .and_then(|cid| source_remote_meta_by_cid.get(&cid).cloned());
+      let file_path_key = normalize_local_path_key(&part.file_path);
+      let record_id = record_id_by_actual_path.get(&file_path_key).copied();
+      let fallback_end_time = duration_by_actual_path
+        .get(&file_path_key)
+        .filter(|duration| **duration > 0 && is_empty_or_zero_time(part.end_time.as_deref()))
+        .map(|duration| format_duration_hms(*duration));
+      let end_time = fallback_end_time.or(part.end_time);
+      let remote_meta = record_id
+        .and_then(|record_id| source_remote_meta_by_record_id.get(&record_id).cloned())
+        .or_else(|| part.cid.and_then(|cid| source_remote_meta_by_cid.get(&cid).cloned()));
       let remote_bvid = remote_meta.as_ref().and_then(|value| value.0.clone());
       let remote_aid = remote_meta.as_ref().and_then(|value| value.1);
       let remote_part_title = remote_meta
@@ -1189,8 +1486,7 @@ async fn handle_integration_download(
             Some(title)
           }
         });
-      let remote_video_url =
-        remote_bvid.as_ref().map(|value| format!("https://www.bilibili.com/video/{}", value));
+      let remote_video_url = remote_meta.as_ref().and_then(|value| value.3.clone());
       conn.execute(
         "INSERT INTO task_source_video (id, task_id, source_file_path, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, sort_order, start_time, end_time) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -1205,7 +1501,7 @@ async fn handle_integration_download(
           remote_part_title.as_deref(),
           (index + 1) as i64,
           part.start_time,
-          part.end_time,
+          end_time,
         ),
       )?;
     }
@@ -1281,6 +1577,11 @@ async fn create_download_tasks(
     context: DownloadContext,
     request: DownloadRequest,
 ) -> Result<Vec<DownloadTaskCreateResult>, String> {
+    let source_type = normalize_download_source_type(request.source_type.as_deref());
+    if is_direct_download_source(&source_type) {
+        return create_direct_download_tasks(context, request).await;
+    }
+
     let (bvid, aid) = parse_video_id(&request.video_url);
     let video_title = fetch_video_title(&context, bvid.as_deref(), aid.as_deref()).await;
 
@@ -1321,6 +1622,7 @@ async fn create_download_tasks(
             Some(part.cid),
             request.video_url.as_str(),
             part.title.as_str(),
+            DOWNLOAD_SOURCE_BILIBILI,
         )? {
             let actual_path_buf = PathBuf::from(&actual_path);
             let has_file = actual_path_buf.is_file();
@@ -1331,6 +1633,7 @@ async fn create_download_tasks(
                     cid: part.cid,
                     expected_path,
                     actual_path,
+                    duration: part.duration,
                 });
                 continue;
             }
@@ -1375,6 +1678,7 @@ async fn create_download_tasks(
             cid: part.cid,
             expected_path,
             actual_path,
+            duration: part.duration,
         });
     }
 
@@ -1385,11 +1689,114 @@ async fn create_download_tasks(
     Ok(record_ids)
 }
 
+async fn create_direct_download_tasks(
+    context: DownloadContext,
+    request: DownloadRequest,
+) -> Result<Vec<DownloadTaskCreateResult>, String> {
+    let url = parse_direct_download_url(&request.video_url)?;
+    let url_value = url.as_str().to_string();
+    let source_file_name = direct_url_file_name(&url);
+    let title = direct_url_title(&url);
+    let duration = request
+        .parts
+        .first()
+        .and_then(|part| part.duration)
+        .filter(|value| *value > 0);
+    let duration = match duration {
+        Some(value) => Some(value),
+        None => probe_direct_url_duration(&url_value).await.ok(),
+    };
+    let folder_name = request
+        .config
+        .download_name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| title.clone());
+    let sanitized_folder = sanitize_filename(&folder_name);
+    let part_title = request
+        .parts
+        .first()
+        .map(|part| part.title.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| title.clone());
+    let extension = extension_from_file_name(&source_file_name);
+    let file_name = format!("{}.{}", sanitize_filename(&part_title), extension);
+    let now = now_rfc3339();
+    let settings = load_download_settings_from_db(&context.db)
+        .map_err(|err| format!("Failed to load download settings: {}", err))?;
+    let storage_prefix = load_local_path_prefix(&context.db);
+    let base_dir = request
+        .config
+        .download_path
+        .clone()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| settings.download_path.clone());
+    let base_dir = if base_dir.trim().is_empty() {
+        default_download_dir().to_string_lossy().to_string()
+    } else {
+        base_dir
+    };
+    let output_path = build_output_path(&base_dir, &sanitized_folder, &file_name);
+    let expected_path = output_path.to_string_lossy().to_string();
+
+    if let Some((record_id, actual_path, status)) =
+        find_reusable_download_record(&context, None, &url_value, &part_title, DOWNLOAD_SOURCE_DIRECT)?
+    {
+        let actual_path_buf = PathBuf::from(&actual_path);
+        let has_file = actual_path_buf.is_file();
+        let can_reuse = status == 0 || status == 1 || status == 3 || status == 4;
+        if can_reuse || (status == 2 && has_file) {
+            return Ok(vec![DownloadTaskCreateResult {
+                id: record_id,
+                cid: 0,
+                expected_path,
+                actual_path,
+                duration,
+            }]);
+        }
+    }
+
+    let output_path = resolve_unique_output_path(&context, output_path)?;
+    let actual_path = output_path.to_string_lossy().to_string();
+    let stored_actual_path =
+        to_stored_local_path_with_prefix(storage_prefix.as_path(), actual_path.as_str());
+    let record_id = context
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+          "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, progress_total, progress_done, create_time, update_time, resolution, codec, format, cid, content, source_type) \
+           VALUES (NULL, NULL, ?1, ?2, 1, 1, ?3, ?4, 0, 0, 0, 0, ?5, ?6, NULL, NULL, ?7, 0, NULL, ?8)",
+          (
+            title.as_str(),
+            part_title.as_str(),
+            url_value.as_str(),
+            stored_actual_path.as_str(),
+            &now,
+            &now,
+            extension.as_str(),
+            DOWNLOAD_SOURCE_DIRECT,
+          ),
+        )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .map_err(|err| format!("Failed to save direct download record: {}", err))?;
+
+    schedule_pending_downloads(context.clone()).await;
+    Ok(vec![DownloadTaskCreateResult {
+        id: record_id,
+        cid: 0,
+        expected_path,
+        actual_path,
+        duration,
+    }])
+}
+
 fn find_reusable_download_record(
     context: &DownloadContext,
     cid: Option<i64>,
     download_url: &str,
     part_title: &str,
+    source_type: &str,
 ) -> Result<Option<(i64, String, i64)>, String> {
     let storage_prefix = load_local_path_prefix(context.db.as_ref());
     context
@@ -1410,7 +1817,7 @@ fn find_reusable_download_record(
         let mut stmt = conn.prepare(
           "SELECT id, local_path, status FROM video_download WHERE download_url = ?1 AND part_title = ?2 AND source_type = ?3 ORDER BY id DESC",
         )?;
-        let rows = stmt.query_map((download_url, part_title, DOWNLOAD_SOURCE_BILIBILI), |row| {
+        let rows = stmt.query_map((download_url, part_title, source_type), |row| {
           Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         for row in rows {
@@ -1632,6 +2039,53 @@ fn start_pending_download(
             PathBuf::from(local_path),
         );
     }
+    if source_type == DOWNLOAD_SOURCE_DIRECT {
+        let download_url = match record.download_url {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => {
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "download_schedule_invalid record_id={} reason=missing_direct_url",
+                        record.id
+                    ),
+                );
+                let _ = update_download_status(&context, record.id, 3, 0);
+                let context_clone = context.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = refresh_integration_status(&context_clone, record.id).await;
+                });
+                return Ok(false);
+            }
+        };
+        if let Err(err) = parse_direct_download_url(&download_url) {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "download_schedule_invalid record_id={} reason=invalid_direct_url err={}",
+                    record.id, err
+                ),
+            );
+            let _ = update_download_status(&context, record.id, 3, 0);
+            let context_clone = context.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = refresh_integration_status(&context_clone, record.id).await;
+            });
+            return Ok(false);
+        }
+        return try_start_direct_download_job(
+            context,
+            record.id,
+            0,
+            download_url,
+            PathBuf::from(local_path),
+            if resume_progress > 0 {
+                Some(resume_progress.min(99))
+            } else {
+                None
+            },
+        );
+    }
     let cid = match record.cid {
         Some(value) => value,
         None => {
@@ -1736,6 +2190,37 @@ fn try_start_baidu_download_job(
     let context_clone = context.clone();
     tauri::async_runtime::spawn(async move {
         run_baidu_download_job(context_clone, record_id, remote_path, output_path).await;
+    });
+
+    Ok(true)
+}
+
+fn try_start_direct_download_job(
+    context: DownloadContext,
+    record_id: i64,
+    expected_status: i64,
+    download_url: String,
+    output_path: PathBuf,
+    resume_progress: Option<i64>,
+) -> Result<bool, String> {
+    if !try_acquire_download_slot(&context)? {
+        return Ok(false);
+    }
+    if !mark_download_running(&context, record_id, expected_status)? {
+        release_download_slot(&context);
+        return Ok(false);
+    }
+
+    let context_clone = context.clone();
+    tauri::async_runtime::spawn(async move {
+        run_direct_download_job(
+            context_clone,
+            record_id,
+            download_url,
+            output_path,
+            resume_progress,
+        )
+        .await;
     });
 
     Ok(true)
@@ -2076,6 +2561,68 @@ async fn run_baidu_download_job(
                 ),
             );
             let _ = handle_baidu_restore_after_download(&context, record_id).await;
+        }
+    }
+}
+
+async fn run_direct_download_job(
+    context: DownloadContext,
+    record_id: i64,
+    download_url: String,
+    output_path: PathBuf,
+    resume_progress: Option<i64>,
+) {
+    clear_download_progress(&context, record_id);
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "direct_download_job_start record_id={} url={}",
+            record_id, download_url
+        ),
+    );
+    let result =
+        download_direct_url(&context, record_id, &download_url, &output_path, resume_progress).await;
+    release_download_slot(&context);
+    let context_clone = context.clone();
+    tauri::async_runtime::spawn(async move {
+        schedule_pending_downloads(context_clone).await;
+    });
+    match result {
+        Ok(()) => {
+            let _ = update_download_status(&context, record_id, 2, 100);
+            clear_download_progress(&context, record_id);
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "direct_download_job_complete record_id={} status=completed",
+                    record_id
+                ),
+            );
+            let _ = refresh_integration_status(&context, record_id).await;
+        }
+        Err(err) => {
+            if is_resume_error(&err) {
+                let _ = update_download_status_only(&context, record_id, 4);
+                clear_download_progress(&context, record_id);
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "direct_download_job_complete record_id={} status=paused err={}",
+                        record_id, err
+                    ),
+                );
+            } else {
+                let _ = update_download_status(&context, record_id, 3, 0);
+                clear_download_progress(&context, record_id);
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "direct_download_job_complete record_id={} status=failed err={}",
+                        record_id, err
+                    ),
+                );
+            }
+            let _ = refresh_integration_status(&context, record_id).await;
         }
     }
 }
@@ -2832,6 +3379,132 @@ async fn download_part(
     }
 }
 
+async fn fetch_direct_content_length(url: &str) -> Option<u64> {
+    let url = url.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .ok()?
+            .head(url)
+            .send()
+            .ok()?
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse::<u64>()
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn probe_direct_url_duration(url: &str) -> Result<i64, String> {
+    parse_direct_download_url(url)?;
+    let url = url.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let args = vec![
+            "-v".to_string(),
+            "error".to_string(),
+            "-show_entries".to_string(),
+            "format=duration:stream=duration".to_string(),
+            "-of".to_string(),
+            "json".to_string(),
+            url,
+        ];
+        let data = run_ffprobe_json(&args)?;
+        extract_probe_duration_seconds(&data)
+            .ok_or_else(|| "无法获取第三方视频时长".to_string())
+    })
+    .await
+    .map_err(|err| format!("获取第三方视频时长失败: {}", err))?
+}
+
+async fn download_direct_url(
+    context: &DownloadContext,
+    record_id: i64,
+    download_url: &str,
+    output_path: &Path,
+    resume_progress: Option<i64>,
+) -> Result<(), String> {
+    parse_direct_download_url(download_url)?;
+    let settings = load_download_settings_from_db(&context.db)
+        .map_err(|err| format!("Failed to load download settings: {}", err))?;
+    let enable_aria2c = settings.enable_aria2c;
+    let aria2c_connections = settings.aria2c_connections.max(1).min(32);
+    let aria2c_split = settings.aria2c_split.max(1).min(32);
+    let min_progress = resume_progress
+        .filter(|value| *value > 0)
+        .map(|value| value.min(99));
+    let total_size = fetch_direct_content_length(download_url).await.unwrap_or(0);
+    let track_progress = total_size > 0 || enable_aria2c;
+    let header = String::new();
+    let urls = vec![download_url.to_string()];
+
+    if enable_aria2c {
+        if let Err(err) = download_with_aria2c(
+            context,
+            record_id,
+            track_progress,
+            output_path,
+            &urls,
+            &header,
+            aria2c_connections,
+            aria2c_split,
+            "main",
+        )
+        .await
+        {
+            if should_pause_for_aria2c_resume(&err, output_path) {
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "aria2c_resume_pending record_id={} output={}",
+                        record_id,
+                        output_path.to_string_lossy()
+                    ),
+                );
+                return Err("aria2c下载中断，可重试续传".to_string());
+            }
+            cleanup_aria2c_resume_artifacts(output_path);
+            append_log(
+                &context.app_log_path,
+                &format!("direct_aria2c_fallback record_id={} err={}", record_id, err),
+            );
+        } else {
+            return Ok(());
+        }
+    }
+
+    let mut args = Vec::new();
+    args.push("-i".to_string());
+    args.push(download_url.to_string());
+    args.extend(["-c".to_string(), "copy".to_string()]);
+    if output_path.extension().and_then(|value| value.to_str()) == Some("mp4") {
+        args.push("-movflags".to_string());
+        args.push("+faststart".to_string());
+    }
+    if track_progress {
+        args.push("-progress".to_string());
+        args.push("pipe:1".to_string());
+        args.push("-nostats".to_string());
+    }
+    args.push(output_path.to_string_lossy().to_string());
+    run_ffmpeg_job(
+        context,
+        record_id,
+        track_progress,
+        None,
+        min_progress,
+        "direct",
+        output_path,
+        args,
+    )
+    .await
+}
+
 async fn run_ffmpeg_job(
     context: &DownloadContext,
     record_id: i64,
@@ -3567,6 +4240,37 @@ fn extract_play_duration_seconds(play_info: &Value) -> Option<i64> {
         }
     }
     None
+}
+
+fn json_duration_seconds(value: &Value) -> Option<i64> {
+    let duration = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|item| item.parse::<f64>().ok()))?;
+    if duration.is_finite() && duration > 0.0 {
+        Some(duration.ceil() as i64)
+    } else {
+        None
+    }
+}
+
+fn extract_probe_duration_seconds(data: &Value) -> Option<i64> {
+    data.get("format")
+        .and_then(|value| value.get("duration"))
+        .and_then(json_duration_seconds)
+        .or_else(|| {
+            data.get("streams")
+                .and_then(|value| value.as_array())
+                .and_then(|streams| {
+                    streams
+                        .iter()
+                        .filter_map(|stream| {
+                            stream
+                                .get("duration")
+                                .and_then(json_duration_seconds)
+                        })
+                        .max()
+                })
+        })
 }
 
 fn candidate_codec_matches(candidate: &StreamCandidate, codec: &str) -> bool {

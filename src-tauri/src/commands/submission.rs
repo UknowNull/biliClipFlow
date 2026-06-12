@@ -8043,6 +8043,7 @@ pub async fn submission_edit_add_segment(
             &client,
             &auth,
             &task_id_for_upload,
+            None,
             &segment_id_clone,
             upload_context_clone.app_log_path.as_ref(),
             UPLOAD_SEGMENT_RETRY_LIMIT,
@@ -8186,6 +8187,7 @@ pub async fn submission_edit_reupload_segment(
             &client,
             &auth,
             &task_id_for_upload,
+            None,
             &segment_id_clone,
             upload_context_clone.app_log_path.as_ref(),
             UPLOAD_SEGMENT_RETRY_LIMIT,
@@ -9470,6 +9472,7 @@ pub async fn submission_retry_segment_upload(
         &client,
         &auth,
         &segment.task_id,
+        None,
         &segment_id,
         upload_context.app_log_path.as_ref(),
         UPLOAD_SEGMENT_RETRY_LIMIT,
@@ -13825,6 +13828,10 @@ fn is_retryable_submission_error(err: &str) -> bool {
         || cn_keywords.iter().any(|keyword| err.contains(keyword))
 }
 
+fn is_workflow_superseded_error(err: &str) -> bool {
+    err == "WORKFLOW_SUPERSEDED"
+}
+
 fn is_already_submitted_submission_error(err: &str) -> bool {
     err.contains("稿件已成功投稿，请勿重新提交")
         || err.contains("同一视频不能重复投稿")
@@ -14371,6 +14378,7 @@ async fn upload_output_segments_with_worker_pool(
     client: &Client,
     auth: &AuthInfo,
     task_id: &str,
+    workflow_instance_id: Option<String>,
     upload_concurrency: usize,
     is_update_workflow: bool,
 ) -> Result<Vec<UploadedVideoPart>, String> {
@@ -14423,6 +14431,7 @@ async fn upload_output_segments_with_worker_pool(
             let auth_clone = auth.clone();
             let log_path = submission_context.app_log_path.clone();
             let task_id_clone = task_id.to_string();
+            let workflow_instance_id_clone = workflow_instance_id.clone();
             active_uploads.push(async move {
                 let result = upload_segment_with_retry(
                     &context_clone,
@@ -14430,6 +14439,7 @@ async fn upload_output_segments_with_worker_pool(
                     &client_clone,
                     &auth_clone,
                     &task_id_clone,
+                    workflow_instance_id_clone.as_deref(),
                     &segment_id,
                     log_path.as_ref(),
                     UPLOAD_SEGMENT_RETRY_LIMIT,
@@ -14507,6 +14517,8 @@ async fn run_submission_upload(context: UploadContext, task_id: String) -> Resul
         edit_upload_state: context.edit_upload_state.clone(),
         local_path_prefix: load_local_path_prefix(context.db.as_ref()),
     };
+    let workflow_instance_id = load_latest_workflow_runtime(&submission_context, &task_id)?
+        .map(|(instance_id, _, _)| instance_id);
 
     let mut auth =
         match load_auth_or_refresh_for_task(&context, &task_id, "submission_upload").await {
@@ -14630,6 +14642,7 @@ async fn run_submission_upload(context: UploadContext, task_id: String) -> Resul
             &client,
             &auth,
             &task_id,
+            workflow_instance_id.clone(),
             upload_concurrency,
             is_update_workflow,
         )
@@ -14637,6 +14650,17 @@ async fn run_submission_upload(context: UploadContext, task_id: String) -> Resul
         {
             Ok(parts) => parts,
             Err(err) => {
+                if is_workflow_superseded_error(&err) {
+                    append_log(
+                        &context.app_log_path,
+                        &format!(
+                            "submission_upload_skip_superseded task_id={} instance_id={}",
+                            task_id,
+                            workflow_instance_id.as_deref().unwrap_or("")
+                        ),
+                    );
+                    return Ok(());
+                }
                 update_submission_status_with_reason(
                     &submission_context,
                     &task_id,
@@ -15148,6 +15172,13 @@ async fn process_submission_queue_task(
         match result {
             Ok(()) => break,
             Err(err) => {
+                if is_workflow_superseded_error(&err) {
+                    append_log(
+                        &context.app_log_path,
+                        &format!("submission_queue_upload_skip_superseded task_id={}", task_id),
+                    );
+                    break;
+                }
                 append_log(
                     &context.app_log_path,
                     &format!(
@@ -16060,6 +16091,7 @@ async fn upload_segment_with_retry(
     client: &Client,
     auth: &AuthInfo,
     task_id: &str,
+    workflow_instance_id: Option<&str>,
     segment_id: &str,
     log_path: &PathBuf,
     max_retries: u32,
@@ -16068,11 +16100,55 @@ async fn upload_segment_with_retry(
     let mut current_auth = auth.clone();
     loop {
         attempt = attempt.saturating_add(1);
-        let segment = load_output_segment_by_id(context, segment_id)?
-            .ok_or_else(|| "分段不存在".to_string())?;
+        let segment = match load_output_segment_by_id(context, segment_id)? {
+            Some(segment) => segment,
+            None => {
+                if workflow_instance_id
+                    .map(|id| is_workflow_instance_latest(context, task_id, id))
+                    .transpose()?
+                    .unwrap_or(true)
+                {
+                    return Err("分段不存在".to_string());
+                }
+                append_log(
+                    log_path,
+                    &format!(
+                        "submission_segment_superseded task_id={} segment_id={} reason=missing_record",
+                        task_id, segment_id
+                    ),
+                );
+                return Err("WORKFLOW_SUPERSEDED".to_string());
+            }
+        };
         let path = Path::new(&segment.segment_file_path);
         if segment.segment_file_path.trim().is_empty() || !path.exists() {
-            return Err("分段文件不存在".to_string());
+            if workflow_instance_id
+                .map(|id| is_workflow_instance_latest(context, task_id, id))
+                .transpose()?
+                .unwrap_or(true)
+            {
+                return Err("分段文件不存在".to_string());
+            }
+            append_log(
+                log_path,
+                &format!(
+                    "submission_segment_superseded task_id={} segment_id={} reason=missing_file path={}",
+                    task_id, segment_id, segment.segment_file_path
+                ),
+            );
+            return Err("WORKFLOW_SUPERSEDED".to_string());
+        }
+        if let Some(workflow_instance_id) = workflow_instance_id {
+            if !is_workflow_instance_latest(context, task_id, workflow_instance_id)? {
+                append_log(
+                    log_path,
+                    &format!(
+                        "submission_segment_superseded task_id={} segment_id={} reason=workflow_changed instance_id={}",
+                        task_id, segment_id, workflow_instance_id
+                    ),
+                );
+                return Err("WORKFLOW_SUPERSEDED".to_string());
+            }
         }
 
         let target = UploadTarget::Segment(segment.segment_id.clone());
@@ -16133,6 +16209,7 @@ async fn upload_edit_segment_with_retry(
     client: &Client,
     auth: &AuthInfo,
     task_id: &str,
+    workflow_instance_id: Option<&str>,
     segment_id: &str,
     log_path: &PathBuf,
     max_retries: u32,
@@ -16141,11 +16218,55 @@ async fn upload_edit_segment_with_retry(
     let mut current_auth = auth.clone();
     loop {
         attempt = attempt.saturating_add(1);
-        let segment = load_edit_upload_segment(context, segment_id)?
-            .ok_or_else(|| "分段不存在".to_string())?;
+        let segment = match load_edit_upload_segment(context, segment_id)? {
+            Some(segment) => segment,
+            None => {
+                if workflow_instance_id
+                    .map(|id| is_workflow_instance_latest(context, task_id, id))
+                    .transpose()?
+                    .unwrap_or(true)
+                {
+                    return Err("分段不存在".to_string());
+                }
+                append_log(
+                    log_path,
+                    &format!(
+                        "submission_edit_segment_superseded task_id={} segment_id={} reason=missing_record",
+                        task_id, segment_id
+                    ),
+                );
+                return Err("WORKFLOW_SUPERSEDED".to_string());
+            }
+        };
         let path = Path::new(&segment.segment_file_path);
         if segment.segment_file_path.trim().is_empty() || !path.exists() {
-            return Err("分段文件不存在".to_string());
+            if workflow_instance_id
+                .map(|id| is_workflow_instance_latest(context, task_id, id))
+                .transpose()?
+                .unwrap_or(true)
+            {
+                return Err("分段文件不存在".to_string());
+            }
+            append_log(
+                log_path,
+                &format!(
+                    "submission_edit_segment_superseded task_id={} segment_id={} reason=missing_file path={}",
+                    task_id, segment_id, segment.segment_file_path
+                ),
+            );
+            return Err("WORKFLOW_SUPERSEDED".to_string());
+        }
+        if let Some(workflow_instance_id) = workflow_instance_id {
+            if !is_workflow_instance_latest(context, task_id, workflow_instance_id)? {
+                append_log(
+                    log_path,
+                    &format!(
+                        "submission_edit_segment_superseded task_id={} segment_id={} reason=workflow_changed instance_id={}",
+                        task_id, segment_id, workflow_instance_id
+                    ),
+                );
+                return Err("WORKFLOW_SUPERSEDED".to_string());
+            }
         }
 
         let target = UploadTarget::EditSegment(segment.segment_id.clone());
@@ -19052,17 +19173,49 @@ fn count_incomplete_segments(context: &SubmissionContext, task_id: &str) -> Resu
     .map_err(|err| err.to_string())
 }
 
+fn count_segments_by_upload_status(
+    context: &SubmissionContext,
+    task_id: &str,
+    upload_status: &str,
+) -> Result<i64, String> {
+    context
+        .db
+        .with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM task_output_segment WHERE task_id = ?1 AND upload_status = ?2",
+                (task_id, upload_status),
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+        .map_err(|err| err.to_string())
+}
+
 fn enqueue_submission_after_segment_retry(
     context: &SubmissionContext,
     task_id: &str,
 ) -> Result<bool, String> {
     let remaining = count_incomplete_segments(context, task_id)?;
     if remaining > 0 {
+        let status = load_task_status(context, task_id)?;
+        let failed_segments = count_segments_by_upload_status(context, task_id, "FAILED")?;
+        if status == "FAILED" && failed_segments == 0 {
+            update_submission_status(context, task_id, "WAITING_UPLOAD")?;
+            update_workflow_status(context, task_id, "COMPLETED", None, 100.0)?;
+            append_log(
+                context.app_log_path.as_ref(),
+                &format!(
+                    "submission_retry_segment_enqueue_continue task_id={} remaining={}",
+                    task_id, remaining
+                ),
+            );
+            return Ok(true);
+        }
         append_log(
             context.app_log_path.as_ref(),
             &format!(
-                "submission_retry_segment_enqueue_skip task_id={} reason=incomplete_segments remaining={}",
-                task_id, remaining
+                "submission_retry_segment_enqueue_skip task_id={} reason=incomplete_segments remaining={} failed_segments={} status={}",
+                task_id, remaining, failed_segments, status
             ),
         );
         return Ok(false);

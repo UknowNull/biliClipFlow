@@ -247,6 +247,7 @@ pub fn run() {
             commands::download::download_delete,
             commands::download::download_retry,
             commands::download::download_resume,
+            commands::download::download_direct_duration,
             commands::process::process_create,
             commands::process::process_status,
             commands::toolbox::toolbox_remux,

@@ -54,6 +54,8 @@ const fallbackFormats = [
   { value: "mp4", label: "MP4" },
 ];
 
+const DIRECT_SOURCE_TYPE = "DIRECT";
+
 const formatDurationHms = (seconds) => {
   const totalSeconds = Math.max(0, Math.floor(seconds || 0));
   const hrs = Math.floor(totalSeconds / 3600);
@@ -111,6 +113,31 @@ const buildVideoKey = (bvid, aid, index) => {
   return `input-${index}`;
 };
 
+const isHttpUrl = (value) => /^https?:\/\//i.test(String(value || "").trim());
+
+const parseDirectVideoUrl = (raw) => {
+  const value = String(raw || "").trim();
+  if (!isHttpUrl(value)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    const pathname = decodeURIComponent(parsed.pathname || "");
+    const fileName = pathname.split("/").filter(Boolean).pop() || "download.mp4";
+    const dotIndex = fileName.lastIndexOf(".");
+    const title = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+    const extension = dotIndex > 0 ? fileName.slice(dotIndex + 1).toLowerCase() : "mp4";
+    return {
+      url: value,
+      title: title || "第三方视频",
+      fileName,
+      extension,
+    };
+  } catch (_) {
+    return null;
+  }
+};
+
 const buildPartKey = (videoKey, cid) => {
   return `${videoKey}:${cid}`;
 };
@@ -151,14 +178,29 @@ const extractVideoInputs = (input) => {
   if (!input) {
     return [];
   }
-  const matches = Array.from(input.matchAll(/BV[0-9A-Za-z]+|av\d+/gi), (item) => item[0]);
-  if (matches.length > 0) {
-    return matches;
-  }
-  return input
+  const tokens = input
     .split(/[\s,，;；]+/)
     .map((item) => item.trim())
     .filter(Boolean);
+  const result = [];
+  tokens.forEach((token) => {
+    if (isHttpUrl(token)) {
+      const { bvid, aid } = parseVideoInput(token);
+      if (bvid || aid) {
+        result.push(bvid || `av${aid}`);
+      } else {
+        result.push(token);
+      }
+      return;
+    }
+    const matches = Array.from(token.matchAll(/BV[0-9A-Za-z]+|av\d+/gi), (item) => item[0]);
+    if (matches.length > 0) {
+      result.push(...matches);
+    } else {
+      result.push(token);
+    }
+  });
+  return result;
 };
 
 export default function DownloadSection({
@@ -251,6 +293,7 @@ export default function DownloadSection({
         ...part,
         videoKey: item.key,
         videoTitle: item.info?.title || "未知视频",
+        sourceType: item.sourceType || "BILIBILI",
       })),
     );
   }, [videoItems]);
@@ -261,6 +304,7 @@ export default function DownloadSection({
         ...part,
         videoKey: item.key,
         videoTitle: item.info?.title || "未知视频",
+        sourceType: item.sourceType || "BILIBILI",
       })),
     );
   }, [videoItems]);
@@ -273,6 +317,13 @@ export default function DownloadSection({
   const hasVideo = videoItems.length > 0;
   const hasSelection = selectedCount > 0;
   const isMultiVideo = videoItems.length > 1;
+  const hasDirectSelection = selectedVideoItems.some(
+    (item) => item.sourceType === DIRECT_SOURCE_TYPE,
+  );
+  const hasBilibiliSelection = selectedVideoItems.some(
+    (item) => (item.sourceType || "BILIBILI") !== DIRECT_SOURCE_TYPE,
+  );
+  const hasMixedSourceSelection = hasDirectSelection && hasBilibiliSelection;
   const allVideosSelected =
     hasVideo &&
     videoItems.every(
@@ -781,13 +832,32 @@ export default function DownloadSection({
     }
   };
 
+  const fetchDirectDuration = async (url) => {
+    try {
+      const duration = await invokeCommand("download_direct_duration", { url });
+      const seconds = Number(duration);
+      return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+    } catch (_) {
+      return 0;
+    }
+  };
+
   const handleSearch = async () => {
     const rawInputs = extractVideoInputs(searchInput);
     const parsedInputs = [];
+    const directInputs = [];
     const seen = new Set();
     rawInputs.forEach((raw, index) => {
       const { bvid, aid } = parseVideoInput(raw);
       if (!bvid && !aid) {
+        const direct = parseDirectVideoUrl(raw);
+        if (direct) {
+          const key = `${DIRECT_SOURCE_TYPE}:${direct.url}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            directInputs.push({ ...direct, key });
+          }
+        }
         return;
       }
       const key = buildVideoKey(bvid, aid, index);
@@ -797,8 +867,8 @@ export default function DownloadSection({
       seen.add(key);
       parsedInputs.push({ bvid, aid, key, raw });
     });
-    if (parsedInputs.length === 0) {
-      setMessage("请输入正确的 BV 号或 AV 号/链接");
+    if (parsedInputs.length === 0 && directInputs.length === 0) {
+      setMessage("请输入正确的 BV 号、AV 号、B站链接或第三方视频直链");
       return;
     }
     setSearching(true);
@@ -809,6 +879,34 @@ export default function DownloadSection({
     try {
       const nextItems = [];
       const errorMessages = [];
+      for (const input of directInputs) {
+        const duration = await fetchDirectDuration(input.url);
+        nextItems.push({
+          key: input.key,
+          input: input.url,
+          sourceType: DIRECT_SOURCE_TYPE,
+          bvid: "",
+          aid: "",
+          info: {
+            title: input.title,
+            desc: input.url,
+            owner: { name: "第三方直链" },
+          },
+          parts: [
+            {
+              cid: 0,
+              part: input.title,
+              duration,
+              sourceType: DIRECT_SOURCE_TYPE,
+              extension: input.extension,
+            },
+          ],
+          selectedParts: [],
+          selectedPartsConfig: [],
+          coverUrl: "",
+          avatarUrl: "",
+        });
+      }
       for (const input of parsedInputs) {
         try {
           const data = await invokeCommand("video_detail", { bvid: input.bvid, aid: input.aid });
@@ -847,7 +945,20 @@ export default function DownloadSection({
         }));
       }
       if (nextItems.length > 0 && nextItems[0].parts.length > 0) {
-        await loadPlayOptions(nextItems[0].info, nextItems[0].parts[0]);
+        if (nextItems[0].sourceType === DIRECT_SOURCE_TYPE) {
+          setAvailableResolutions([]);
+          setAvailableCodecs([]);
+          setAvailableFormats([{ value: "direct", label: "直链原文件" }]);
+          setDownloadConfig((prev) => ({
+            ...prev,
+            resolution: "",
+            codec: "",
+            format: "direct",
+            content: "audio_video",
+          }));
+        } else {
+          await loadPlayOptions(nextItems[0].info, nextItems[0].parts[0]);
+        }
       }
       if (errorMessages.length > 0) {
         setMessage(`部分视频获取失败：${errorMessages[0]}`);
@@ -866,7 +977,8 @@ export default function DownloadSection({
         ? item?.info?.title || "未知"
         : downloadConfig.downloadName || item?.info?.title || "未知",
     );
-    const fileName = `${sanitizeFilename(part.part)}.mp4`;
+    const extension = item?.sourceType === DIRECT_SOURCE_TYPE ? part.extension || "mp4" : "mp4";
+    const fileName = `${sanitizeFilename(part.part)}.${extension}`;
     if (!basePath) {
       return `${folderName}/${fileName}`;
     }
@@ -1295,6 +1407,7 @@ export default function DownloadSection({
       const downloadName = isMultiVideo ? null : downloadConfig.downloadName || null;
       const requests = selectedVideoItems.map((item) => ({
         videoUrl: item.input,
+        sourceType: item.sourceType || "BILIBILI",
         parts: item.selectedParts.map((part) => ({
           cid: part.cid,
           title: part.part,
@@ -1828,13 +1941,16 @@ export default function DownloadSection({
     if (selectedCount === 0) {
       return { valid: false, message: "请至少选择一个分P" };
     }
-    if (!downloadConfig.resolution) {
+    if (hasMixedSourceSelection) {
+      return { valid: false, message: "B站视频和第三方直链请分批下载或投稿" };
+    }
+    if (!hasDirectSelection && !downloadConfig.resolution) {
       return { valid: false, message: "请选择分辨率" };
     }
-    if (!downloadConfig.codec) {
+    if (!hasDirectSelection && !downloadConfig.codec) {
       return { valid: false, message: "请选择编码格式" };
     }
-    if (!downloadConfig.format) {
+    if (!hasDirectSelection && !downloadConfig.format) {
       return { valid: false, message: "请选择流媒体格式" };
     }
     if (!submissionConfig.title.trim()) {
@@ -1890,15 +2006,19 @@ export default function DownloadSection({
       setMessage("请至少选择一个分P");
       return false;
     }
-    if (!downloadConfig.resolution) {
+    if (hasMixedSourceSelection) {
+      setMessage("B站视频和第三方直链请分批下载或投稿");
+      return false;
+    }
+    if (!hasDirectSelection && !downloadConfig.resolution) {
       setMessage("请选择分辨率");
       return false;
     }
-    if (!downloadConfig.codec) {
+    if (!hasDirectSelection && !downloadConfig.codec) {
       setMessage("请选择编码格式");
       return false;
     }
-    if (!downloadConfig.format) {
+    if (!hasDirectSelection && !downloadConfig.format) {
       setMessage("请选择流媒体格式");
       return false;
     }
@@ -1941,6 +2061,7 @@ export default function DownloadSection({
       const downloadName = isMultiVideo ? null : downloadConfig.downloadName || null;
       const downloadRequests = selectedVideoItems.map((item) => ({
         videoUrl: item.input,
+        sourceType: item.sourceType || "BILIBILI",
         parts: item.selectedParts.map((part) => ({
           cid: part.cid,
           title: part.part,
@@ -2229,7 +2350,7 @@ export default function DownloadSection({
                         handleSearch();
                       }
                     }}
-                    placeholder="请输入 BV 号或视频链接，可用空格分隔多个"
+                    placeholder="请输入 BV 号、B站链接或第三方视频直链，可用空格分隔多个"
                     className="w-full"
                   />
                   <button
@@ -2470,74 +2591,80 @@ export default function DownloadSection({
                           }
                           className="w-full"
                         />
-                        <div className="grid gap-2">
-                          <select
-                            value={downloadConfig.resolution}
-                            onChange={(event) =>
-                              setDownloadConfig((prev) => ({
-                                ...prev,
-                                resolution: event.target.value,
-                              }))
-                            }
-                            className="w-full"
-                          >
-                            <option value="">分辨率</option>
-                            {availableResolutions.map((item) => (
-                              <option key={item.value} value={item.value}>
-                                {item.label}
-                              </option>
-                            ))}
-                          </select>
-                          <select
-                            value={downloadConfig.codec}
-                            onChange={(event) =>
-                              setDownloadConfig((prev) => ({
-                                ...prev,
-                                codec: event.target.value,
-                              }))
-                            }
-                            className="w-full"
-                          >
-                            <option value="">编码格式</option>
-                            {availableCodecs.map((item) => (
-                              <option key={item.value} value={item.value}>
-                                {item.label}
-                              </option>
-                            ))}
-                          </select>
-                          <select
-                            value={downloadConfig.format}
-                            onChange={(event) =>
-                              setDownloadConfig((prev) => ({
-                                ...prev,
-                                format: event.target.value,
-                              }))
-                            }
-                            className="w-full"
-                          >
-                            <option value="">流媒体格式</option>
-                            {availableFormats.map((item) => (
-                              <option key={item.value} value={item.value}>
-                                {item.label}
-                              </option>
-                            ))}
-                          </select>
-                          <select
-                            value={downloadConfig.content}
-                            onChange={(event) =>
-                              setDownloadConfig((prev) => ({
-                                ...prev,
-                                content: event.target.value,
-                              }))
-                            }
-                            className="w-full"
-                          >
-                            <option value="audio_video">音视频</option>
-                            <option value="video_only">仅视频</option>
-                            <option value="audio_only">仅音频</option>
-                          </select>
-                        </div>
-                        {playOptionsEmpty ? (
+                        {hasDirectSelection ? (
+                          <div className="rounded-lg border border-dashed border-[var(--split-color)] px-3 py-2 text-xs text-[var(--desc-color)]">
+                            第三方直链将按原文件格式下载，不需要选择分辨率和编码。
+                          </div>
+                        ) : (
+                          <div className="grid gap-2">
+                            <select
+                              value={downloadConfig.resolution}
+                              onChange={(event) =>
+                                setDownloadConfig((prev) => ({
+                                  ...prev,
+                                  resolution: event.target.value,
+                                }))
+                              }
+                              className="w-full"
+                            >
+                              <option value="">分辨率</option>
+                              {availableResolutions.map((item) => (
+                                <option key={item.value} value={item.value}>
+                                  {item.label}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              value={downloadConfig.codec}
+                              onChange={(event) =>
+                                setDownloadConfig((prev) => ({
+                                  ...prev,
+                                  codec: event.target.value,
+                                }))
+                              }
+                              className="w-full"
+                            >
+                              <option value="">编码格式</option>
+                              {availableCodecs.map((item) => (
+                                <option key={item.value} value={item.value}>
+                                  {item.label}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              value={downloadConfig.format}
+                              onChange={(event) =>
+                                setDownloadConfig((prev) => ({
+                                  ...prev,
+                                  format: event.target.value,
+                                }))
+                              }
+                              className="w-full"
+                            >
+                              <option value="">流媒体格式</option>
+                              {availableFormats.map((item) => (
+                                <option key={item.value} value={item.value}>
+                                  {item.label}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              value={downloadConfig.content}
+                              onChange={(event) =>
+                                setDownloadConfig((prev) => ({
+                                  ...prev,
+                                  content: event.target.value,
+                                }))
+                              }
+                              className="w-full"
+                            >
+                              <option value="audio_video">音视频</option>
+                              <option value="video_only">仅视频</option>
+                              <option value="audio_only">仅音频</option>
+                            </select>
+                          </div>
+                        )}
+                        {!hasDirectSelection && playOptionsEmpty ? (
                           <div className="rounded-lg border border-dashed border-[var(--split-color)] px-3 py-2 text-xs text-[var(--desc-color)]">
                             搜索视频后加载可选分辨率与编码。
                           </div>
@@ -3145,8 +3272,13 @@ export default function DownloadSection({
                         ? Math.min(100, (progressDone / progressTotal) * 100)
                         : Math.min(100, record.progress || 0);
                     const progressLabel = Number(progressValue.toFixed(1));
+                    const recordSourceType = (record.sourceType || "").toUpperCase();
                     const sourceLabel =
-                      (record.sourceType || "").toUpperCase() === "BAIDU" ? "网盘" : "B站";
+                      recordSourceType === "BAIDU"
+                        ? "网盘"
+                        : recordSourceType === DIRECT_SOURCE_TYPE
+                          ? "直链"
+                          : "B站";
                     return (
                       <div
                         key={record.id}
