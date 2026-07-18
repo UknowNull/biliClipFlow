@@ -160,6 +160,8 @@ pub struct SubmissionVideoPart {
     pub end_time: Option<String>,
     #[allow(dead_code)]
     pub cid: Option<i64>,
+    pub upload_part_title: Option<String>,
+    pub upload_part_title_mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -179,6 +181,7 @@ pub struct SubmissionRequest {
     pub baidu_sync_enabled: Option<bool>,
     pub baidu_sync_path: Option<String>,
     pub baidu_sync_filename: Option<String>,
+    pub immediate_submit: Option<bool>,
     pub video_parts: Vec<SubmissionVideoPart>,
 }
 
@@ -216,6 +219,15 @@ pub struct VideoDownloadRecord {
     pub create_time: String,
     pub update_time: String,
     pub source_type: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaginatedDownloadRecords {
+    pub items: Vec<VideoDownloadRecord>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
 }
 
 struct PendingDownloadRecord {
@@ -432,18 +444,42 @@ pub fn download_get(state: State<'_, AppState>, task_id: i64) -> ApiResponse<Vid
 }
 
 #[tauri::command]
+#[allow(non_snake_case)]
 pub fn download_list_by_status(
     state: State<'_, AppState>,
     status: i64,
-) -> ApiResponse<Vec<VideoDownloadRecord>> {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    pageSize: Option<i64>,
+) -> ApiResponse<PaginatedDownloadRecords> {
     let prefix = load_local_path_prefix(&state.db);
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.or(pageSize).unwrap_or(20).clamp(1, 200);
+    let offset = (page - 1).saturating_mul(page_size);
     match state.db.with_conn(|conn| {
-    let mut stmt = conn.prepare(
+    let (where_sql, params): (&str, Vec<i64>) = if status == 1 {
+      ("status IN (1, 4)", vec![])
+    } else {
+      ("status = ?1", vec![status])
+    };
+    let total: i64 = if status == 1 {
+      conn.query_row("SELECT COUNT(1) FROM video_download WHERE status IN (1, 4)", [], |row| row.get(0))?
+    } else {
+      conn.query_row("SELECT COUNT(1) FROM video_download WHERE status = ?1", [status], |row| row.get(0))?
+    };
+    let sql = format!(
       "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, progress_total, progress_done, create_time, update_time, source_type \
-       FROM video_download WHERE status = ?1 ORDER BY id DESC",
-    )?;
+       FROM video_download WHERE {} ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
+      where_sql,
+      params.len() + 1,
+      params.len() + 2,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut query_params = params;
+    query_params.push(page_size);
+    query_params.push(offset);
     let list = stmt
-      .query_map([status], |row| {
+      .query_map(rusqlite::params_from_iter(query_params.iter()), |row| {
         Ok(VideoDownloadRecord {
           id: row.get(0)?,
           bvid: row.get(1)?,
@@ -469,14 +505,14 @@ pub fn download_list_by_status(
         })
       })?
       .collect::<Result<Vec<_>, _>>()?;
-    Ok(list)
+    Ok(PaginatedDownloadRecords { items: list, total, page, page_size })
   }) {
-    Ok(mut list) => {
-      for item in &mut list {
+    Ok(mut result) => {
+      for item in &mut result.items {
         item.local_path =
           to_absolute_local_path_opt_with_prefix(prefix.as_path(), item.local_path.clone());
       }
-      ApiResponse::success(list)
+      ApiResponse::success(result)
     }
     Err(err) => ApiResponse::error(format!("Failed to load downloads: {}", err)),
   }
@@ -1271,9 +1307,15 @@ async fn handle_integration_download(
         return ApiResponse::error("Missing download requests".to_string());
     }
 
+    let immediate_submit = request
+        .submission_request
+        .immediate_submit
+        .unwrap_or(true);
     let mut download_results = Vec::new();
     for download_request in download_requests {
-        match create_download_tasks(context.clone(), download_request).await {
+        match create_download_tasks_with_start(context.clone(), download_request, immediate_submit)
+            .await
+        {
             Ok(task_results) => download_results.extend(task_results),
             Err(err) => return ApiResponse::error(err),
         }
@@ -1322,10 +1364,16 @@ async fn handle_integration_download(
         None
     };
     if !download_results.is_empty() {
+        let mut cid_counts: HashMap<i64, usize> = HashMap::new();
+        for record in &download_results {
+            *cid_counts.entry(record.cid).or_insert(0) += 1;
+        }
         let mut path_by_cid: HashMap<i64, String> = HashMap::new();
         let mut path_by_expected: HashMap<String, String> = HashMap::new();
         for record in &download_results {
-            path_by_cid.insert(record.cid, record.actual_path.clone());
+            if cid_counts.get(&record.cid).copied().unwrap_or(0) == 1 {
+                path_by_cid.insert(record.cid, record.actual_path.clone());
+            }
             if record.expected_path != record.actual_path {
                 path_by_expected.insert(
                     normalize_local_path_key(&record.expected_path),
@@ -1364,6 +1412,10 @@ async fn handle_integration_download(
         i64,
         (Option<String>, Option<i64>, Option<String>, Option<String>),
     > = HashMap::new();
+    let mut cid_counts: HashMap<i64, usize> = HashMap::new();
+    for record in &download_results {
+        *cid_counts.entry(record.cid).or_insert(0) += 1;
+    }
     if !download_results.is_empty() {
         let load_meta_result = context.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -1413,7 +1465,7 @@ async fn handle_integration_download(
                 };
                 let remote_meta = (bvid, aid, part_title, remote_video_url);
                 source_remote_meta_by_record_id.insert(record_id, remote_meta.clone());
-                if let Some(cid) = cid {
+                if let Some(cid) = cid.filter(|value| cid_counts.get(value).copied().unwrap_or(0) == 1) {
                     source_remote_meta_by_cid.insert(cid, remote_meta);
                 }
             }
@@ -1432,7 +1484,7 @@ async fn handle_integration_download(
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
       params![
         &submission_id,
-        "PENDING",
+        if immediate_submit { "PENDING" } else { "PENDING_SUBMIT" },
         if priority_enabled { 1 } else { 0 },
         priority_at,
         submission.title,
@@ -1487,9 +1539,19 @@ async fn handle_integration_download(
           }
         });
       let remote_video_url = remote_meta.as_ref().and_then(|value| value.3.clone());
+      let upload_part_title = part
+        .upload_part_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(80).collect::<String>());
+      let upload_part_title_mode = match part.upload_part_title_mode.as_deref() {
+        Some(value) if value.trim().eq_ignore_ascii_case("CUSTOM") => "CUSTOM",
+        _ => "AUTO",
+      };
       conn.execute(
-        "INSERT INTO task_source_video (id, task_id, source_file_path, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, sort_order, start_time, end_time) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO task_source_video (id, task_id, source_file_path, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, sort_order, start_time, end_time, upload_part_title, upload_part_title_mode) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         (
           part_id,
           &submission_id,
@@ -1502,6 +1564,8 @@ async fn handle_integration_download(
           (index + 1) as i64,
           part.start_time,
           end_time,
+          upload_part_title.as_deref(),
+          upload_part_title_mode,
         ),
       )?;
     }
@@ -1577,9 +1641,17 @@ async fn create_download_tasks(
     context: DownloadContext,
     request: DownloadRequest,
 ) -> Result<Vec<DownloadTaskCreateResult>, String> {
+    create_download_tasks_with_start(context, request, true).await
+}
+
+async fn create_download_tasks_with_start(
+    context: DownloadContext,
+    request: DownloadRequest,
+    start_immediately: bool,
+) -> Result<Vec<DownloadTaskCreateResult>, String> {
     let source_type = normalize_download_source_type(request.source_type.as_deref());
     if is_direct_download_source(&source_type) {
-        return create_direct_download_tasks(context, request).await;
+        return create_direct_download_tasks_with_start(context, request, start_immediately).await;
     }
 
     let (bvid, aid) = parse_video_id(&request.video_url);
@@ -1626,7 +1698,7 @@ async fn create_download_tasks(
         )? {
             let actual_path_buf = PathBuf::from(&actual_path);
             let has_file = actual_path_buf.is_file();
-            let can_reuse = status == 0 || status == 1 || status == 3 || status == 4;
+            let can_reuse = status == 0 || status == 1 || status == 3 || status == 4 || status == 5;
             if can_reuse || (status == 2 && has_file) {
                 record_ids.push(DownloadTaskCreateResult {
                     id: record_id,
@@ -1644,13 +1716,14 @@ async fn create_download_tasks(
         let stored_actual_path =
             to_stored_local_path_with_prefix(storage_prefix.as_path(), actual_path.as_str());
 
+        let initial_status = if start_immediately { 0 } else { 5 };
         let record_id = context
       .db
       .with_conn(|conn| {
         conn.execute(
           "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, progress_total, progress_done, create_time, update_time, resolution, codec, format, cid, content, source_type) \
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-          (
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+          params![
             bvid.as_deref(),
             aid.as_deref(),
             video_title.as_deref(),
@@ -1659,6 +1732,7 @@ async fn create_download_tasks(
             (index + 1) as i64,
             request.video_url.as_str(),
             stored_actual_path.as_str(),
+            initial_status,
             &now,
             &now,
             request.config.resolution.as_deref(),
@@ -1667,7 +1741,7 @@ async fn create_download_tasks(
             part.cid,
             request.config.content.as_deref(),
             DOWNLOAD_SOURCE_BILIBILI,
-          ),
+          ],
         )?;
         Ok(conn.last_insert_rowid())
       })
@@ -1685,13 +1759,16 @@ async fn create_download_tasks(
     if record_ids.is_empty() {
         return Err("No download task created".to_string());
     }
-    schedule_pending_downloads(context.clone()).await;
+    if start_immediately {
+        schedule_pending_downloads(context.clone()).await;
+    }
     Ok(record_ids)
 }
 
-async fn create_direct_download_tasks(
+async fn create_direct_download_tasks_with_start(
     context: DownloadContext,
     request: DownloadRequest,
+    start_immediately: bool,
 ) -> Result<Vec<DownloadTaskCreateResult>, String> {
     let url = parse_direct_download_url(&request.video_url)?;
     let url_value = url.as_str().to_string();
@@ -1744,7 +1821,7 @@ async fn create_direct_download_tasks(
     {
         let actual_path_buf = PathBuf::from(&actual_path);
         let has_file = actual_path_buf.is_file();
-        let can_reuse = status == 0 || status == 1 || status == 3 || status == 4;
+        let can_reuse = status == 0 || status == 1 || status == 3 || status == 4 || status == 5;
         if can_reuse || (status == 2 && has_file) {
             return Ok(vec![DownloadTaskCreateResult {
                 id: record_id,
@@ -1760,17 +1837,19 @@ async fn create_direct_download_tasks(
     let actual_path = output_path.to_string_lossy().to_string();
     let stored_actual_path =
         to_stored_local_path_with_prefix(storage_prefix.as_path(), actual_path.as_str());
+    let initial_status = if start_immediately { 0 } else { 5 };
     let record_id = context
         .db
         .with_conn(|conn| {
             conn.execute(
           "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, progress_total, progress_done, create_time, update_time, resolution, codec, format, cid, content, source_type) \
-           VALUES (NULL, NULL, ?1, ?2, 1, 1, ?3, ?4, 0, 0, 0, 0, ?5, ?6, NULL, NULL, ?7, 0, NULL, ?8)",
+           VALUES (NULL, NULL, ?1, ?2, 1, 1, ?3, ?4, ?5, 0, 0, 0, ?6, ?7, NULL, NULL, ?8, 0, NULL, ?9)",
           (
             title.as_str(),
             part_title.as_str(),
             url_value.as_str(),
             stored_actual_path.as_str(),
+            initial_status,
             &now,
             &now,
             extension.as_str(),
@@ -1781,7 +1860,9 @@ async fn create_direct_download_tasks(
         })
         .map_err(|err| format!("Failed to save direct download record: {}", err))?;
 
-    schedule_pending_downloads(context.clone()).await;
+    if start_immediately {
+        schedule_pending_downloads(context.clone()).await;
+    }
     Ok(vec![DownloadTaskCreateResult {
         id: record_id,
         cid: 0,
@@ -5121,25 +5202,6 @@ fn update_relation_workflow_status(
     .map_err(|err| err.to_string())
 }
 
-fn update_workflow_instance_status(
-    context: &DownloadContext,
-    task_id: &str,
-    status: &str,
-) -> Result<(), String> {
-    let now = now_rfc3339();
-    context
-        .db
-        .with_conn(|conn| {
-            let updated = conn.execute(
-                "UPDATE workflow_instances SET status = ?1, updated_at = ?2 WHERE task_id = ?3",
-                (status, &now, task_id),
-            )?;
-            Ok(updated)
-        })
-        .map_err(|err| err.to_string())?;
-    Ok(())
-}
-
 fn reset_workflow_instance_state(context: &DownloadContext, task_id: &str) -> Result<(), String> {
     let now = now_rfc3339();
     context
@@ -5299,12 +5361,11 @@ async fn refresh_integration_status(
             }
             return Ok(());
         }
+        if submission_status != "PENDING" {
+            return Ok(());
+        }
         if let Some(status) = workflow_status {
-            if status == "VIDEO_DOWNLOADING" {
-                let _ = update_workflow_instance_status(context, &submission_task_id, "COMPLETED");
-                return Ok(());
-            }
-            if status == "RUNNING" || status == "COMPLETED" {
+            if status == "RUNNING" {
                 return Ok(());
             }
         }
@@ -5316,6 +5377,13 @@ async fn refresh_integration_status(
             task_id,
         );
         let _ = update_relation_workflow_status(context, &submission_task_id, "WORKFLOW_STARTED");
+        append_log(
+            &context.app_log_path,
+            &format!(
+                "download_integration_start_submission task_id={} reason=downloads_ready",
+                submission_task_id
+            ),
+        );
     }
 
     Ok(())

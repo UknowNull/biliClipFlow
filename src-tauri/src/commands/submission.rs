@@ -166,6 +166,7 @@ pub struct SubmissionTaskInput {
     pub baidu_sync_enabled: Option<bool>,
     pub baidu_sync_path: Option<String>,
     pub baidu_sync_filename: Option<String>,
+    pub immediate_submit: Option<bool>,
     pub source_type: Option<String>,
     pub bilibili_uid: Option<i64>,
 }
@@ -181,6 +182,9 @@ pub struct SourceVideoInput {
     pub remote_aid: Option<i64>,
     pub remote_cid: Option<i64>,
     pub remote_part_title: Option<String>,
+    pub remote_video_url: Option<String>,
+    pub upload_part_title: Option<String>,
+    pub upload_part_title_mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +193,12 @@ pub struct SubmissionCreateRequest {
     pub task: SubmissionTaskInput,
     pub source_videos: Vec<SourceVideoInput>,
     pub workflow_config: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionTaskIdsRequest {
+    pub task_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -596,6 +606,7 @@ pub struct SubmissionTaskRecord {
     pub aid: Option<i64>,
     pub remote_state: Option<i64>,
     pub reject_reason: Option<String>,
+    pub remote_status_ignored: bool,
     pub created_at: String,
     pub updated_at: String,
     pub segment_prefix: Option<String>,
@@ -624,6 +635,7 @@ pub struct TaskSourceVideoRecord {
     pub id: String,
     pub task_id: String,
     pub source_file_path: String,
+    pub remote_video_url: Option<String>,
     pub sort_order: i64,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
@@ -631,6 +643,8 @@ pub struct TaskSourceVideoRecord {
     pub remote_aid: Option<i64>,
     pub remote_cid: Option<i64>,
     pub remote_part_title: Option<String>,
+    pub upload_part_title: Option<String>,
+    pub upload_part_title_mode: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1006,6 +1020,12 @@ pub async fn submission_create(
     };
     let task_id = uuid::Uuid::new_v4().to_string();
     let now = now_rfc3339();
+    let immediate_submit = request.task.immediate_submit.unwrap_or(true);
+    let initial_status = if immediate_submit {
+        "PENDING"
+    } else {
+        "PENDING_SUBMIT"
+    };
     let normalized_collection_id = request.task.collection_id.filter(|value| *value > 0);
     let normalized_cover_url = normalize_optional_text(request.task.cover_url.clone());
     let normalized_cover_data_url = normalize_optional_text(request.task.cover_data_url.clone());
@@ -1061,9 +1081,10 @@ pub async fn submission_create(
     };
     conn.execute(
       "INSERT INTO submission_task (task_id, status, priority, priority_at, title, description, cover_url, cover_local_path, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename, source_type) \
-       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, NULL, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
       params![
         &task_id,
+        initial_status,
         if priority_enabled { 1 } else { 0 },
         priority_at,
         &request.task.title,
@@ -1101,9 +1122,10 @@ pub async fn submission_create(
       let source_id = uuid::Uuid::new_v4().to_string();
       let (remote_bvid, remote_aid, remote_cid, remote_part_title, remote_video_url) =
         normalize_source_remote_binding(source);
+      let (upload_part_title, upload_part_title_mode) = normalize_upload_part_title(source);
       conn.execute(
-        "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         (
           source_id,
           &task_id,
@@ -1116,6 +1138,8 @@ pub async fn submission_create(
           remote_aid,
           remote_cid,
           remote_part_title.as_deref(),
+          upload_part_title.as_deref(),
+          upload_part_title_mode.as_str(),
         ),
       )?;
     }
@@ -1161,7 +1185,7 @@ pub async fn submission_create(
         }
     }
 
-    if result.workflow_instance_id.is_some() {
+    if immediate_submit && result.workflow_instance_id.is_some() {
         let context_clone = context.clone();
         let task_id_clone = task_id.clone();
         tauri::async_runtime::spawn(async move {
@@ -2372,6 +2396,9 @@ fn clip_source_match_key(source: &ClipSource) -> (i64, String, String) {
 struct MergeGroupPlan {
     order: i64,
     sources: Vec<ClipSource>,
+    /// 「上传分P标题」自定义值（仅 CUSTOM 且非空时为 Some）。
+    /// 分段关闭时作为该最终上传单元的 B 站分P标题；None 时兜底 P{index}。
+    upload_part_title: Option<String>,
 }
 
 fn extract_merge_groups_from_config(
@@ -2449,7 +2476,12 @@ fn extract_merge_groups_from_config(
             .or_else(|| group.get("sort_order"))
             .and_then(|value| value.as_i64())
             .unwrap_or((group_index + 1) as i64);
-        groups.push(MergeGroupPlan { order, sources });
+        let upload_part_title = extract_upload_part_title_from_json(group);
+        groups.push(MergeGroupPlan {
+            order,
+            sources,
+            upload_part_title,
+        });
     }
     groups.sort_by_key(|item| item.order);
     for (index, group) in groups.iter_mut().enumerate() {
@@ -2537,6 +2569,42 @@ fn load_latest_workflow_config_record(
                 .map_err(|err| format!("解析工作流配置失败: {}", err)),
             None => Ok(None),
         })
+}
+
+fn load_task_specific_workflow_config_record(
+    context: &SubmissionContext,
+    task_id: &str,
+) -> Result<Option<(i64, Value)>, String> {
+    let config_name = format!("workflow_{}", task_id);
+    context
+        .db
+        .with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT config_id, configuration_data FROM workflow_configurations \
+                 WHERE config_name = ?1 ORDER BY updated_at DESC, config_id DESC LIMIT 1",
+            )?;
+            let row: Option<(i64, String)> = stmt
+                .query_row([config_name], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            Ok(row)
+        })
+        .map_err(|err| err.to_string())
+        .and_then(|row| match row {
+            Some((config_id, raw)) => serde_json::from_str::<Value>(&raw)
+                .map(|config| Some((config_id, config)))
+                .map_err(|err| format!("解析工作流配置失败: {}", err)),
+            None => Ok(None),
+        })
+}
+
+fn load_effective_workflow_config_record(
+    context: &SubmissionContext,
+    task_id: &str,
+) -> Result<Option<(i64, Value)>, String> {
+    match load_latest_workflow_config_record(context, task_id)? {
+        Some(record) => Ok(Some(record)),
+        None => load_task_specific_workflow_config_record(context, task_id),
+    }
 }
 
 fn save_latest_workflow_merge_groups(
@@ -2704,16 +2772,32 @@ fn resolve_merge_groups(
             groups.push(MergeGroupPlan {
                 order: groups.len() as i64 + 1,
                 sources: normalize_binding_sources(vec![source.clone()]),
+                upload_part_title: None,
             });
         }
-        return groups;
-    }
-    // 无合并组配置：所有源视频合并为一个合并视频
-    if !fallback_sources.is_empty() {
+    } else if !fallback_sources.is_empty() {
+        // 无合并组配置：所有源视频合并为一个合并视频
         groups.push(MergeGroupPlan {
             order: 1,
             sources: normalize_binding_sources(fallback_sources.to_vec()),
+            upload_part_title: None,
         });
+    }
+    // 独立分组（单源组）的自定义上传分P标题从源视频读取（合并组标题已在配置中携带）。
+    let source_titles = load_source_upload_titles(context, task_id);
+    if !source_titles.is_empty() {
+        for group in &mut groups {
+            if group.upload_part_title.is_some() || group.sources.len() != 1 {
+                continue;
+            }
+            if let Some(title) = group
+                .sources
+                .first()
+                .and_then(|source| source_titles.get(&source.input_path))
+            {
+                group.upload_part_title = Some(title.clone());
+            }
+        }
     }
     groups
 }
@@ -5608,6 +5692,33 @@ fn collect_retry_download_records_for_missing_sources(
             continue;
         }
         if let Some(binding) = source_bindings.get(&runtime_path) {
+            let binding_url = binding.remote_video_url.as_deref().unwrap_or("").trim();
+            let is_direct_url = !binding_url.is_empty()
+                && binding
+                    .remote_bvid
+                    .as_deref()
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true);
+            if is_direct_url {
+                retry_records.push(IntegratedDownloadRecord {
+                    id: 0,
+                    download_url: binding_url.to_string(),
+                    bvid: None,
+                    aid: None,
+                    title: binding.remote_part_title.clone(),
+                    part_title: binding.remote_part_title.clone(),
+                    part_count: Some(1),
+                    current_part: Some(1),
+                    local_path: runtime_path.clone(),
+                    resolution: None,
+                    codec: None,
+                    format: None,
+                    cid: None,
+                    content: None,
+                    source_type: crate::commands::download::DOWNLOAD_SOURCE_DIRECT.to_string(),
+                });
+                continue;
+            }
             if binding.remote_cid.is_some()
                 && (binding
                     .remote_bvid
@@ -5737,6 +5848,12 @@ fn create_retry_download_records(
         let source_type = record.source_type.trim().to_ascii_uppercase();
         if source_type == "BAIDU" && record.download_url.trim().is_empty() {
             return Err("网盘下载记录缺少远程路径，无法重新下载".to_string());
+        }
+        if source_type == crate::commands::download::DOWNLOAD_SOURCE_DIRECT {
+            if record.download_url.trim().is_empty() {
+                return Err("第三方下载记录缺少下载链接，无法重新下载".to_string());
+            }
+            continue;
         }
         if source_type != "BAIDU" {
             let has_bvid = record
@@ -9288,6 +9405,138 @@ pub async fn submission_execute(
 }
 
 #[tauri::command]
+pub async fn submission_start(
+    state: State<'_, AppState>,
+    request: SubmissionTaskIdsRequest,
+) -> Result<ApiResponse<String>, String> {
+    let context = SubmissionContext::new(&state);
+    let mut task_ids = request
+        .task_ids
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    task_ids.sort();
+    task_ids.dedup();
+    if task_ids.is_empty() {
+        return Ok(ApiResponse::error("请选择要投稿的任务"));
+    }
+
+    let mut tasks = Vec::new();
+    for task_id in task_ids {
+        let detail = load_task_detail(&context, &task_id)?;
+        if detail.task.status != "PENDING_SUBMIT" && detail.task.status != "FAILED" {
+            continue;
+        }
+        tasks.push(detail.task);
+    }
+    tasks.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    if tasks.is_empty() {
+        return Ok(ApiResponse::error("没有可开始投稿的任务"));
+    }
+
+    for task in tasks {
+        let _ = context.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE video_download SET status = 0, update_time = ?1 \
+                 WHERE status = 5 AND id IN ( \
+                   SELECT download_task_id FROM task_relations \
+                   WHERE submission_task_id = ?2 AND relation_type = 'INTEGRATED' \
+                 )",
+                (now_rfc3339(), task.task_id.as_str()),
+            )?;
+            Ok(())
+        });
+        let _ = update_submission_status(&context, &task.task_id, "PENDING");
+        if let Some(stats) = load_integrated_download_stats(&context, &task.task_id)? {
+            if stats.failed > 0 {
+                let _ = mark_submission_failure(
+                    &context,
+                    &task.task_id,
+                    None,
+                    "存在下载失败的分P，请先重试下载",
+                );
+                continue;
+            }
+            if stats.completed < stats.total {
+                let _ = update_workflow_status(
+                    &context,
+                    &task.task_id,
+                    "VIDEO_DOWNLOADING",
+                    None,
+                    0.0,
+                );
+                let _ = update_integrated_relation_workflow_status(
+                    &context,
+                    &task.task_id,
+                    "PENDING_DOWNLOAD",
+                );
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "submission_start_wait_download task_id={} completed={} total={}",
+                        task.task_id, stats.completed, stats.total
+                    ),
+                );
+                continue;
+            }
+        }
+        let workflow_config = load_latest_workflow_config(&context, &task.task_id)?;
+        if workflow_config.is_some()
+            && load_workflow_status(&context, &task.task_id)
+                .ok()
+                .flatten()
+                .map(|status| status.status != "RUNNING")
+                .unwrap_or(true)
+        {
+            start_submission_workflow(
+                context.db.clone(),
+                context.app_log_path.clone(),
+                context.edit_upload_state.clone(),
+                task.task_id.clone(),
+            );
+        }
+    }
+
+    Ok(ApiResponse::success("已加入投稿流程".to_string()))
+}
+
+#[tauri::command]
+pub async fn submission_ignore_remote_status(
+    state: State<'_, AppState>,
+    request: SubmissionTaskIdsRequest,
+) -> Result<ApiResponse<String>, String> {
+    let context = SubmissionContext::new(&state);
+    let now = now_rfc3339();
+    let task_ids = request
+        .task_ids
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if task_ids.is_empty() {
+        return Ok(ApiResponse::error("请选择要忽略的任务"));
+    }
+
+    context
+        .db
+        .with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            for task_id in task_ids {
+                tx.execute(
+                    "UPDATE submission_task SET remote_state = 0, reject_reason = NULL, remote_status_ignored = 1, updated_at = ?1 WHERE task_id = ?2 AND remote_state IN (-2, -4)",
+                    (&now, &task_id),
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .map_err(|err| err.to_string())?;
+
+    Ok(ApiResponse::success("已忽略远程投稿状态".to_string()))
+}
+
+#[tauri::command]
 pub async fn submission_integrated_execute(
     state: State<'_, AppState>,
     task_id: String,
@@ -11610,7 +11859,7 @@ fn load_tasks(
         st.created_at DESC";
       let sql = match (status.as_ref(), like_query.as_ref(), source_type.as_ref()) {
         (Some(_), Some(_), Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -11624,7 +11873,7 @@ fn load_tasks(
           order_by
         ),
         (Some(_), Some(_), None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -11638,7 +11887,7 @@ fn load_tasks(
           order_by
         ),
         (Some(_), None, Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -11652,7 +11901,7 @@ fn load_tasks(
           order_by
         ),
         (Some(_), None, None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -11666,7 +11915,7 @@ fn load_tasks(
           order_by
         ),
         (None, Some(_), Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -11680,7 +11929,7 @@ fn load_tasks(
           order_by
         ),
         (None, Some(_), None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -11694,7 +11943,7 @@ fn load_tasks(
           order_by
         ),
         (None, None, Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -11708,7 +11957,7 @@ fn load_tasks(
           order_by
         ),
         (None, None, None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
@@ -11775,11 +12024,12 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
     let workflow_settings = parse_workflow_settings(
         workflow_config_raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),
     );
-    let has_integrated_downloads: i64 = row.get(28)?;
-    let workflow_status = row.get::<_, Option<String>>(29)?;
-    let workflow_step = row.get::<_, Option<String>>(30)?;
-    let workflow_progress: Option<f64> = row.get(31)?;
-    let workflow_error_message: Option<String> = row.get(32)?;
+    let remote_status_ignored = row.get::<_, i64>(28)? != 0;
+    let has_integrated_downloads: i64 = row.get(29)?;
+    let workflow_status = row.get::<_, Option<String>>(30)?;
+    let workflow_step = row.get::<_, Option<String>>(31)?;
+    let workflow_progress: Option<f64> = row.get(32)?;
+    let workflow_error_message: Option<String> = row.get(33)?;
     let workflow_status = workflow_status.map(|status| WorkflowStatusRecord {
         status,
         current_step: workflow_step,
@@ -11809,6 +12059,7 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
         aid: row.get(16)?,
         remote_state: row.get(17)?,
         reject_reason: row.get(18)?,
+        remote_status_ignored,
         created_at: row.get(19)?,
         updated_at: row.get(20)?,
         segment_prefix: row.get(21)?,
@@ -11831,7 +12082,7 @@ fn load_task_record(
     .db
     .with_conn(|conn| {
       conn.query_row(
-        "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+        "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                 wi.status, wi.current_step, wi.progress, wi.error_message \
          FROM submission_task st \
@@ -11855,11 +12106,13 @@ fn load_task_detail(
 ) -> Result<SubmissionTaskDetail, String> {
     let path_prefix = context.local_path_prefix.clone();
     let task = load_task_record(context, task_id)?;
+    let workflow_config = load_effective_workflow_config_record(context, task_id)?
+        .map(|(_, config)| config);
     let mut detail = context
     .db
     .with_conn(|conn| {
       let mut source_stmt = conn.prepare(
-        "SELECT id, task_id, source_file_path, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
+        "SELECT id, task_id, source_file_path, remote_video_url, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
       )?;
       let source_videos = source_stmt
         .query_map([task_id], |row| {
@@ -11867,13 +12120,16 @@ fn load_task_detail(
             id: row.get(0)?,
             task_id: row.get(1)?,
             source_file_path: row.get(2)?,
-            sort_order: row.get(3)?,
-            start_time: row.get(4)?,
-            end_time: row.get(5)?,
-            remote_bvid: row.get(6)?,
-            remote_aid: row.get(7)?,
-            remote_cid: row.get(8)?,
-            remote_part_title: row.get(9)?,
+            remote_video_url: row.get(3)?,
+            sort_order: row.get(4)?,
+            start_time: row.get(5)?,
+            end_time: row.get(6)?,
+            remote_bvid: row.get(7)?,
+            remote_aid: row.get(8)?,
+            remote_cid: row.get(9)?,
+            remote_part_title: row.get(10)?,
+            upload_part_title: row.get(11)?,
+            upload_part_title_mode: row.get(12)?,
           })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -11989,18 +12245,6 @@ fn load_task_detail(
           merged.source_video_paths = source_paths;
         }
       }
-
-      let workflow_config_raw: Option<String> = conn
-        .query_row(
-          "SELECT wc.configuration_data FROM workflow_instances wi \
-           JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-           WHERE wi.task_id = ?1 ORDER BY wi.created_at DESC LIMIT 1",
-          [task_id],
-          |row| row.get(0),
-        )
-        .ok();
-      let workflow_config =
-        workflow_config_raw.and_then(|value| serde_json::from_str::<Value>(&value).ok());
 
       Ok(SubmissionTaskDetail {
         task,
@@ -12642,6 +12886,7 @@ async fn run_submission_workflow(
             prepared_groups.push(MergeGroupPlan {
                 order: group.order,
                 sources: normalized,
+                upload_part_title: group.upload_part_title.clone(),
             });
         }
         if !is_workflow_instance_latest(&context, &task_id, &workflow_instance_id)? {
@@ -13017,6 +13262,13 @@ async fn run_submission_workflow(
                     )?;
                     next_part_order += 1;
                     next_name_index += 1;
+                    // 分段关闭：用合并组/源视频的自定义上传分P标题覆盖默认 P{index}。
+                    if let Some(title) = prepared_groups
+                        .get(index)
+                        .and_then(|group| group.upload_part_title.as_deref())
+                    {
+                        apply_non_segmented_part_title(&context, &task_id, *merged_id, title)?;
+                    }
                     append_log(
                         &context.app_log_path,
                         &format!(
@@ -13403,6 +13655,19 @@ async fn run_submission_workflow(
                 Some(merged_id),
                 workflow_settings.segment_prefix.as_deref(),
             )?;
+            // 单合并单元（无合并组配置）：若对应源视频设置了自定义上传分P标题则覆盖。
+            let single_title = resolve_merge_groups(
+                &context,
+                &task_id,
+                workflow_config.as_ref(),
+                &sources,
+            )
+            .into_iter()
+            .next()
+            .and_then(|group| group.upload_part_title);
+            if let Some(title) = single_title {
+                apply_non_segmented_part_title(&context, &task_id, merged_id, &title)?;
+            }
         }
     }
     if is_update_workflow && !workflow_settings.enable_segmentation {
@@ -13422,6 +13687,18 @@ async fn run_submission_workflow(
             max_order + 1,
             name_start_index,
         )?;
+        // 编辑/更新工作流分段关闭：单源追加时若该源配置了自定义上传分P标题则覆盖。
+        // 更新路径会把所有 sources 合并为一个分P，故仅在单源场景按源标题精确赋值，
+        // 多源合并保持默认 P{index} 以免错配。
+        if sources.len() == 1 {
+            let source_titles = load_source_upload_titles(&context, &task_id);
+            if let Some(title) = sources
+                .first()
+                .and_then(|source| source_titles.get(&source.input_path))
+            {
+                apply_non_segmented_part_title(&context, &task_id, merged_id, title)?;
+            }
+        }
     }
     if let Err(err) = baidu_sync::enqueue_submission_sync(
         context.db.as_ref(),
@@ -14081,6 +14358,9 @@ fn build_uploaded_parts(
                 .ok_or_else(|| format!("分段缺少文件名 segment_id={}", segment.segment_id))?
         };
         let title = if is_update_workflow {
+            resolve_existing_part_title(&detail.task, &segment.part_name, index + 1)
+        } else if is_non_segmented_task(&detail.task) {
+            // 分段关闭：分P标题使用配置值（写库阶段已写入 part_name），空值/默认值兜底 P{index}。
             resolve_existing_part_title(&detail.task, &segment.part_name, index + 1)
         } else {
             build_part_title(detail.task.segment_prefix.as_deref(), index + 1)
@@ -15436,7 +15716,7 @@ fn load_task_bvids_by_owner(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-        "SELECT task_id, bvid, bilibili_uid FROM submission_task WHERE bvid IS NOT NULL AND TRIM(bvid) != ''",
+        "SELECT task_id, bvid, bilibili_uid FROM submission_task WHERE bvid IS NOT NULL AND TRIM(bvid) != '' AND COALESCE(remote_status_ignored, 0) = 0",
       )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -17742,7 +18022,7 @@ fn load_task_source_video_records(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, task_id, source_file_path, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title \
+                "SELECT id, task_id, source_file_path, remote_video_url, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title \
          FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
             )?;
             let rows = stmt.query_map([task_id], |row| {
@@ -17750,13 +18030,16 @@ fn load_task_source_video_records(
                     id: row.get(0)?,
                     task_id: row.get(1)?,
                     source_file_path: row.get(2)?,
-                    sort_order: row.get(3)?,
-                    start_time: row.get(4)?,
-                    end_time: row.get(5)?,
-                    remote_bvid: row.get(6)?,
-                    remote_aid: row.get(7)?,
-                    remote_cid: row.get(8)?,
-                    remote_part_title: row.get(9)?,
+                    remote_video_url: row.get(3)?,
+                    sort_order: row.get(4)?,
+                    start_time: row.get(5)?,
+                    end_time: row.get(6)?,
+                    remote_bvid: row.get(7)?,
+                    remote_aid: row.get(8)?,
+                    remote_cid: row.get(9)?,
+                    remote_part_title: row.get(10)?,
+                    upload_part_title: None,
+                    upload_part_title_mode: None,
                 })
             })?;
             let mut list = rows.collect::<Result<Vec<_>, _>>()?;
@@ -18075,19 +18358,8 @@ fn load_latest_workflow_config(
     context: &SubmissionContext,
     task_id: &str,
 ) -> Result<Option<Value>, String> {
-    context
-        .db
-        .with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT wc.configuration_data FROM workflow_instances wi \
-         JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-         WHERE wi.task_id = ?1 ORDER BY wi.created_at DESC LIMIT 1",
-            )?;
-            let result: Option<String> = stmt.query_row([task_id], |row| row.get(0)).ok();
-            Ok(result)
-        })
-        .map_err(|err| err.to_string())
-        .map(|value| value.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()))
+    load_effective_workflow_config_record(context, task_id)
+        .map(|value| value.map(|(_, config)| config))
 }
 
 fn load_update_sources(
@@ -18218,6 +18490,22 @@ fn normalize_source_remote_binding(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
+    let remote_video_url = source
+        .remote_video_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .or_else(|| {
+            if remote_bvid.is_some() {
+                Some(format!(
+                    "https://www.bilibili.com/video/{}",
+                    remote_bvid.as_deref().unwrap_or("")
+                ))
+            } else {
+                None
+            }
+        });
     let remote_aid = if remote_bvid.is_some() {
         source.remote_aid.filter(|value| *value > 0)
     } else {
@@ -18238,9 +18526,6 @@ fn normalize_source_remote_binding(
     } else {
         None
     };
-    let remote_video_url = remote_bvid
-        .as_ref()
-        .map(|value| format!("https://www.bilibili.com/video/{}", value));
     (
         remote_bvid,
         remote_aid,
@@ -18248,6 +18533,88 @@ fn normalize_source_remote_binding(
         remote_part_title,
         remote_video_url,
     )
+}
+
+/// 归一化源视频「上传分P标题」与其模式。
+/// 返回 (title, mode)：title 为 trim 后的非空值（否则 None），mode 归一为 AUTO/CUSTOM。
+/// 标题长度超过 80 时按截断处理（前端已校验，这里兜底）。
+fn normalize_upload_part_title(source: &SourceVideoInput) -> (Option<String>, String) {
+    let title = source
+        .upload_part_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(80).collect::<String>());
+    let mode = match source.upload_part_title_mode.as_deref() {
+        Some(value) if value.trim().eq_ignore_ascii_case("CUSTOM") => "CUSTOM",
+        _ => "AUTO",
+    }
+    .to_string();
+    (title, mode)
+}
+
+/// 从合并组 JSON 对象解析自定义「上传分P标题」。
+/// 仅当 uploadPartTitleMode == CUSTOM 且标题非空时返回 Some（截断至 80 字符）；
+/// AUTO 模式返回 None，由调用方按最终顺序兜底 P{index}。
+fn extract_upload_part_title_from_json(group: &Value) -> Option<String> {
+    let mode = group
+        .get("uploadPartTitleMode")
+        .or_else(|| group.get("upload_part_title_mode"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if !mode.trim().eq_ignore_ascii_case("CUSTOM") {
+        return None;
+    }
+    group
+        .get("uploadPartTitle")
+        .or_else(|| group.get("upload_part_title"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(80).collect::<String>())
+}
+
+/// 加载任务各源视频的自定义「上传分P标题」，返回 runtime 源路径 -> 自定义标题。
+/// 仅收录 upload_part_title_mode == CUSTOM 且标题非空的项。
+fn load_source_upload_titles(
+    context: &SubmissionContext,
+    task_id: &str,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let _ = context.db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT source_file_path, upload_part_title, upload_part_title_mode FROM task_source_video WHERE task_id = ?1",
+        )?;
+        let rows = stmt.query_map([task_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (path, title, mode) = row?;
+            let is_custom = mode
+                .as_deref()
+                .map(|value| value.trim().eq_ignore_ascii_case("CUSTOM"))
+                .unwrap_or(false);
+            if !is_custom {
+                continue;
+            }
+            let Some(title) = title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.chars().take(80).collect::<String>())
+            else {
+                continue;
+            };
+            let runtime_path = to_runtime_submission_path(context, &path);
+            map.insert(runtime_path, title);
+        }
+        Ok(())
+    });
+    map
 }
 
 fn replace_source_videos(
@@ -18264,9 +18631,10 @@ fn replace_source_videos(
         let stored_source_path = to_stored_submission_path(context, &source.source_file_path);
         let (remote_bvid, remote_aid, remote_cid, remote_part_title, remote_video_url) =
           normalize_source_remote_binding(source);
+        let (upload_part_title, upload_part_title_mode) = normalize_upload_part_title(source);
         conn.execute(
-          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title) \
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
           (
             source_id,
             task_id,
@@ -18279,6 +18647,8 @@ fn replace_source_videos(
             remote_aid,
             remote_cid,
             remote_part_title.as_deref(),
+            upload_part_title.as_deref(),
+            upload_part_title_mode.as_str(),
           ),
         )?;
       }
@@ -18308,9 +18678,10 @@ fn append_source_videos(
         let stored_source_path = to_stored_submission_path(context, &source.source_file_path);
         let (remote_bvid, remote_aid, remote_cid, remote_part_title, remote_video_url) =
           normalize_source_remote_binding(source);
+        let (upload_part_title, upload_part_title_mode) = normalize_upload_part_title(source);
         conn.execute(
-          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title) \
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
           (
             source_id,
             task_id,
@@ -18323,6 +18694,8 @@ fn append_source_videos(
             remote_aid,
             remote_cid,
             remote_part_title.as_deref(),
+            upload_part_title.as_deref(),
+            upload_part_title_mode.as_str(),
           ),
         )?;
       }
@@ -18341,6 +18714,36 @@ fn attach_update_sources(config: Value, sources: &[SourceVideoInput]) -> Value {
                 "sourceFilePath".to_string(),
                 Value::String(source.source_file_path.clone()),
             );
+            if let Some(remote_video_url) = source.remote_video_url.as_deref() {
+                let trimmed = remote_video_url.trim();
+                if !trimmed.is_empty() {
+                    map.insert(
+                        "remoteVideoUrl".to_string(),
+                        Value::String(trimmed.to_string()),
+                    );
+                }
+            }
+            if let Some(remote_bvid) = source.remote_bvid.as_deref() {
+                let trimmed = remote_bvid.trim();
+                if !trimmed.is_empty() {
+                    map.insert("remoteBvid".to_string(), Value::String(trimmed.to_string()));
+                }
+            }
+            if let Some(remote_aid) = source.remote_aid.filter(|value| *value > 0) {
+                map.insert("remoteAid".to_string(), Value::Number(Number::from(remote_aid)));
+            }
+            if let Some(remote_cid) = source.remote_cid.filter(|value| *value > 0) {
+                map.insert("remoteCid".to_string(), Value::Number(Number::from(remote_cid)));
+            }
+            if let Some(remote_part_title) = source.remote_part_title.as_deref() {
+                let trimmed = remote_part_title.trim();
+                if !trimmed.is_empty() {
+                    map.insert(
+                        "remotePartTitle".to_string(),
+                        Value::String(trimmed.to_string()),
+                    );
+                }
+            }
             if let Some(start) = source.start_time.as_deref() {
                 let trimmed = start.trim();
                 if !trimmed.is_empty() {
@@ -18715,6 +19118,30 @@ fn parse_leading_number(value: &str) -> Option<usize> {
         return None;
     }
     digits.parse::<usize>().ok()
+}
+
+/// 分段关闭时，用自定义「上传分P标题」覆盖某合并视频对应分P的 part_name。
+/// 该 part_name 最终会被 build_uploaded_parts 用作 B 站分P标题。
+fn apply_non_segmented_part_title(
+    context: &SubmissionContext,
+    task_id: &str,
+    merged_id: i64,
+    title: &str,
+) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(());
+    }
+    context
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_output_segment SET part_name = ?1 WHERE task_id = ?2 AND merged_id = ?3",
+                (title, task_id, merged_id),
+            )?;
+            Ok(())
+        })
+        .map_err(|err| err.to_string())
 }
 
 fn append_output_segments(
@@ -19691,6 +20118,25 @@ fn load_integrated_download_stats(
         .map_err(|err| err.to_string())
 }
 
+fn update_integrated_relation_workflow_status(
+    context: &SubmissionContext,
+    task_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    let now = now_rfc3339();
+    context
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_relations SET workflow_status = ?1, updated_at = ?2 \
+                 WHERE submission_task_id = ?3 AND relation_type = 'INTEGRATED'",
+                (status, &now, task_id),
+            )?;
+            Ok(())
+        })
+        .map_err(|err| err.to_string())
+}
+
 fn ensure_editable_status(context: &SubmissionContext, task_id: &str) -> Result<(), String> {
     let status = load_task_status(context, task_id)?;
     if status == "UPLOADING" {
@@ -20365,6 +20811,11 @@ fn update_submission_status_with_reason(
                 conn.execute(
           "UPDATE workflow_instances SET status = 'FAILED', progress = 0, error_message = ?1, completed_at = COALESCE(completed_at, ?2), updated_at = ?2 WHERE task_id = ?3",
           (final_reason.as_deref(), &now, task_id),
+        )?;
+            } else if status == "COMPLETED" {
+                conn.execute(
+          "UPDATE workflow_instances SET status = 'COMPLETED', current_step = NULL, progress = 100, error_message = NULL, completed_at = ?1, updated_at = ?1 WHERE task_id = ?2",
+          (&now, task_id),
         )?;
             } else {
                 conn.execute(
@@ -21213,6 +21664,7 @@ mod tests {
             aid: Some(1),
             remote_state: None,
             reject_reason: None,
+            remote_status_ignored: false,
             created_at: "2026-03-10 09:18:11".to_string(),
             updated_at: "2026-03-10 09:18:11".to_string(),
             segment_prefix: None,
@@ -21516,6 +21968,9 @@ mod tests {
             remote_aid: None,
             remote_cid: None,
             remote_part_title: None,
+            remote_video_url: None,
+            upload_part_title: None,
+            upload_part_title_mode: None,
         }];
         let result = validate_source_video_inputs(&sources);
         assert!(result.is_ok());
@@ -21532,6 +21987,9 @@ mod tests {
             remote_aid: None,
             remote_cid: None,
             remote_part_title: None,
+            remote_video_url: None,
+            upload_part_title: None,
+            upload_part_title_mode: None,
         }];
         let result = validate_source_video_inputs(&sources);
         assert_eq!(result.unwrap_err(), "第1行时间范围不合法");

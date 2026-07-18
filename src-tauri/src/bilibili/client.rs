@@ -17,7 +17,12 @@ pub struct BilibiliClient {
 impl BilibiliClient {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            // B站为国内 CDN，强制直连、忽略系统/环境变量代理：绕道代理只会更慢且多一层单点。
+            // TUN 模式在 IP 层接管则无法在此绕过，需在 Clash 侧为 B站域名配 DIRECT 规则。
+            client: Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             base_url: "https://api.bilibili.com".to_string(),
             passport_base_url: "https://passport.bilibili.com".to_string(),
             signer: WbiSigner::new(),

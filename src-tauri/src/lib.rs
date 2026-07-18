@@ -276,6 +276,8 @@ pub fn run() {
             commands::baidu_sync::baidu_sync_update_settings,
             commands::submission::submission_create,
             commands::submission::submission_update,
+            commands::submission::submission_start,
+            commands::submission::submission_ignore_remote_status,
             commands::submission::submission_repost,
             commands::submission::submission_repost_transcode,
             commands::submission::submission_resegment,

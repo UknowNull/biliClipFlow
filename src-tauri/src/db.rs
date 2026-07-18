@@ -55,6 +55,12 @@ impl Db {
       "ALTER TABLE live_settings ADD COLUMN flv_fix_split_on_timestamp_jump INTEGER DEFAULT 1",
       [],
     );
+        // 方案A：重连续写同一文件开关，默认开(1)。开启后重连不再滚新分段文件，
+        // 而是续写当前文件，消除因重连产生的破碎分段与文件间接缝。
+        let _ = conn.execute(
+            "ALTER TABLE live_settings ADD COLUMN reconnect_keep_file INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN aid INTEGER", []);
         let _ = conn.execute(
             "ALTER TABLE submission_task ADD COLUMN remote_state INTEGER",
@@ -87,6 +93,10 @@ impl Db {
         );
         let _ = conn.execute(
             "ALTER TABLE submission_task ADD COLUMN baidu_sync_filename TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE submission_task ADD COLUMN remote_status_ignored INTEGER DEFAULT 0",
             [],
         );
         let _ = conn.execute(
@@ -231,6 +241,14 @@ impl Db {
         );
         let _ = conn.execute(
             "ALTER TABLE task_source_video ADD COLUMN remote_part_title TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE task_source_video ADD COLUMN upload_part_title TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE task_source_video ADD COLUMN upload_part_title_mode TEXT DEFAULT 'AUTO'",
             [],
         );
         let _ = conn.execute(

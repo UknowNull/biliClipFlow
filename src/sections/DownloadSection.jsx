@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import LoadingButton from "../components/LoadingButton";
 import { showErrorDialog } from "../lib/dialog";
 import { invokeCommand } from "../lib/tauri";
@@ -30,6 +31,15 @@ const defaultWorkflowConfig = {
 
 const buildMergeGroupId = () =>
   `group_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+
+// 提交时的上传分P标题:仅 CUSTOM 且非空才下发,AUTO 交后端按最终顺序生成 P{index}。
+const resolveSubmittedUploadPartTitle = (item) => {
+  if ((item?.uploadPartTitleMode || "AUTO") !== "CUSTOM") {
+    return null;
+  }
+  const value = String(item?.uploadPartTitle || "").trim();
+  return value ? value.slice(0, 80) : null;
+};
 
 const buildMergeItemsFromParts = (parts) =>
   (parts || [])
@@ -145,6 +155,15 @@ const buildPartKey = (videoKey, cid) => {
 const buildDuplicatePartKey = (videoKey, cid) =>
   `${videoKey}:${cid}:${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
 
+const buildLocalPartKey = () =>
+  `local:${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+
+const getFileTitle = (path) => {
+  const fileName = normalizePath(path).split("/").filter(Boolean).pop() || "本地视频";
+  const dotIndex = fileName.lastIndexOf(".");
+  return dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+};
+
 const insertSubmitMergeItemClone = (items, sourceId, clonedId) => {
   const next = [];
   let inserted = false;
@@ -221,12 +240,16 @@ export default function DownloadSection({
   const [defaultDownloadPath, setDefaultDownloadPath] = useState("");
   const [message, setMessage] = useState("");
   const [downloadList, setDownloadList] = useState([]);
+  const [downloadTotal, setDownloadTotal] = useState(0);
+  const [downloadPage, setDownloadPage] = useState(1);
+  const [downloadPageSize, setDownloadPageSize] = useState(20);
   const [loadingDownloads, setLoadingDownloads] = useState(false);
   const [submitSubmitting, setSubmitSubmitting] = useState(false);
   const [defaultBaiduSyncPath, setDefaultBaiduSyncPath] = useState("/录播");
   const [currentUpProfile, setCurrentUpProfile] = useState({ uid: 0, name: "" });
   const [bilibiliAccounts, setBilibiliAccounts] = useState([]);
   const [selectedBilibiliUid, setSelectedBilibiliUid] = useState("");
+  const [sourceVideos, setSourceVideos] = useState([]);
 
   const [integrationEnabled, setIntegrationEnabled] = useState(false);
   const [segmentationEnabled, setSegmentationEnabled] = useState(true);
@@ -243,6 +266,7 @@ export default function DownloadSection({
     activityMissionId: "",
     activityTitle: "",
     segmentPrefix: "",
+    immediateSubmit: true,
     priority: false,
     baiduSyncEnabled: false,
     baiduSyncPath: "",
@@ -299,7 +323,7 @@ export default function DownloadSection({
   }, [videoItems]);
 
   const selectedPartsConfig = useMemo(() => {
-    return videoItems.flatMap((item) =>
+    const remoteParts = videoItems.flatMap((item) =>
       item.selectedPartsConfig.map((part) => ({
         ...part,
         videoKey: item.key,
@@ -307,7 +331,22 @@ export default function DownloadSection({
         sourceType: item.sourceType || "BILIBILI",
       })),
     );
-  }, [videoItems]);
+    const localParts = sourceVideos.map((source) => ({
+      key: source.localId,
+      cid: source.cid || 0,
+      title: source.title || "本地视频",
+      videoKey: source.localId,
+      videoTitle: source.title || "本地视频",
+      sourceType: "LOCAL",
+      filePath: source.sourceFilePath,
+      startTime: source.startTime || "00:00:00",
+      endTime: source.endTime || source.durationText || "00:00:00",
+      duration: source.durationSeconds || 0,
+      uploadPartTitle: source.uploadPartTitle || "",
+      uploadPartTitleMode: source.uploadPartTitleMode || "AUTO",
+    }));
+    return [...remoteParts, ...localParts];
+  }, [sourceVideos, videoItems]);
 
   const selectedVideoItems = useMemo(() => {
     return videoItems.filter((item) => item.selectedParts.length > 0);
@@ -323,7 +362,6 @@ export default function DownloadSection({
   const hasBilibiliSelection = selectedVideoItems.some(
     (item) => (item.sourceType || "BILIBILI") !== DIRECT_SOURCE_TYPE,
   );
-  const hasMixedSourceSelection = hasDirectSelection && hasBilibiliSelection;
   const allVideosSelected =
     hasVideo &&
     videoItems.every(
@@ -558,23 +596,24 @@ export default function DownloadSection({
     loadBaiduSyncSettings();
   }, []);
 
-  const loadDownloadList = async (status = activeRecordStatus) => {
+  const loadDownloadList = async (
+    status = activeRecordStatus,
+    page = downloadPage,
+    size = downloadPageSize,
+  ) => {
     setLoadingDownloads(true);
     setMessage("");
     try {
-      if (status === 1) {
-        const [downloading, paused] = await Promise.all([
-          invokeCommand("download_list_by_status", { status: 1 }),
-          invokeCommand("download_list_by_status", { status: 4 }),
-        ]);
-        const merged = [...(downloading || []), ...(paused || [])].sort(
-          (a, b) => (b.id || 0) - (a.id || 0),
-        );
-        setDownloadList(merged);
-      } else {
-        const data = await invokeCommand("download_list_by_status", { status });
-        setDownloadList(data || []);
-      }
+      const data = await invokeCommand("download_list_by_status", {
+        status,
+        page,
+        page_size: size,
+        pageSize: size,
+      });
+      setDownloadList(data?.items || []);
+      setDownloadTotal(Number(data?.total || 0));
+      setDownloadPage(Number(data?.page || page));
+      setDownloadPageSize(Number(data?.pageSize || data?.page_size || size));
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -598,7 +637,7 @@ export default function DownloadSection({
 
   useEffect(() => {
     if (mainTab === "records") {
-      loadDownloadList();
+      loadDownloadList(activeRecordStatus, 1, downloadPageSize);
     }
   }, [mainTab, activeRecordStatus]);
 
@@ -607,10 +646,10 @@ export default function DownloadSection({
       return undefined;
     }
     const timer = setInterval(() => {
-      loadDownloadList();
+      loadDownloadList(activeRecordStatus, downloadPage, downloadPageSize);
     }, 3000);
     return () => clearInterval(timer);
-  }, [mainTab, activeRecordStatus]);
+  }, [mainTab, activeRecordStatus, downloadPage, downloadPageSize]);
 
   useEffect(() => {
     if (mainTab !== "download") {
@@ -844,8 +883,8 @@ export default function DownloadSection({
 
   const handleSearch = async () => {
     const rawInputs = extractVideoInputs(searchInput);
-    const parsedInputs = [];
-    const directInputs = [];
+    // 保留输入链接的原始顺序（B站与第三方按粘贴顺序混排展示），仅去重。
+    const orderedInputs = [];
     const seen = new Set();
     rawInputs.forEach((raw, index) => {
       const { bvid, aid } = parseVideoInput(raw);
@@ -855,7 +894,7 @@ export default function DownloadSection({
           const key = `${DIRECT_SOURCE_TYPE}:${direct.url}`;
           if (!seen.has(key)) {
             seen.add(key);
-            directInputs.push({ ...direct, key });
+            orderedInputs.push({ type: DIRECT_SOURCE_TYPE, key, direct });
           }
         }
         return;
@@ -865,9 +904,9 @@ export default function DownloadSection({
         return;
       }
       seen.add(key);
-      parsedInputs.push({ bvid, aid, key, raw });
+      orderedInputs.push({ type: "BILIBILI", key, bvid, aid, raw });
     });
-    if (parsedInputs.length === 0 && directInputs.length === 0) {
+    if (orderedInputs.length === 0) {
       setMessage("请输入正确的 BV 号、AV 号、B站链接或第三方视频直链");
       return;
     }
@@ -879,45 +918,48 @@ export default function DownloadSection({
     try {
       const nextItems = [];
       const errorMessages = [];
-      for (const input of directInputs) {
-        const duration = await fetchDirectDuration(input.url);
-        nextItems.push({
-          key: input.key,
-          input: input.url,
-          sourceType: DIRECT_SOURCE_TYPE,
-          bvid: "",
-          aid: "",
-          info: {
-            title: input.title,
-            desc: input.url,
-            owner: { name: "第三方直链" },
-          },
-          parts: [
-            {
-              cid: 0,
-              part: input.title,
-              duration,
-              sourceType: DIRECT_SOURCE_TYPE,
-              extension: input.extension,
+      // 按输入顺序依次查询并展示（第三方探测时长 / B站查详情），保持与粘贴顺序一致。
+      for (const entry of orderedInputs) {
+        if (entry.type === DIRECT_SOURCE_TYPE) {
+          const direct = entry.direct;
+          const duration = await fetchDirectDuration(direct.url);
+          nextItems.push({
+            key: entry.key,
+            input: direct.url,
+            sourceType: DIRECT_SOURCE_TYPE,
+            bvid: "",
+            aid: "",
+            info: {
+              title: direct.title,
+              desc: direct.url,
+              owner: { name: "第三方直链" },
             },
-          ],
-          selectedParts: [],
-          selectedPartsConfig: [],
-          coverUrl: "",
-          avatarUrl: "",
-        });
-      }
-      for (const input of parsedInputs) {
+            parts: [
+              {
+                cid: 0,
+                part: direct.title,
+                duration,
+                sourceType: DIRECT_SOURCE_TYPE,
+                extension: direct.extension,
+              },
+            ],
+            selectedParts: [],
+            selectedPartsConfig: [],
+            coverUrl: "",
+            avatarUrl: "",
+          });
+          continue;
+        }
         try {
-          const data = await invokeCommand("video_detail", { bvid: input.bvid, aid: input.aid });
+          const data = await invokeCommand("video_detail", { bvid: entry.bvid, aid: entry.aid });
           const pages = Array.isArray(data?.pages) ? data.pages : [];
           const coverUrl = await fetchProxyImage(data?.pic);
           const avatarUrl = await fetchProxyImage(data?.owner?.face);
           nextItems.push({
-            key: input.key,
-            input: input.raw,
-            bvid: input.bvid,
-            aid: input.aid,
+            key: entry.key,
+            input: entry.raw,
+            bvid: entry.bvid,
+            aid: entry.aid,
             info: data,
             parts: pages,
             selectedParts: [],
@@ -927,7 +969,7 @@ export default function DownloadSection({
           });
         } catch (error) {
           const errorMessage = error?.message || "未知错误";
-          errorMessages.push(`${input.raw}: ${errorMessage}`);
+          errorMessages.push(`${entry.raw}: ${errorMessage}`);
         }
       }
       setVideoItems(nextItems);
@@ -944,21 +986,24 @@ export default function DownloadSection({
           downloadName: "",
         }));
       }
-      if (nextItems.length > 0 && nextItems[0].parts.length > 0) {
-        if (nextItems[0].sourceType === DIRECT_SOURCE_TYPE) {
-          setAvailableResolutions([]);
-          setAvailableCodecs([]);
-          setAvailableFormats([{ value: "direct", label: "直链原文件" }]);
-          setDownloadConfig((prev) => ({
-            ...prev,
-            resolution: "",
-            codec: "",
-            format: "direct",
-            content: "audio_video",
-          }));
-        } else {
-          await loadPlayOptions(nextItems[0].info, nextItems[0].parts[0]);
-        }
+      // 清晰度/编码/格式是 B站项的全局配置：从第一个 B站项加载（无论它排在第几），
+      // 这样混排后即便第三方排在最前，B站项仍能正常配置；仅当全是第三方时才用"直链原文件"。
+      const firstBilibiliItem = nextItems.find(
+        (item) => item.sourceType !== DIRECT_SOURCE_TYPE,
+      );
+      if (firstBilibiliItem && firstBilibiliItem.parts.length > 0) {
+        await loadPlayOptions(firstBilibiliItem.info, firstBilibiliItem.parts[0]);
+      } else if (nextItems.some((item) => item.sourceType === DIRECT_SOURCE_TYPE)) {
+        setAvailableResolutions([]);
+        setAvailableCodecs([]);
+        setAvailableFormats([{ value: "direct", label: "直链原文件" }]);
+        setDownloadConfig((prev) => ({
+          ...prev,
+          resolution: "",
+          codec: "",
+          format: "direct",
+          content: "audio_video",
+        }));
       }
       if (errorMessages.length > 0) {
         setMessage(`部分视频获取失败：${errorMessages[0]}`);
@@ -997,6 +1042,8 @@ export default function DownloadSection({
         filePath: defaultPath,
         startTime: existing?.startTime || "00:00:00",
         endTime: existing?.endTime || formatDurationHms(part.duration),
+        uploadPartTitle: existing?.uploadPartTitle || "",
+        uploadPartTitleMode: existing?.uploadPartTitleMode || "AUTO",
       };
     });
   };
@@ -1156,6 +1203,109 @@ export default function DownloadSection({
     setSubmitMergeSelection((prev) => {
       const next = new Set(prev);
       next.delete(partKey);
+      return next;
+    });
+  };
+
+  const updateSourceVideosByKey = (sourceId, updater) => {
+    setSourceVideos((prev) =>
+      prev.map((item) => {
+        if (item.localId !== sourceId) {
+          return item;
+        }
+        return updater(item);
+      }),
+    );
+  };
+
+  const addLocalSourceFile = async () => {
+    setMessage("");
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [
+          {
+            name: "视频文件",
+            extensions: ["mp4", "mkv", "flv", "mov", "avi", "webm", "ts", "m4v"],
+          },
+        ],
+      });
+      if (!selected) {
+        return;
+      }
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (!path) {
+        return;
+      }
+      let durationSeconds = 0;
+      try {
+        const duration = await invokeCommand("video_duration", { path });
+        durationSeconds = Number(duration) || 0;
+      } catch (_) {
+        durationSeconds = 0;
+      }
+      const localId = buildLocalPartKey();
+      const durationText = durationSeconds > 0 ? formatDurationHms(durationSeconds) : "00:00:00";
+      setSourceVideos((prev) => [
+        ...prev,
+        {
+          localId,
+          sourceFilePath: path,
+          title: getFileTitle(path),
+          cid: 0,
+          startTime: "00:00:00",
+          endTime: durationText,
+          durationSeconds,
+          durationText,
+          uploadPartTitle: "",
+          uploadPartTitleMode: "AUTO",
+        },
+      ]);
+    } catch (error) {
+      setMessage(error?.message || "选择本地视频失败");
+    }
+  };
+
+  const duplicateLocalSource = (sourceId) => {
+    const target = sourceVideos.find((item) => item.localId === sourceId);
+    if (!target) {
+      return;
+    }
+    const clonedId = buildLocalPartKey();
+    setSourceVideos((prev) => {
+      const index = prev.findIndex((item) => item.localId === sourceId);
+      const next = [...prev];
+      next.splice(index + 1, 0, { ...target, localId: clonedId });
+      return next;
+    });
+    setSubmitMergeItems((prev) => insertSubmitMergeItemClone(prev, sourceId, clonedId));
+    setSubmitMergeSelection((prev) => {
+      const next = new Set(prev);
+      next.delete(clonedId);
+      return next;
+    });
+  };
+
+  const removeLocalSource = (sourceId) => {
+    setSourceVideos((prev) => prev.filter((item) => item.localId !== sourceId));
+    setSubmitMergeItems((prev) =>
+      prev
+        .map((item) => {
+          if (item.type === "GROUP") {
+            return {
+              ...item,
+              sourceIds: (item.sourceIds || []).filter((id) => id !== sourceId),
+            };
+          }
+          return item;
+        })
+        .filter((item) => item.type !== "GROUP" || (item.sourceIds || []).length > 0)
+        .filter((item) => item.type !== "SOURCE" || item.sourceId !== sourceId),
+    );
+    setSubmitMergeSelection((prev) => {
+      const next = new Set(prev);
+      next.delete(sourceId);
       return next;
     });
   };
@@ -1338,6 +1488,7 @@ export default function DownloadSection({
       activityTitle: task.activityTitle || "",
       videoType: task.videoType || "ORIGINAL",
       segmentPrefix: task.segmentPrefix || "",
+      immediateSubmit: true,
       priority: Boolean(task.priority),
       baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
       baiduSyncPath: task.baiduSyncPath || "",
@@ -1555,7 +1706,7 @@ export default function DownloadSection({
       for (const item of prev) {
         if (item.type === "SOURCE" && selectedSet.has(item.sourceId)) {
           if (!inserted) {
-            next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected });
+            next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected, uploadPartTitle: "", uploadPartTitleMode: "AUTO" });
             inserted = true;
           }
           continue;
@@ -1568,6 +1719,21 @@ export default function DownloadSection({
       return next;
     });
     setSubmitMergeSelection(new Set());
+  };
+
+  const updateSubmitMergeGroupTitle = (groupId, value) => {
+    const next = String(value || "").slice(0, 80);
+    setSubmitMergeItems((prev) =>
+      prev.map((item) =>
+        item.type === "GROUP" && item.id === groupId
+          ? {
+              ...item,
+              uploadPartTitle: next,
+              uploadPartTitleMode: next.trim() ? "CUSTOM" : "AUTO",
+            }
+          : item,
+      ),
+    );
   };
 
   const releaseSubmitMergeGroup = (groupId) => {
@@ -1782,6 +1948,8 @@ export default function DownloadSection({
           groups.push({
             order: groups.length + 1,
             sources: groupSources,
+            uploadPartTitle: resolveSubmittedUploadPartTitle(item),
+            uploadPartTitleMode: item.uploadPartTitleMode || "AUTO",
           });
         }
         continue;
@@ -1801,6 +1969,8 @@ export default function DownloadSection({
               sortOrder: 1,
             },
           ],
+          uploadPartTitle: resolveSubmittedUploadPartTitle(source),
+          uploadPartTitleMode: source.uploadPartTitleMode || "AUTO",
         });
       } else {
         remainingSources.push({
@@ -1822,6 +1992,61 @@ export default function DownloadSection({
   const resolvePartIndexById = (sourceId) =>
     selectedPartsConfig.findIndex((item) => item.key === sourceId);
 
+  // 计算每个「最终上传单元」(合并组算一个单元、顶层独立源算一个单元)的自动分P标题 P1/P2/...
+  // 顺序与 submitMergeItems 渲染顺序一致;CUSTOM 标题不在此处覆盖,渲染时优先取自定义值。
+  const uploadUnitLabelByKey = useMemo(() => {
+    const map = new Map();
+    let counter = 0;
+    for (const item of submitMergeItems) {
+      if (item.type === "GROUP") {
+        const valid = (item.sourceIds || []).some(
+          (sid) => selectedPartsConfig.findIndex((p) => p.key === sid) >= 0,
+        );
+        if (!valid) {
+          continue;
+        }
+        counter += 1;
+        map.set(item.id, `P${counter}`);
+        continue;
+      }
+      if (selectedPartsConfig.findIndex((p) => p.key === item.sourceId) < 0) {
+        continue;
+      }
+      counter += 1;
+      map.set(item.sourceId, `P${counter}`);
+    }
+    return map;
+  }, [submitMergeItems, selectedPartsConfig]);
+
+  // 源视频行(独立分组/未合并源)上传分P标题列的显示值与编辑回调。
+  const updateSourceUploadPartTitle = (sourceId, isLocalSource, value) => {
+    const next = String(value || "").slice(0, 80);
+    const mode = next.trim() ? "CUSTOM" : "AUTO";
+    if (isLocalSource) {
+      updateSourceVideosByKey(sourceId, (source) => ({
+        ...source,
+        uploadPartTitle: next,
+        uploadPartTitleMode: mode,
+      }));
+      return;
+    }
+    setVideoItems((prev) =>
+      prev.map((item) => {
+        if (!item.selectedPartsConfig.some((part) => part.key === sourceId)) {
+          return item;
+        }
+        return {
+          ...item,
+          selectedPartsConfig: item.selectedPartsConfig.map((part) =>
+            part.key === sourceId
+              ? { ...part, uploadPartTitle: next, uploadPartTitleMode: mode }
+              : part,
+          ),
+        };
+      }),
+    );
+  };
+
   const renderSubmitMergeRow = ({
     sourceId,
     displayIndex,
@@ -1833,6 +2058,7 @@ export default function DownloadSection({
       return null;
     }
     const part = selectedPartsConfig[partIndex];
+    const isLocalSource = part.sourceType === "LOCAL";
     const isGroupedRow = Boolean(groupId);
     const activeMergeId = mergeItemId || sourceId;
     const submitMergeItem = !isGroupedRow ? submitMergeItems.find((i) => i.type === "SOURCE" && i.sourceId === sourceId) : null;
@@ -1894,12 +2120,33 @@ export default function DownloadSection({
         </td>
         <td className="px-3 py-2 text-[var(--content-color)]">{part.videoTitle}</td>
         <td className="px-3 py-2">
-          <input value={part.filePath} readOnly className="w-full" />
+          {isLocalSource ? (
+            <input
+              value={part.filePath}
+              onChange={(event) =>
+                updateSourceVideosByKey(sourceId, (source) => ({
+                  ...source,
+                  sourceFilePath: event.target.value,
+                  title: source.title || getFileTitle(event.target.value),
+                }))
+              }
+              className="w-full"
+            />
+          ) : (
+            <input value={part.filePath} readOnly className="w-full" />
+          )}
         </td>
         <td className="px-3 py-2">
           <input
             value={part.startTime}
-            onChange={(event) => updatePartConfig(sourceId, "startTime", event.target.value)}
+            onChange={(event) =>
+              isLocalSource
+                ? updateSourceVideosByKey(sourceId, (source) => ({
+                    ...source,
+                    startTime: event.target.value,
+                  }))
+                : updatePartConfig(sourceId, "startTime", event.target.value)
+            }
             placeholder="00:00:00"
             className="w-full"
           />
@@ -1907,10 +2154,40 @@ export default function DownloadSection({
         <td className="px-3 py-2">
           <input
             value={part.endTime}
-            onChange={(event) => updatePartConfig(sourceId, "endTime", event.target.value)}
+            onChange={(event) =>
+              isLocalSource
+                ? updateSourceVideosByKey(sourceId, (source) => ({
+                    ...source,
+                    endTime: event.target.value,
+                  }))
+                : updatePartConfig(sourceId, "endTime", event.target.value)
+            }
             placeholder="00:00:00"
             className="w-full"
           />
+        </td>
+        <td className="px-3 py-2">
+          {isGroupedRow ? (
+            <span className="text-[var(--desc-color)]" title="合并组分P标题在组标题处编辑">
+              —
+            </span>
+          ) : (
+            <input
+              value={
+                (part.uploadPartTitleMode || "AUTO") === "CUSTOM"
+                  ? part.uploadPartTitle || ""
+                  : uploadUnitLabelByKey.get(sourceId) || ""
+              }
+              onChange={(event) =>
+                updateSourceUploadPartTitle(sourceId, isLocalSource, event.target.value)
+              }
+              maxLength={80}
+              disabled={segmentationEnabled}
+              title={segmentationEnabled ? "分段开启时使用自动分P标题" : ""}
+              placeholder={uploadUnitLabelByKey.get(sourceId) || "P1"}
+              className="w-full disabled:cursor-not-allowed disabled:opacity-60"
+            />
+          )}
         </td>
         <td className="px-3 py-2 text-[var(--desc-color)]">
           {submitGroupedSourceIds.has(sourceId) ? "已合并" : "未合并"}
@@ -1920,14 +2197,18 @@ export default function DownloadSection({
             <button
               type="button"
               className="h-7 px-2 rounded border border-[var(--split-color)] text-xs text-[var(--content-color)]"
-              onClick={() => duplicatePartConfig(sourceId)}
+              onClick={() =>
+                isLocalSource ? duplicateLocalSource(sourceId) : duplicatePartConfig(sourceId)
+              }
             >
               复制
             </button>
             <button
               type="button"
               className="h-7 px-2 rounded border border-[var(--split-color)] text-xs text-[var(--content-color)]"
-              onClick={() => removePartConfig(sourceId)}
+              onClick={() =>
+                isLocalSource ? removeLocalSource(sourceId) : removePartConfig(sourceId)
+              }
             >
               删除
             </button>
@@ -1938,20 +2219,17 @@ export default function DownloadSection({
   };
 
   const validateIntegrationForm = () => {
-    if (selectedCount === 0) {
-      return { valid: false, message: "请至少选择一个分P" };
+    if (selectedPartsConfig.length === 0) {
+      return { valid: false, message: "请至少选择一个分P或添加一个本地视频" };
     }
-    if (hasMixedSourceSelection) {
-      return { valid: false, message: "B站视频和第三方直链请分批下载或投稿" };
+    if (hasBilibiliSelection && !downloadConfig.resolution) {
+      return { valid: false, message: "请选择分辨率（B站视频）" };
     }
-    if (!hasDirectSelection && !downloadConfig.resolution) {
-      return { valid: false, message: "请选择分辨率" };
+    if (hasBilibiliSelection && !downloadConfig.codec) {
+      return { valid: false, message: "请选择编码格式（B站视频）" };
     }
-    if (!hasDirectSelection && !downloadConfig.codec) {
-      return { valid: false, message: "请选择编码格式" };
-    }
-    if (!hasDirectSelection && !downloadConfig.format) {
-      return { valid: false, message: "请选择流媒体格式" };
+    if (hasBilibiliSelection && !downloadConfig.format) {
+      return { valid: false, message: "请选择流媒体格式（B站视频）" };
     }
     if (!submissionConfig.title.trim()) {
       return { valid: false, message: "请输入视频标题" };
@@ -1984,6 +2262,9 @@ export default function DownloadSection({
     }
     for (let index = 0; index < selectedPartsConfig.length; index += 1) {
       const part = selectedPartsConfig[index];
+      if (!String(part.filePath || "").trim()) {
+        return { valid: false, message: `第${index + 1}个源视频的文件路径不能为空` };
+      }
       if (!isValidTimeFormat(part.startTime)) {
         return { valid: false, message: `第${index + 1}个分P的开始时间格式不正确，请使用 HH:MM:SS` };
       }
@@ -2006,20 +2287,16 @@ export default function DownloadSection({
       setMessage("请至少选择一个分P");
       return false;
     }
-    if (hasMixedSourceSelection) {
-      setMessage("B站视频和第三方直链请分批下载或投稿");
+    if (hasBilibiliSelection && !downloadConfig.resolution) {
+      setMessage("请选择分辨率（B站视频）");
       return false;
     }
-    if (!hasDirectSelection && !downloadConfig.resolution) {
-      setMessage("请选择分辨率");
+    if (hasBilibiliSelection && !downloadConfig.codec) {
+      setMessage("请选择编码格式（B站视频）");
       return false;
     }
-    if (!hasDirectSelection && !downloadConfig.codec) {
-      setMessage("请选择编码格式");
-      return false;
-    }
-    if (!hasDirectSelection && !downloadConfig.format) {
-      setMessage("请选择流媒体格式");
+    if (hasBilibiliSelection && !downloadConfig.format) {
+      setMessage("请选择流媒体格式（B站视频）");
       return false;
     }
     if (!(await ensureDownloadPathReady())) {
@@ -2040,7 +2317,7 @@ export default function DownloadSection({
       await logClient(`download_submit:integration:invalid:${validation.message}`);
       return { ok: false, errorMessage: validation.message };
     }
-    if (!(await ensureDownloadPathReady())) {
+    if (hasSelection && !(await ensureDownloadPathReady())) {
       await logClient("download_submit:integration:invalid_path");
       return { ok: false, errorMessage: "下载目录不可用" };
     }
@@ -2072,6 +2349,15 @@ export default function DownloadSection({
           downloadName,
         },
       }));
+      const localVideoParts = sourceVideos.map((source) => ({
+        originalTitle: source.title || getFileTitle(source.sourceFilePath),
+        filePath: source.sourceFilePath,
+        startTime: source.startTime || null,
+        endTime: source.endTime || null,
+        cid: 0,
+        uploadPartTitle: resolveSubmittedUploadPartTitle(source),
+        uploadPartTitleMode: source.uploadPartTitleMode || "AUTO",
+      }));
       const mergeGroups = buildSubmitMergeGroupsPayload();
       const payload = {
         enableSubmission: true,
@@ -2094,17 +2380,25 @@ export default function DownloadSection({
             ? Number(submissionConfig.collectionId)
             : null,
           segmentPrefix: submissionConfig.segmentPrefix || null,
+          immediateSubmit: Boolean(submissionConfig.immediateSubmit),
           priority: Boolean(submissionConfig.priority),
           baiduSyncEnabled: Boolean(submissionConfig.baiduSyncEnabled),
           baiduSyncPath: submissionConfig.baiduSyncPath || null,
           baiduSyncFilename: submissionConfig.baiduSyncFilename || null,
-          videoParts: selectedPartsConfig.map((part) => ({
+          videoParts: [
+            ...selectedPartsConfig
+              .filter((part) => part.sourceType !== "LOCAL")
+              .map((part) => ({
             originalTitle: part.title,
             filePath: part.filePath,
             startTime: part.startTime || null,
             endTime: part.endTime || null,
             cid: part.cid,
-          })),
+            uploadPartTitle: resolveSubmittedUploadPartTitle(part),
+            uploadPartTitleMode: part.uploadPartTitleMode || "AUTO",
+              })),
+            ...localVideoParts,
+          ],
         },
       };
       await invokeCommand("download_video", { payload });
@@ -2595,7 +2889,8 @@ export default function DownloadSection({
                           <div className="rounded-lg border border-dashed border-[var(--split-color)] px-3 py-2 text-xs text-[var(--desc-color)]">
                             第三方直链将按原文件格式下载，不需要选择分辨率和编码。
                           </div>
-                        ) : (
+                        ) : null}
+                        {hasBilibiliSelection ? (
                           <div className="grid gap-2">
                             <select
                               value={downloadConfig.resolution}
@@ -2663,8 +2958,8 @@ export default function DownloadSection({
                               <option value="audio_only">仅音频</option>
                             </select>
                           </div>
-                        )}
-                        {!hasDirectSelection && playOptionsEmpty ? (
+                        ) : null}
+                        {hasBilibiliSelection && playOptionsEmpty ? (
                           <div className="rounded-lg border border-dashed border-[var(--split-color)] px-3 py-2 text-xs text-[var(--desc-color)]">
                             搜索视频后加载可选分辨率与编码。
                           </div>
@@ -2904,6 +3199,39 @@ export default function DownloadSection({
                       />
                       优先投稿（进入投稿队列时置顶）
                     </label>
+                    <div className="rounded-lg border border-[var(--split-color)] bg-white/70 p-3">
+                      <div className="text-xs uppercase tracking-[0.2em] text-[var(--desc-color)]">
+                        是否立即投稿
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-4 text-xs text-[var(--desc-color)]">
+                        <label className="flex items-center gap-2">
+                          <input
+                            type="radio"
+                            checked={submissionConfig.immediateSubmit}
+                            onChange={() =>
+                              setSubmissionConfig((prev) => ({
+                                ...prev,
+                                immediateSubmit: true,
+                              }))
+                            }
+                          />
+                          立即投稿
+                        </label>
+                        <label className="flex items-center gap-2">
+                          <input
+                            type="radio"
+                            checked={!submissionConfig.immediateSubmit}
+                            onChange={() =>
+                              setSubmissionConfig((prev) => ({
+                                ...prev,
+                                immediateSubmit: false,
+                              }))
+                            }
+                          />
+                          暂不投稿
+                        </label>
+                      </div>
+                    </div>
                     <div className="text-xs text-[var(--desc-color)]">
                       分段前缀会作为分段文件名的前缀（可选）
                     </div>
@@ -3042,13 +3370,19 @@ export default function DownloadSection({
                 </div>
               </div>
 
-              {selectedPartsConfig.length > 0 ? (
+              {selectedPartsConfig.length > 0 || downloadStep === "submission" ? (
                 <div className="panel p-4">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-sm font-semibold text-[var(--content-color)]">
                       源视频配置
                     </div>
                     <div className="flex items-center gap-2">
+                      <button
+                        className="h-8 px-3 rounded-lg border border-[var(--split-color)] text-xs text-[var(--content-color)]"
+                        onClick={addLocalSourceFile}
+                      >
+                        添加视频
+                      </button>
                       <button
                         className="h-8 px-3 rounded-lg border border-[var(--split-color)] text-xs text-[var(--content-color)] disabled:cursor-not-allowed disabled:opacity-60"
                         onClick={createSubmitMergeGroup}
@@ -3069,6 +3403,7 @@ export default function DownloadSection({
                           <th className="px-3 py-2">视频文件（必填）</th>
                           <th className="px-3 py-2">开始时间</th>
                           <th className="px-3 py-2">结束时间</th>
+                          <th className="px-3 py-2">上传分P标题</th>
                           <th className="px-3 py-2">合并状态</th>
                           <th className="px-3 py-2">操作</th>
                         </tr>
@@ -3076,7 +3411,7 @@ export default function DownloadSection({
                       <tbody>
                         {submitMergeItems.length === 0 ? (
                           <tr>
-                            <td className="px-3 py-3 text-[var(--desc-color)]" colSpan={9}>
+                            <td className="px-3 py-3 text-[var(--desc-color)]" colSpan={10}>
                               暂无配置
                             </td>
                           </tr>
@@ -3095,10 +3430,10 @@ export default function DownloadSection({
                                   data-merge-item-id={item.id}
                                   className="border-t border-[var(--split-color)]"
                                 >
-                                  <td className="p-0" colSpan={9}>
+                                  <td className="p-0" colSpan={10}>
                                     <div className="m-2 overflow-hidden rounded-lg border-2 border-[var(--primary-color)]/40 bg-white/70">
                                       <div
-                                        className="flex items-center justify-between border-b border-[var(--primary-color)]/30 bg-[var(--primary-color)]/10 px-3 py-2 text-xs text-[var(--desc-color)] cursor-grab"
+                                        className="flex items-center justify-between gap-3 border-b border-[var(--primary-color)]/30 bg-[var(--primary-color)]/10 px-3 py-2 text-xs text-[var(--desc-color)] cursor-grab"
                                         onPointerDown={(event) =>
                                           handleSubmitMergeItemPointerDown(event, item.id)
                                         }
@@ -3111,17 +3446,37 @@ export default function DownloadSection({
                                           </span>
                                           <span>{groupSources.length} 个视频</span>
                                         </div>
-                                        <button
-                                          type="button"
-                                          className="h-7 px-2 rounded border border-[var(--split-color)] text-xs text-[var(--content-color)]"
+                                        <div
+                                          className="flex items-center gap-2"
                                           onPointerDown={(event) => event.stopPropagation()}
-                                          onClick={(event) => {
-                                            event.stopPropagation();
-                                            releaseSubmitMergeGroup(item.id);
-                                          }}
                                         >
-                                          解绑
-                                        </button>
+                                          <span className="text-[var(--desc-color)]">上传分P标题</span>
+                                          <input
+                                            value={
+                                              (item.uploadPartTitleMode || "AUTO") === "CUSTOM"
+                                                ? item.uploadPartTitle || ""
+                                                : uploadUnitLabelByKey.get(item.id) || ""
+                                            }
+                                            onChange={(event) =>
+                                              updateSubmitMergeGroupTitle(item.id, event.target.value)
+                                            }
+                                            maxLength={80}
+                                            disabled={segmentationEnabled}
+                                            title={segmentationEnabled ? "分段开启时使用自动分P标题" : ""}
+                                            placeholder={uploadUnitLabelByKey.get(item.id) || "P1"}
+                                            className="h-7 w-40 rounded border border-[var(--split-color)] bg-white px-2 text-xs text-[var(--content-color)] disabled:cursor-not-allowed disabled:opacity-60"
+                                          />
+                                          <button
+                                            type="button"
+                                            className="h-7 px-2 rounded border border-[var(--split-color)] text-xs text-[var(--content-color)]"
+                                            onClick={(event) => {
+                                              event.stopPropagation();
+                                              releaseSubmitMergeGroup(item.id);
+                                            }}
+                                          >
+                                            解绑
+                                          </button>
+                                        </div>
                                       </div>
                                       <table className="w-full text-left text-sm">
                                         <tbody>
@@ -3252,13 +3607,13 @@ export default function DownloadSection({
                 <span className="text-sm font-semibold text-[var(--content-color)]">
                   {activeRecordLabel}（{downloadList.length}）
                 </span>
-                <button
-                  className="ml-auto h-8 px-3 rounded-lg"
-                  onClick={() => loadDownloadList()}
-                  disabled={loadingDownloads}
-                >
-                  {loadingDownloads ? "刷新中..." : "刷新"}
-                </button>
+            <button
+              className="ml-auto h-8 px-3 rounded-lg"
+              onClick={() => loadDownloadList(activeRecordStatus, downloadPage, downloadPageSize)}
+              disabled={loadingDownloads}
+            >
+              {loadingDownloads ? "刷新中..." : "刷新"}
+            </button>
               </div>
               <div className="flex flex-col gap-2 overflow-y-auto pr-1 min-h-0">
                 {downloadList.length === 0 ? (
@@ -3348,6 +3703,54 @@ export default function DownloadSection({
                     );
                   })
                 )}
+              </div>
+              <div className="flex items-center justify-between gap-3 border-t border-black/5 px-1 pt-2 text-xs text-[var(--desc-color)]">
+                <div>
+                  共 {downloadTotal} 条，当前第 {downloadPage} 页
+                </div>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={downloadPageSize}
+                    onChange={(event) => {
+                      const nextSize = Number(event.target.value);
+                      setDownloadPageSize(nextSize);
+                      loadDownloadList(activeRecordStatus, 1, nextSize);
+                    }}
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                  >
+                    {[10, 20, 50].map((size) => (
+                      <option key={size} value={size}>
+                        {size} 条/页
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={() =>
+                      setDownloadPage((prev) => {
+                        const next = Math.max(1, prev - 1);
+                        loadDownloadList(activeRecordStatus, next, downloadPageSize);
+                        return next;
+                      })
+                    }
+                    disabled={downloadPage <= 1}
+                  >
+                    上一页
+                  </button>
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={() =>
+                      setDownloadPage((prev) => {
+                        const next = prev + 1;
+                        loadDownloadList(activeRecordStatus, next, downloadPageSize);
+                        return next;
+                      })
+                    }
+                    disabled={downloadList.length < downloadPageSize}
+                  >
+                    下一页
+                  </button>
+                </div>
               </div>
             </div>
           </div>

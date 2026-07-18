@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS submission_task (
   baidu_sync_enabled INTEGER DEFAULT 0,
   baidu_sync_path TEXT,
   baidu_sync_filename TEXT,
+  remote_status_ignored INTEGER DEFAULT 0,
   source_type TEXT DEFAULT 'NORMAL'
 );
 
@@ -143,6 +144,8 @@ CREATE TABLE IF NOT EXISTS task_source_video (
   remote_aid INTEGER,
   remote_cid INTEGER,
   remote_part_title TEXT,
+  upload_part_title TEXT,
+  upload_part_title_mode TEXT DEFAULT 'AUTO',
   sort_order INTEGER NOT NULL,
   start_time TEXT,
   end_time TEXT,
@@ -419,6 +422,7 @@ CREATE TABLE IF NOT EXISTS live_settings (
   flv_fix_disable_on_annexb INTEGER NOT NULL,
   baidu_sync_enabled INTEGER NOT NULL DEFAULT 0,
   baidu_sync_path TEXT,
+  reconnect_keep_file INTEGER NOT NULL DEFAULT 1,
   create_time TEXT NOT NULL,
   update_time TEXT NOT NULL
 );

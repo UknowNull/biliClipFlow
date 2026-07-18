@@ -10,7 +10,7 @@ import {
 import LoadingButton from "../components/LoadingButton";
 import { showErrorDialog } from "../lib/dialog";
 import { invokeCommand } from "../lib/tauri";
-import { formatDateTime } from "../lib/format";
+import { formatDateTime, parseVideoInput } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
 import BaiduRemoteFilePicker from "../components/BaiduRemoteFilePicker";
 import CoverCropModal from "../components/CoverCropModal";
@@ -25,6 +25,7 @@ import {
 
 const statusFilters = [
   { value: "ALL", label: "全部" },
+  { value: "PENDING_SUBMIT", label: "待投稿" },
   { value: "PENDING", label: "待处理" },
   { value: "CLIPPING", label: "剪辑中" },
   { value: "MERGING", label: "合并中" },
@@ -50,10 +51,13 @@ const buildMergeGroupId = () =>
 const emptySource = (index) => ({
   localId: buildSourceId(),
   sourceFilePath: "",
+  remoteVideoUrl: "",
   remoteBvid: "",
   remoteAid: 0,
   remoteCid: 0,
   remotePartTitle: "",
+  uploadPartTitle: "",
+  uploadPartTitleMode: "AUTO",
   sortOrder: index + 1,
   startTime: "00:00:00",
   endTime: "00:00:00",
@@ -117,6 +121,10 @@ const buildMergeItemsFromSources = (sources) =>
     .map((id) => ({ id, type: "SOURCE", sourceId: id, standalone: false }));
 
 const formatSourceBindingSummary = (source) => {
+  const remoteVideoUrl = String(source?.remoteVideoUrl || "").trim();
+  if (remoteVideoUrl && !String(source?.remoteBvid || "").trim()) {
+    return "已绑定下载链接";
+  }
   const remoteBvid = String(source?.remoteBvid || "").trim();
   if (!remoteBvid) {
     return "";
@@ -132,11 +140,127 @@ const formatSourceBindingSummary = (source) => {
   return "已绑定BV，未指定分P";
 };
 
+const isDownloadUrlInput = (value) => /^https?:\/\//i.test(String(value || "").trim());
+const isBilibiliUrlInput = (value) => {
+  if (!isDownloadUrlInput(value)) {
+    return false;
+  }
+  try {
+    const host = new URL(String(value || "").trim()).hostname.toLowerCase();
+    return host === "bilibili.com" || host.endsWith(".bilibili.com") || host === "b23.tv";
+  } catch (_) {
+    return false;
+  }
+};
+const resolveSourceRemoteInput = (source) =>
+  String(source?.remoteVideoUrl || source?.remoteBvid || "").trim();
+
+const normalizeUploadPartTitle = (value) =>
+  String(value || "").trim().slice(0, 80);
+
+const resolveUploadPartTitleMode = (source) =>
+  String(source?.uploadPartTitleMode || "").trim().toUpperCase() === "CUSTOM" &&
+  normalizeUploadPartTitle(source?.uploadPartTitle)
+    ? "CUSTOM"
+    : "AUTO";
+
+const buildSourceVideoPayload = (source, index) => {
+  const mode = resolveUploadPartTitleMode(source);
+  const title = mode === "CUSTOM" ? normalizeUploadPartTitle(source.uploadPartTitle) : "";
+  return {
+    sourceFilePath: source.sourceFilePath,
+    remoteVideoUrl: source.remoteVideoUrl || null,
+    remoteBvid: source.remoteBvid || null,
+    remoteAid: source.remoteAid || null,
+    remoteCid: source.remoteCid || null,
+    remotePartTitle: source.remotePartTitle || null,
+    uploadPartTitle: title || null,
+    uploadPartTitleMode: mode,
+    sortOrder: index + 1,
+    startTime: source.startTime || null,
+    endTime: source.endTime || null,
+  };
+};
+
+// 计算各最终上传单元（合并组算一个、独立/未合并源各算一个，未合并未独立源合并为尾部一个单元）
+// 的 AUTO 占位标题 P{n}，顺序与 buildMergeGroupsPayload 的单元顺序一致。
+const resolveUploadPartTitles = (items, sources) => {
+  const sourceMap = new Map(
+    (sources || []).filter((s) => s?.localId).map((s) => [s.localId, s]),
+  );
+  const groupTitleMap = new Map();
+  const sourceTitleMap = new Map();
+  const list = Array.isArray(items) ? items : [];
+  const hasGroup = list.some((i) => i.type === "GROUP");
+  const hasStandalone = list.some((i) => i.type === "SOURCE" && i.standalone);
+  if (!hasGroup && !hasStandalone) {
+    // 全部合并为一个单元 P1
+    list.forEach((i) => {
+      if (i.type === "SOURCE" && sourceMap.has(i.sourceId)) {
+        sourceTitleMap.set(i.sourceId, "P1");
+      }
+    });
+    return { groupTitleMap, sourceTitleMap };
+  }
+  let order = 0;
+  const remaining = [];
+  for (const item of list) {
+    if (item.type === "GROUP") {
+      const valid = (item.sourceIds || []).filter((id) => sourceMap.has(id));
+      if (valid.length > 0) {
+        order += 1;
+        groupTitleMap.set(item.id, `P${order}`);
+      }
+    } else if (sourceMap.has(item.sourceId)) {
+      if (item.standalone) {
+        order += 1;
+        sourceTitleMap.set(item.sourceId, `P${order}`);
+      } else {
+        remaining.push(item.sourceId);
+      }
+    }
+  }
+  if (remaining.length > 0) {
+    order += 1;
+    remaining.forEach((id) => sourceTitleMap.set(id, `P${order}`));
+  }
+  return { groupTitleMap, sourceTitleMap };
+};
+
 const sanitizeLocalFileName = (value) =>
   String(value || "")
     .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
     .replace(/\s+/g, " ")
     .trim();
+
+const parseDirectVideoUrl = (raw) => {
+  const value = String(raw || "").trim();
+  if (!isDownloadUrlInput(value) || isBilibiliUrlInput(value)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    const fileName = decodeURIComponent(parsed.pathname || "")
+      .split("/")
+      .filter(Boolean)
+      .pop() || "download.mp4";
+    const dotIndex = fileName.lastIndexOf(".");
+    const title = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+    const extension = dotIndex > 0 ? fileName.slice(dotIndex + 1).toLowerCase() : "mp4";
+    return {
+      url: value,
+      title: title || "第三方视频",
+      fileName,
+      extension,
+    };
+  } catch (_) {
+    return null;
+  }
+};
+
+// 是否为"第三方直链"(http/https 直链且非 B站域名)。用于把 B站网页链接正确路由到分P选择，
+// 真直链路由到"保存+探测时长"。isDownloadUrlInput 对 bilibili.com/b23.tv 也为真，不能用于此判定。
+const isDirectSourceInput = (value) => Boolean(parseDirectVideoUrl(value));
 
 export default function SubmissionSection({
   activeBilibiliUid = "",
@@ -156,6 +280,7 @@ export default function SubmissionSection({
     activityTitle: "",
     videoType: "ORIGINAL",
     segmentPrefix: "",
+    immediateSubmit: true,
     priority: false,
     baiduSyncEnabled: false,
     baiduSyncPath: "",
@@ -217,8 +342,10 @@ export default function SubmissionSection({
   const [sourcePartPickerPages, setSourcePartPickerPages] = useState([]);
   const [sourcePartPickerError, setSourcePartPickerError] = useState("");
   const [deleteTargetId, setDeleteTargetId] = useState("");
+  const [deleteTargetIds, setDeleteTargetIds] = useState([]);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deletePreview, setDeletePreview] = useState(null);
+  const [deleteBatchPreviews, setDeleteBatchPreviews] = useState([]);
   const [deleteTaskChecked, setDeleteTaskChecked] = useState(false);
   const [deleteFilesChecked, setDeleteFilesChecked] = useState(false);
   const [deleteFileSelections, setDeleteFileSelections] = useState(() => new Set());
@@ -365,9 +492,12 @@ export default function SubmissionSection({
   const selectedTaskHasBvid = Boolean(String(selectedTask?.task?.bvid || "").trim());
   const canSyncRemoteEdit = selectedTaskHasBvid;
   const groupedSourceIds = buildGroupedSourceIdSet(mergeItems);
+  const uploadTitleHints = resolveUploadPartTitles(mergeItems, sourceVideos);
   const quickFillPageSize = 10;
   const deleteFiles = deletePreview?.files || [];
   const deleteHasFiles = deleteFiles.length > 0;
+  const isBatchDelete = deleteTargetIds.length > 0;
+  const deleteTargetCount = isBatchDelete ? deleteTargetIds.length : deleteTargetId ? 1 : 0;
   const buildPartitionOptionValue = (partition) => {
     const tid = String(partition?.tid ?? "").trim();
     if (!tid) {
@@ -519,8 +649,10 @@ export default function SubmissionSection({
 
   const resetDeleteState = () => {
     setDeleteTargetId("");
+    setDeleteTargetIds([]);
     setDeleteConfirmOpen(false);
     setDeletePreview(null);
+    setDeleteBatchPreviews([]);
     setDeleteTaskChecked(false);
     setDeleteFilesChecked(true);
     setDeleteFileSelections(new Set());
@@ -548,6 +680,7 @@ export default function SubmissionSection({
       activityTitle: "",
       videoType: "ORIGINAL",
       segmentPrefix: "",
+      immediateSubmit: true,
       priority: false,
       baiduSyncEnabled: false,
       baiduSyncPath: "",
@@ -720,6 +853,7 @@ export default function SubmissionSection({
         return {
           ...item,
           sourceFilePath: nextPath,
+          remoteVideoUrl: normalizedBvid ? item.remoteVideoUrl || "" : item.remoteVideoUrl || "",
           remoteBvid: normalizedBvid || item.remoteBvid || "",
           remoteAid: normalizedAid,
           remoteCid: normalizedCid,
@@ -743,9 +877,13 @@ export default function SubmissionSection({
     if (!source) {
       return;
     }
-    const input = String(source.remoteBvid || "").trim();
+    const input = resolveSourceRemoteInput(source);
     if (!input) {
-      setMessage("请先输入源视频BV号或视频链接");
+      setMessage("请先输入源视频BV号或下载链接");
+      return;
+    }
+    if (isDirectSourceInput(input)) {
+      setMessage("当前输入为第三方直链，请点击保存（将自动探测时长）");
       return;
     }
     setSourcePartPickerLoadingId(source.localId);
@@ -812,6 +950,59 @@ export default function SubmissionSection({
     });
     setMessage(`已绑定BV：${targetBvid}`);
     closeSourcePartPicker();
+  };
+
+  const applySourceDownloadUrlBinding = async (target, sourceIndex) => {
+    const isUpdateTarget = target === "update";
+    const sourceList = isUpdateTarget ? updateSourceVideos : sourceVideos;
+    const updateList = isUpdateTarget ? setUpdateSourceVideos : setSourceVideos;
+    const current = sourceList[sourceIndex];
+    if (!current) {
+      return;
+    }
+    const direct = parseDirectVideoUrl(resolveSourceRemoteInput(current));
+    if (!direct) {
+      setMessage("请输入有效的第三方下载链接（http/https 直链）");
+      return;
+    }
+    // 与批量导入(handleUpdateImportQuery)、B站绑定(applySourceRemoteBinding)保持一致：
+    // 探测时长并在结束时间为空时自动填充，让第三方源与 B站源在剪辑/合并/投稿中一视同仁。
+    setSourcePartPickerLoadingId(current.localId);
+    let durationSeconds = 0;
+    try {
+      const duration = await invokeCommand("download_direct_duration", { url: direct.url });
+      durationSeconds = Number(duration) || 0;
+    } catch (_) {
+      durationSeconds = 0;
+    } finally {
+      setSourcePartPickerLoadingId("");
+    }
+    updateList((prev) =>
+      prev.map((item, index) => {
+        if (index !== sourceIndex) {
+          return item;
+        }
+        const shouldFillEndTime =
+          durationSeconds > 0 &&
+          (!String(item.endTime || "").trim() || item.endTime === "00:00:00");
+        return {
+          ...item,
+          remoteVideoUrl: direct.url,
+          remoteBvid: "",
+          remoteAid: 0,
+          remoteCid: 0,
+          remotePartTitle: String(item.remotePartTitle || "").trim() || direct.title,
+          durationSeconds: durationSeconds || item.durationSeconds || 0,
+          startTime: item.startTime || "00:00:00",
+          endTime: shouldFillEndTime ? formatDurationHms(durationSeconds) : item.endTime,
+        };
+      }),
+    );
+    setMessage(
+      durationSeconds > 0
+        ? `下载链接已保存，时长 ${formatDurationHms(durationSeconds)}`
+        : "下载链接已保存（未能探测时长，请手动填写结束时间）",
+    );
   };
 
   const openUpdateModal = async (task) => {
@@ -1531,6 +1722,42 @@ export default function SubmissionSection({
       });
       return next;
     });
+  };
+
+  const handleStartSubmissionTasks = async (taskIds) => {
+    const ids = (taskIds || [])
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
+    if (ids.length === 0) {
+      setMessage("请先选择待投稿任务");
+      return;
+    }
+    try {
+      await invokeCommand("submission_start", { request: { taskIds: ids } });
+      setSelectedTaskIds(new Set());
+      await loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter, "start_submission");
+      setMessage("已加入投稿流程");
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleIgnoreRemoteStatus = async (taskIds) => {
+    const ids = (taskIds || [])
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
+    if (ids.length === 0) {
+      setMessage("请先选择未通过或已锁定的任务");
+      return;
+    }
+    try {
+      await invokeCommand("submission_ignore_remote_status", { request: { taskIds: ids } });
+      setSelectedTaskIds(new Set());
+      await loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter, "ignore_remote");
+      setMessage("已忽略远程投稿状态");
+    } catch (error) {
+      setMessage(error.message);
+    }
   };
 
   const resetSegmentBindingState = () => {
@@ -2403,8 +2630,19 @@ export default function SubmissionSection({
           return item;
         }
         if (field === "remoteBvid") {
+          if (isDownloadUrlInput(value)) {
+            return {
+              ...item,
+              remoteVideoUrl: value,
+              remoteBvid: "",
+              remoteAid: 0,
+              remoteCid: 0,
+              remotePartTitle: "",
+            };
+          }
           return {
             ...item,
+            remoteVideoUrl: "",
             remoteBvid: value,
             remoteAid: 0,
             remoteCid: 0,
@@ -2413,6 +2651,31 @@ export default function SubmissionSection({
         }
         return { ...item, [field]: value };
       }),
+    );
+  };
+
+  const applyUploadTitle = (item, value) => {
+    const next = String(value || "").slice(0, 80);
+    return {
+      ...item,
+      uploadPartTitle: next,
+      uploadPartTitleMode: next.trim() ? "CUSTOM" : "AUTO",
+    };
+  };
+
+  const updateSourceUploadTitle = (index, value) => {
+    setSourceVideos((prev) =>
+      prev.map((item, idx) => (idx === index ? applyUploadTitle(item, value) : item)),
+    );
+  };
+
+  const updateMergeGroupTitle = (groupId, value) => {
+    setMergeItems((prev) =>
+      prev.map((item) =>
+        item.type === "GROUP" && item.id === groupId
+          ? applyUploadTitle(item, value)
+          : item,
+      ),
     );
   };
 
@@ -2768,6 +3031,7 @@ export default function SubmissionSection({
           .filter(Boolean)
           .map((source, index) => ({
             sourceFilePath: source.sourceFilePath,
+            remoteVideoUrl: source.remoteVideoUrl || null,
             remoteAid: source.remoteAid || null,
             startTime: source.startTime || null,
             endTime: source.endTime || null,
@@ -2777,9 +3041,17 @@ export default function SubmissionSection({
             sortOrder: index + 1,
           }));
         if (groupSources.length > 0) {
+          const groupMode =
+            String(item.uploadPartTitleMode || "").trim().toUpperCase() === "CUSTOM" &&
+            normalizeUploadPartTitle(item.uploadPartTitle)
+              ? "CUSTOM"
+              : "AUTO";
           groups.push({
             order: groups.length + 1,
             sources: groupSources,
+            uploadPartTitle:
+              groupMode === "CUSTOM" ? normalizeUploadPartTitle(item.uploadPartTitle) : null,
+            uploadPartTitleMode: groupMode,
           });
         }
         continue;
@@ -2789,11 +3061,16 @@ export default function SubmissionSection({
         continue;
       }
       if (item.standalone) {
+        const sourceMode = resolveUploadPartTitleMode(source);
         groups.push({
           order: groups.length + 1,
+          uploadPartTitle:
+            sourceMode === "CUSTOM" ? normalizeUploadPartTitle(source.uploadPartTitle) : null,
+          uploadPartTitleMode: sourceMode,
           sources: [
             {
               sourceFilePath: source.sourceFilePath,
+              remoteVideoUrl: source.remoteVideoUrl || null,
               remoteBvid: source.remoteBvid || null,
               remoteAid: source.remoteAid || null,
               remoteCid: source.remoteCid || null,
@@ -2807,6 +3084,7 @@ export default function SubmissionSection({
       } else {
         remainingSources.push({
           sourceFilePath: source.sourceFilePath,
+          remoteVideoUrl: source.remoteVideoUrl || null,
           remoteBvid: source.remoteBvid || null,
           remoteAid: source.remoteAid || null,
           remoteCid: source.remoteCid || null,
@@ -3028,9 +3306,9 @@ export default function SubmissionSection({
           <div className="space-y-2">
             <div className="flex flex-wrap gap-2">
               <input
-                value={source.remoteBvid || ""}
+                value={resolveSourceRemoteInput(source)}
                 onChange={(event) => updateSource(sourceIndex, "remoteBvid", event.target.value)}
-                placeholder="可选，填写源视频 BV 号或链接"
+                placeholder="可选，填写源视频 BV 号或下载链接"
                 readOnly={isReadOnly}
                 className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
               />
@@ -3038,10 +3316,18 @@ export default function SubmissionSection({
                 <button
                   type="button"
                   className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
-                  onClick={() => handleChooseSourceRemotePart("create", sourceIndex)}
+                  onClick={() =>
+                    isDirectSourceInput(resolveSourceRemoteInput(source))
+                      ? applySourceDownloadUrlBinding("create", sourceIndex)
+                      : handleChooseSourceRemotePart("create", sourceIndex)
+                  }
                   disabled={sourcePartPickerLoadingId === source.localId}
                 >
-                  {sourcePartPickerLoadingId === source.localId ? "查询中" : "选择分P"}
+                  {sourcePartPickerLoadingId === source.localId
+                    ? "查询中"
+                    : isDirectSourceInput(resolveSourceRemoteInput(source))
+                      ? "保存"
+                      : "选择分P"}
                 </button>
               ) : null}
             </div>
@@ -3053,7 +3339,32 @@ export default function SubmissionSection({
           </div>
         </td>
         <td className="px-4 py-2 text-[var(--muted)]">
-          {source.remotePartTitle || (source.remoteBvid ? "未指定分P" : "-")}
+          {source.remotePartTitle ||
+            (source.remoteBvid
+              ? "未指定分P"
+              : source.remoteVideoUrl
+                ? "下载链接"
+                : "-")}
+        </td>
+        <td className="px-4 py-2">
+          {isGroupedRow ? (
+            <span className="text-xs text-[var(--muted)]">见合并组标题</span>
+          ) : (
+            <input
+              value={source.uploadPartTitleMode === "CUSTOM" ? source.uploadPartTitle || "" : ""}
+              onChange={(event) => updateSourceUploadTitle(sourceIndex, event.target.value)}
+              maxLength={80}
+              placeholder={
+                segmentationEnabled
+                  ? "分段开启时自动分P"
+                  : uploadTitleHints.sourceTitleMap.get(sourceId) || "P1"
+              }
+              title={segmentationEnabled ? "分段开启时使用自动分P标题" : ""}
+              readOnly={isReadOnly}
+              disabled={segmentationEnabled}
+              className="w-32 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
+            />
+          )}
         </td>
         <td className="px-4 py-2">
           <input
@@ -3141,8 +3452,19 @@ export default function SubmissionSection({
           return item;
         }
         if (field === "remoteBvid") {
+          if (isDownloadUrlInput(value)) {
+            return {
+              ...item,
+              remoteVideoUrl: value,
+              remoteBvid: "",
+              remoteAid: 0,
+              remoteCid: 0,
+              remotePartTitle: "",
+            };
+          }
           return {
             ...item,
+            remoteVideoUrl: "",
             remoteBvid: value,
             remoteAid: 0,
             remoteCid: 0,
@@ -3151,6 +3473,12 @@ export default function SubmissionSection({
         }
         return { ...item, [field]: value };
       }),
+    );
+  };
+
+  const updateUpdateSourceUploadTitle = (index, value) => {
+    setUpdateSourceVideos((prev) =>
+      prev.map((item, idx) => (idx === index ? applyUploadTitle(item, value) : item)),
     );
   };
 
@@ -3370,21 +3698,13 @@ export default function SubmissionSection({
             videoType: taskForm.videoType,
             bilibiliUid: selectedBilibiliUid ? Number(selectedBilibiliUid) : null,
             segmentPrefix: taskForm.segmentPrefix || null,
+            immediateSubmit: Boolean(taskForm.immediateSubmit),
             priority: Boolean(taskForm.priority),
             baiduSyncEnabled: Boolean(taskForm.baiduSyncEnabled),
             baiduSyncPath: taskForm.baiduSyncPath || null,
             baiduSyncFilename: taskForm.baiduSyncFilename || null,
           },
-          sourceVideos: validSources.map((item, index) => ({
-            sourceFilePath: item.sourceFilePath,
-            remoteBvid: item.remoteBvid || null,
-            remoteAid: item.remoteAid || null,
-            remoteCid: item.remoteCid || null,
-            remotePartTitle: item.remotePartTitle || null,
-            sortOrder: index + 1,
-            startTime: item.startTime || null,
-            endTime: item.endTime || null,
-          })),
+          sourceVideos: validSources.map(buildSourceVideoPayload),
           workflowConfig: buildWorkflowConfig(mergeGroups),
         },
       };
@@ -3436,16 +3756,7 @@ export default function SubmissionSection({
           baiduSyncEnabled: Boolean(updateBaiduSync.enabled),
           baiduSyncPath: updateBaiduSync.path || null,
           baiduSyncFilename: updateBaiduSync.filename || null,
-          sourceVideos: validSources.map((item, index) => ({
-            sourceFilePath: item.sourceFilePath,
-            remoteBvid: item.remoteBvid || null,
-            remoteAid: item.remoteAid || null,
-            remoteCid: item.remoteCid || null,
-            remotePartTitle: item.remotePartTitle || null,
-            sortOrder: index + 1,
-            startTime: item.startTime || null,
-            endTime: item.endTime || null,
-          })),
+          sourceVideos: validSources.map(buildSourceVideoPayload),
           workflowConfig: buildUpdateWorkflowConfig(mergeGroups),
         },
       };
@@ -3542,7 +3853,21 @@ export default function SubmissionSection({
   };
 
   const buildUpdateImportedSourcePath = (preview, page) =>
-    buildIntegratedSourceFilePath(updateTaskDir, preview, page);
+    preview?.sourceType === "DIRECT"
+      ? (() => {
+          const title = sanitizeLocalFileName(
+            String(page?.partName || preview?.title || "第三方视频").trim(),
+          ) || "第三方视频";
+          const extension = String(page?.extension || preview?.extension || "mp4")
+            .trim()
+            .replace(/^\./, "") || "mp4";
+          const normalizedTaskDir = String(updateTaskDir || "").trim();
+          const fileName = `${title}.${extension}`;
+          return normalizedTaskDir
+            ? `${normalizedTaskDir}/integrated_sources/${fileName}`
+            : `integrated_sources/${fileName}`;
+        })()
+      : buildIntegratedSourceFilePath(updateTaskDir, preview, page);
 
   const openUpdateImportModal = () => {
     if (!String(updateTaskId || "").trim()) {
@@ -3594,9 +3919,39 @@ export default function SubmissionSection({
     try {
       const previews = [];
       for (const input of inputs) {
+        const direct = parseDirectVideoUrl(input);
+        if (direct) {
+          let durationSeconds = 0;
+          try {
+            const duration = await invokeCommand("download_direct_duration", { url: direct.url });
+            durationSeconds = Number(duration) || 0;
+          } catch (_) {
+            durationSeconds = 0;
+          }
+          previews.push({
+            input,
+            sourceType: "DIRECT",
+            title: direct.title,
+            bvid: "",
+            aid: 0,
+            url: direct.url,
+            extension: direct.extension,
+            pages: [
+              {
+                cid: 0,
+                page: 1,
+                partName: direct.title,
+                durationSeconds,
+                extension: direct.extension,
+              },
+            ],
+          });
+          continue;
+        }
+        const { bvid, aid } = parseVideoInput(input);
         const preview = await invokeCommand("submission_remote_video_preview", {
           request: {
-            input,
+            input: bvid || aid ? input : input,
             enforceOwnerMatch: false,
           },
         });
@@ -3605,6 +3960,7 @@ export default function SubmissionSection({
           : [];
         previews.push({
           input,
+          sourceType: "BILIBILI",
           title: String(preview?.title || "").trim(),
           bvid: String(preview?.bvid || input).trim(),
           aid: Number(preview?.aid || 0) || 0,
@@ -3612,7 +3968,17 @@ export default function SubmissionSection({
         });
       }
       setUpdateImportResults(previews);
-      setUpdateImportSelection(new Set());
+      setUpdateImportSelection(
+        new Set(
+          previews.flatMap((preview) =>
+            (preview.pages || []).map((page) =>
+              preview.sourceType === "DIRECT"
+                ? `DIRECT:${preview.url}`
+                : `${preview.bvid}:${page.cid}`,
+            ),
+          ),
+        ),
+      );
     } catch (error) {
       setMessage(error?.message || "查询视频失败");
     } finally {
@@ -3634,8 +4000,10 @@ export default function SubmissionSection({
 
   const updateImportSelectableKeys = updateImportResults.flatMap((preview) =>
     (preview.pages || [])
-      .filter((page) => Number(page?.cid || 0) > 0)
-      .map((page) => `${preview.bvid}:${page.cid}`),
+      .filter((page) => preview.sourceType === "DIRECT" || Number(page?.cid || 0) > 0)
+      .map((page) =>
+        preview.sourceType === "DIRECT" ? `DIRECT:${preview.url}` : `${preview.bvid}:${page.cid}`,
+      ),
   );
   const updateImportAllSelected =
     updateImportSelectableKeys.length > 0 &&
@@ -3650,7 +4018,8 @@ export default function SubmissionSection({
     const rows = [];
     for (const preview of updateImportResults) {
       for (const page of preview.pages || []) {
-        const key = `${preview.bvid}:${page.cid}`;
+        const isDirect = preview.sourceType === "DIRECT";
+        const key = isDirect ? `DIRECT:${preview.url}` : `${preview.bvid}:${page.cid}`;
         if (!updateImportSelection.has(key)) {
           continue;
         }
@@ -3658,9 +4027,10 @@ export default function SubmissionSection({
         rows.push({
           localId: buildSourceId(),
           sourceFilePath: buildUpdateImportedSourcePath(preview, page),
-          remoteBvid: preview.bvid,
-          remoteAid: preview.aid,
-          remoteCid: Number(page?.cid || 0) || 0,
+          remoteVideoUrl: isDirect ? preview.url : "",
+          remoteBvid: isDirect ? "" : preview.bvid,
+          remoteAid: isDirect ? null : preview.aid,
+          remoteCid: isDirect ? null : Number(page?.cid || 0) || 0,
           remotePartTitle: String(page?.partName || page?.part_title || "").trim(),
           sortOrder: rows.length + 1,
           startTime: "00:00:00",
@@ -3857,10 +4227,16 @@ export default function SubmissionSection({
     const sources = (detail?.sourceVideos || []).map((item, index) => ({
       localId: buildSourceId(),
       sourceFilePath: item.sourceFilePath || "",
+      remoteVideoUrl: item.remoteVideoUrl || "",
       remoteBvid: item.remoteBvid || "",
       remoteAid: Number(item.remoteAid || 0) || 0,
       remoteCid: Number(item.remoteCid || 0) || 0,
       remotePartTitle: item.remotePartTitle || "",
+      uploadPartTitle: item.uploadPartTitle || "",
+      uploadPartTitleMode:
+        String(item.uploadPartTitleMode || "").trim().toUpperCase() === "CUSTOM"
+          ? "CUSTOM"
+          : "AUTO",
       sortOrder: index + 1,
       startTime: item.startTime || "00:00:00",
       endTime: item.endTime || "00:00:00",
@@ -3868,8 +4244,90 @@ export default function SubmissionSection({
     }));
     const normalizedSources = sources.length ? sources : [emptySource(0)];
     setSourceVideos(normalizedSources);
-    setMergeItems(buildMergeItemsFromSources(normalizedSources));
+    setMergeItems(buildMergeItemsFromDetail(normalizedSources, config));
     setMergeSelection(new Set());
+  };
+
+  // 从持久化的 workflowConfig.mergeGroups 重建合并组 mergeItems（按路径+起止时间匹配回 localId）。
+  // 无 mergeGroups 时退回到全部独立 SOURCE。
+  const buildMergeItemsFromDetail = (normalizedSources, config) => {
+    const groups = Array.isArray(config?.mergeGroups)
+      ? config.mergeGroups
+      : Array.isArray(config?.merge_groups)
+        ? config.merge_groups
+        : [];
+    if (!groups.length) {
+      return buildMergeItemsFromSources(normalizedSources);
+    }
+    const norm = (value) => String(value || "").trim();
+    const used = new Set();
+    const matchSource = (gs) => {
+      const path = norm(gs?.sourceFilePath || gs?.source_file_path);
+      const start = norm(gs?.startTime || gs?.start_time);
+      const end = norm(gs?.endTime || gs?.end_time);
+      const candidates = normalizedSources.filter(
+        (s) => !used.has(s.localId) && norm(s.sourceFilePath) === path,
+      );
+      if (candidates.length === 0) {
+        return null;
+      }
+      const exact = candidates.find(
+        (s) =>
+          (norm(s.startTime) === start || (!start && norm(s.startTime) === "00:00:00")) &&
+          (norm(s.endTime) === end || (!end && norm(s.endTime) === "00:00:00")),
+      );
+      const picked = exact || candidates[0];
+      used.add(picked.localId);
+      return picked.localId;
+    };
+    const sortedGroups = [...groups].sort(
+      (a, b) => Number(a?.order || 0) - Number(b?.order || 0),
+    );
+    const items = [];
+    for (const group of sortedGroups) {
+      const groupSources = Array.isArray(group?.sources)
+        ? group.sources
+        : Array.isArray(group?.sourceVideos)
+          ? group.sourceVideos
+          : [];
+      const matchedIds = groupSources.map(matchSource).filter(Boolean);
+      if (matchedIds.length === 0) {
+        continue;
+      }
+      const mode =
+        String(group?.uploadPartTitleMode || "").trim().toUpperCase() === "CUSTOM"
+          ? "CUSTOM"
+          : "AUTO";
+      const title = mode === "CUSTOM" ? normalizeUploadPartTitle(group?.uploadPartTitle) : "";
+      if (matchedIds.length === 1) {
+        // 单源组等价于独立分组：标题以源视频自身的 uploadPartTitle 回显。
+        items.push({
+          id: matchedIds[0],
+          type: "SOURCE",
+          sourceId: matchedIds[0],
+          standalone: true,
+        });
+      } else {
+        items.push({
+          id: buildMergeGroupId(),
+          type: "GROUP",
+          sourceIds: matchedIds,
+          uploadPartTitle: title,
+          uploadPartTitleMode: title ? "CUSTOM" : "AUTO",
+        });
+      }
+    }
+    for (const source of normalizedSources) {
+      if (!used.has(source.localId)) {
+        items.push({
+          id: source.localId,
+          type: "SOURCE",
+          sourceId: source.localId,
+          standalone: false,
+        });
+      }
+    }
+    return items;
   };
 
   const initEditSegments = (detail) => {
@@ -4244,14 +4702,7 @@ export default function SubmissionSection({
         return;
       }
       sourcePayload = sourceValidation.validSources.map((item, index) => ({
-        sourceFilePath: item.sourceFilePath,
-        remoteBvid: item.remoteBvid || null,
-        remoteAid: item.remoteAid || null,
-        remoteCid: item.remoteCid || null,
-        remotePartTitle: item.remotePartTitle || null,
-        sortOrder: index + 1,
-        startTime: item.startTime || null,
-        endTime: item.endTime || null,
+        ...buildSourceVideoPayload(item, index),
       }));
     }
     const uniqueTags = collectCurrentTags(tags, tagInput);
@@ -4862,6 +5313,55 @@ export default function SubmissionSection({
     setDeletePreviewLoading(false);
   };
 
+  const handleBatchDeleteTasks = async () => {
+    setMessage("");
+    setDeleteMessage("");
+    setDeleteMessageTone("info");
+    const targetIds = Array.from(selectedTaskIds)
+      .map((value) => String(value || "").trim())
+      .filter((value) => value);
+    if (targetIds.length === 0) {
+      setMessage("请选择要删除的投稿任务");
+      return;
+    }
+    setDeleteTargetId("");
+    setDeleteTargetIds(targetIds);
+    setDeleteTaskChecked(false);
+    setDeleteFilesChecked(true);
+    setDeleteFileSelections(new Set());
+    setDeletePreview(null);
+    setDeleteBatchPreviews([]);
+    setDeleteConfirmOpen(true);
+    setDeleteConflictOpen(false);
+    setDeleteConflictFiles([]);
+    setDeletePendingPayload(null);
+    setDeletePreviewLoading(true);
+    try {
+      const previews = [];
+      const mergedFiles = [];
+      const seenPaths = new Set();
+      for (const taskId of targetIds) {
+        const preview = await invokeCommand("submission_delete_preview", { taskId });
+        previews.push(preview);
+        for (const file of preview?.files || []) {
+          if (seenPaths.has(file.path)) {
+            continue;
+          }
+          seenPaths.add(file.path);
+          mergedFiles.push(file);
+        }
+      }
+      setDeleteBatchPreviews(previews);
+      setDeletePreview({ taskId: "", files: mergedFiles });
+      setDeleteFileSelections(new Set(mergedFiles.map((item) => item.path)));
+    } catch (error) {
+      setDeleteMessage(`读取批量删除预览失败：${error?.message || "未知错误"}`);
+      setDeleteMessageTone("error");
+    } finally {
+      setDeletePreviewLoading(false);
+    }
+  };
+
   const handleDeleteCancel = async () => {
     const targetId = deleteTargetId;
     resetDeleteState();
@@ -4881,6 +5381,10 @@ export default function SubmissionSection({
         message: `submission_delete_confirm_click taskId=${targetId} deleteTask=${deleteTaskChecked ? "1" : "0"} deleteFiles=${deleteFilesChecked ? "1" : "0"}`,
       });
     } catch (_) {}
+    if (isBatchDelete) {
+      await handleBatchDeleteConfirm(false);
+      return;
+    }
     if (!targetId) {
       resetDeleteState();
       return;
@@ -4975,6 +5479,98 @@ export default function SubmissionSection({
     }
   };
 
+  const handleBatchDeleteConfirm = async (forceDelete) => {
+    const targetIds = deleteTargetIds;
+    if (targetIds.length === 0) {
+      resetDeleteState();
+      return;
+    }
+    if (!deleteTaskChecked && !deleteFilesChecked) {
+      setDeleteMessage("请选择删除投稿任务或删除视频文件");
+      setDeleteMessageTone("error");
+      return;
+    }
+    const selectedPaths = deleteFilesChecked ? new Set(deleteFileSelections) : new Set();
+    if (deleteFilesChecked && deleteHasFiles && selectedPaths.size === 0) {
+      setDeleteMessage("请选择要删除的视频文件");
+      setDeleteMessageTone("error");
+      return;
+    }
+    if (!forceDelete && deleteFilesChecked) {
+      const conflicts = [];
+      for (const preview of deleteBatchPreviews) {
+        for (const file of preview?.files || []) {
+          if (selectedPaths.has(file.path) && (file.conflicts || []).length > 0) {
+            conflicts.push(file);
+          }
+        }
+      }
+      if (conflicts.length > 0) {
+        setDeletePendingPayload({ batch: true });
+        setDeleteConflictFiles(conflicts);
+        setDeleteConflictOpen(true);
+        return;
+      }
+    }
+    setDeleteSubmitting(true);
+    setDeleteMessage(`正在删除 ${targetIds.length} 个任务...`);
+    setDeleteMessageTone("info");
+    try {
+      const blockedFiles = [];
+      const deletedPaths = [];
+      const missingPaths = [];
+      for (const taskId of targetIds) {
+        const preview = deleteBatchPreviews.find((item) => item.taskId === taskId);
+        const deletePaths = deleteFilesChecked
+          ? (preview?.files || [])
+              .map((item) => item.path)
+              .filter((path) => selectedPaths.has(path))
+          : [];
+        const result = await invokeCommand("submission_delete", {
+          request: {
+            taskId,
+            deleteTask: deleteTaskChecked,
+            deleteFiles: deleteFilesChecked,
+            deletePaths,
+            forceDelete,
+          },
+        });
+        if (result?.blocked) {
+          blockedFiles.push(...(result.conflicts || []));
+          continue;
+        }
+        deletedPaths.push(...(result?.deletedPaths || []));
+        missingPaths.push(...(result?.missingPaths || []));
+      }
+      if (blockedFiles.length > 0) {
+        setDeletePendingPayload({ batch: true, forceDelete: true });
+        setDeleteConflictFiles(blockedFiles);
+        setDeleteConflictOpen(true);
+        return;
+      }
+      if (deleteTaskChecked) {
+        if (selectedTask && targetIds.includes(selectedTask?.task?.taskId)) {
+          setSelectedTask(null);
+        }
+        setSelectedTaskIds((prev) => {
+          const next = new Set(prev);
+          targetIds.forEach((taskId) => next.delete(taskId));
+          return next;
+        });
+        setTasks((prev) => prev.filter((item) => !targetIds.includes(item.taskId)));
+        await loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter, "batch_delete");
+      }
+      const summary = buildDeleteSummary(deletedPaths, missingPaths);
+      resetDeleteState();
+      await notifyDeleteSuccess(summary ? `${targetIds.length} 个任务处理完成，${summary}` : `${targetIds.length} 个任务处理完成`);
+    } catch (error) {
+      setDeleteMessage(`批量删除失败：${error?.message || "未知错误"}`);
+      setDeleteMessageTone("error");
+    } finally {
+      setDeleteSubmitting(false);
+    }
+  };
+
   const handleDeleteFilesToggle = (checked) => {
     setDeleteFilesChecked(checked);
     if (checked && deleteFileSelections.size === 0) {
@@ -5028,6 +5624,12 @@ export default function SubmissionSection({
     const payload = deletePendingPayload;
     if (!payload) {
       handleDeleteConflictCancel();
+      return;
+    }
+    if (payload.batch) {
+      setDeleteConflictOpen(false);
+      setDeleteConflictFiles([]);
+      await handleBatchDeleteConfirm(true);
       return;
     }
     setDeleteSubmitting(true);
@@ -5137,6 +5739,8 @@ export default function SubmissionSection({
 
   const formatTaskStatus = (status) => {
     switch (status) {
+      case "PENDING_SUBMIT":
+        return "待投稿";
       case "PENDING":
         return "待处理";
       case "CLIPPING":
@@ -5190,7 +5794,7 @@ export default function SubmissionSection({
     if (["UPLOADING", "WAITING_UPLOAD", "RUNNING"].includes(status)) {
       return "bg-amber-500/10 text-amber-600";
     }
-    if (["CLIPPING", "MERGING", "SEGMENTING", "PENDING"].includes(status)) {
+    if (["CLIPPING", "MERGING", "SEGMENTING", "PENDING", "PENDING_SUBMIT"].includes(status)) {
       return "bg-amber-500/10 text-amber-600";
     }
     return "bg-slate-500/10 text-slate-600";
@@ -5243,6 +5847,9 @@ export default function SubmissionSection({
   };
 
   const resolveRemoteStatus = (task) => {
+    if (task?.remoteStatusIgnored) {
+      return "已通过";
+    }
     if (!task?.bvid) {
       return "进行中";
     }
@@ -5266,6 +5873,9 @@ export default function SubmissionSection({
   };
 
   const isRemoteRejected = (task) => {
+    if (task?.remoteStatusIgnored) {
+      return false;
+    }
     const state = parseRemoteState(task);
     if (state === null) {
       return false;
@@ -5274,6 +5884,9 @@ export default function SubmissionSection({
   };
 
   const isRemoteFailed = (task) => {
+    if (task?.remoteStatusIgnored) {
+      return false;
+    }
     const state = parseRemoteState(task);
     if (state === null) {
       return false;
@@ -5858,6 +6471,15 @@ export default function SubmissionSection({
     currentPageTaskIds.length > 0 &&
     currentPageTaskIds.every((taskId) => selectedTaskIds.has(taskId));
   const selectedTaskCount = selectedTaskIds.size;
+  const selectedTasks = tasks.filter((task) =>
+    selectedTaskIds.has(String(task?.taskId || "").trim()),
+  );
+  const selectedPendingSubmitIds = selectedTasks
+    .filter((task) => task.status === "PENDING_SUBMIT")
+    .map((task) => task.taskId);
+  const selectedRemoteRejectedIds = selectedTasks
+    .filter((task) => isRemoteRejected(task))
+    .map((task) => task.taskId);
   const sourcePartPickerModal =
     sourcePartPickerOpen && typeof document !== "undefined"
       ? createPortal(
@@ -6178,6 +6800,35 @@ export default function SubmissionSection({
             />
             优先投稿（按最近设置时间参与队列优先级）
           </label>
+          {!isReadOnly ? (
+            <div className="space-y-2 rounded-xl border border-black/5 bg-white/80 p-3">
+              <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                是否立即投稿
+              </div>
+              <div className="flex flex-wrap gap-4 text-sm text-[var(--muted)]">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    checked={taskForm.immediateSubmit}
+                    onChange={() =>
+                      setTaskForm((prev) => ({ ...prev, immediateSubmit: true }))
+                    }
+                  />
+                  立即投稿
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    checked={!taskForm.immediateSubmit}
+                    onChange={() =>
+                      setTaskForm((prev) => ({ ...prev, immediateSubmit: false }))
+                    }
+                  />
+                  暂不投稿
+                </label>
+              </div>
+            </div>
+          ) : null}
           <div className="text-xs text-[var(--muted)]">
             分段前缀会作为分段文件名的前缀（可选）
           </div>
@@ -6337,8 +6988,9 @@ export default function SubmissionSection({
                 <th className="px-4 py-2">选择</th>
                 <th className="px-4 py-2">独立分组</th>
                 <th className="px-4 py-2">视频文件（必填）</th>
-                <th className="px-4 py-2">源视频 BV 号</th>
+                <th className="px-4 py-2">BV号或下载链接</th>
                 <th className="px-4 py-2">分P标题</th>
+                <th className="px-4 py-2">上传分P标题</th>
                 <th className="px-4 py-2">开始时间</th>
                 <th className="px-4 py-2">结束时间</th>
                 <th className="px-4 py-2">合并状态</th>
@@ -6348,7 +7000,7 @@ export default function SubmissionSection({
             <tbody>
               {mergeItems.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-3 text-[var(--muted)]" colSpan={10}>
+                  <td className="px-4 py-3 text-[var(--muted)]" colSpan={11}>
                     暂无配置
                   </td>
                 </tr>
@@ -6367,7 +7019,7 @@ export default function SubmissionSection({
                         data-merge-item-id={item.id}
                         className="border-t border-black/5"
                       >
-                        <td className="p-0" colSpan={10}>
+                        <td className="p-0" colSpan={11}>
                           <div className="m-2 overflow-hidden rounded-xl border-2 border-[var(--accent)]/40 bg-white/70">
                             <div
                               className={`flex items-center justify-between border-b border-[var(--accent)]/30 bg-[var(--accent)]/10 px-3 py-2 text-xs text-[var(--muted)] ${
@@ -6388,6 +7040,30 @@ export default function SubmissionSection({
                                   合并组 {index + 1}
                                 </span>
                                 <span>{groupSources.length} 个视频</span>
+                                <span className="text-[var(--muted)]">上传分P标题</span>
+                                <input
+                                  value={
+                                    item.uploadPartTitleMode === "CUSTOM"
+                                      ? item.uploadPartTitle || ""
+                                      : ""
+                                  }
+                                  onChange={(event) =>
+                                    updateMergeGroupTitle(item.id, event.target.value)
+                                  }
+                                  onPointerDown={(event) => event.stopPropagation()}
+                                  maxLength={80}
+                                  placeholder={
+                                    segmentationEnabled
+                                      ? "分段开启时自动分P"
+                                      : uploadTitleHints.groupTitleMap.get(item.id) || "P1"
+                                  }
+                                  title={
+                                    segmentationEnabled ? "分段开启时使用自动分P标题" : ""
+                                  }
+                                  readOnly={isReadOnly}
+                                  disabled={segmentationEnabled}
+                                  className="w-32 rounded-lg border border-black/10 bg-white/80 px-2 py-1 text-xs text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
+                                />
                               </div>
                               {!isReadOnly ? (
                                 <button
@@ -6718,8 +7394,9 @@ export default function SubmissionSection({
                       <tr>
                         <th className="px-4 py-2">序号</th>
                         <th className="px-4 py-2">视频文件（必填）</th>
-                        <th className="px-4 py-2">源视频 BV 号</th>
+                        <th className="px-4 py-2">BV号或下载链接</th>
                         <th className="px-4 py-2">分P标题</th>
+                        <th className="px-4 py-2">上传分P标题</th>
                         <th className="px-4 py-2">开始时间</th>
                         <th className="px-4 py-2">结束时间</th>
                         <th className="px-4 py-2">合并</th>
@@ -6757,20 +7434,28 @@ export default function SubmissionSection({
                             <div className="space-y-2">
                               <div className="flex flex-wrap gap-2">
                                 <input
-                                  value={item.remoteBvid || ""}
+                                  value={resolveSourceRemoteInput(item)}
                                   onChange={(event) =>
                                     updateUpdateSource(index, "remoteBvid", event.target.value)
                                   }
-                                  placeholder="可选，填写源视频 BV 号或链接"
+                                  placeholder="可选，填写源视频 BV 号或下载链接"
                                   className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
                                 />
                                 <button
                                   type="button"
                                   className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
-                                  onClick={() => handleChooseSourceRemotePart("update", index)}
+                                  onClick={() =>
+                                    isDirectSourceInput(resolveSourceRemoteInput(item))
+                                      ? applySourceDownloadUrlBinding("update", index)
+                                      : handleChooseSourceRemotePart("update", index)
+                                  }
                                   disabled={sourcePartPickerLoadingId === item.localId}
                                 >
-                                  {sourcePartPickerLoadingId === item.localId ? "查询中" : "选择分P"}
+                                  {sourcePartPickerLoadingId === item.localId
+                                    ? "查询中"
+                                    : isDirectSourceInput(resolveSourceRemoteInput(item))
+                                      ? "保存"
+                                      : "选择分P"}
                                 </button>
                               </div>
                               {formatSourceBindingSummary(item) ? (
@@ -6781,7 +7466,33 @@ export default function SubmissionSection({
                             </div>
                           </td>
                           <td className="px-4 py-2 text-[var(--muted)]">
-                            {item.remotePartTitle || (item.remoteBvid ? "未指定分P" : "-")}
+                            {item.remotePartTitle ||
+                              (item.remoteBvid
+                                ? "未指定分P"
+                                : item.remoteVideoUrl
+                                  ? "下载链接"
+                                  : "-")}
+                          </td>
+                          <td className="px-4 py-2">
+                            <input
+                              value={
+                                item.uploadPartTitleMode === "CUSTOM"
+                                  ? item.uploadPartTitle || ""
+                                  : ""
+                              }
+                              onChange={(event) =>
+                                updateUpdateSourceUploadTitle(index, event.target.value)
+                              }
+                              maxLength={80}
+                              placeholder={
+                                updateSegmentationEnabled ? "分段开启时自动分P" : `P${index + 1}`
+                              }
+                              title={
+                                updateSegmentationEnabled ? "分段开启时使用自动分P标题" : ""
+                              }
+                              disabled={updateSegmentationEnabled}
+                              className="w-32 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
+                            />
                           </td>
                           <td className="px-4 py-2">
                             <input
@@ -6936,7 +7647,7 @@ export default function SubmissionSection({
               <div>
                 <div className="text-sm font-semibold text-[var(--ink)]">导入远程视频</div>
                 <div className="mt-1 text-xs text-[var(--muted)]">
-                  支持一次输入多个 BVID 或视频链接，按换行、空格或逗号分隔。
+                  支持一次输入多个 BVID、B站链接或第三方视频直链，按换行、空格或逗号分隔。
                 </div>
               </div>
               <button
@@ -6951,7 +7662,7 @@ export default function SubmissionSection({
               <textarea
                 value={updateImportInput}
                 onChange={(event) => setUpdateImportInput(event.target.value)}
-                placeholder={"例如：\nBV1xx...\nBV1yy...\nhttps://www.bilibili.com/video/BV1zz..."}
+                placeholder={"例如：\nBV1xx...\nhttps://www.bilibili.com/video/BV1zz...\nhttps://example.com/video.flv"}
                 className="min-h-28 w-full rounded-xl border border-black/10 bg-white/80 px-3 py-3 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
               />
               <div className="flex justify-end gap-2">
@@ -6989,7 +7700,7 @@ export default function SubmissionSection({
 	                        <span>选择</span>
 	                      </label>
 	                    </th>
-                    <th className="px-4 py-2">BV号</th>
+                    <th className="px-4 py-2">来源</th>
                     <th className="px-4 py-2">分P</th>
                     <th className="px-4 py-2">标题</th>
                     <th className="px-4 py-2">时长</th>
@@ -7006,9 +7717,10 @@ export default function SubmissionSection({
                   ) : (
                     updateImportResults.flatMap((preview) =>
                       (preview.pages || []).map((page) => {
-                        const key = `${preview.bvid}:${page.cid}`;
-                        return (
-                          <tr key={key} className="border-t border-black/5">
+	                        const isDirect = preview.sourceType === "DIRECT";
+	                        const key = isDirect ? `DIRECT:${preview.url}` : `${preview.bvid}:${page.cid}`;
+	                        return (
+	                          <tr key={key} className="border-t border-black/5">
                             <td className="px-4 py-2">
                               <input
                                 type="checkbox"
@@ -7018,10 +7730,12 @@ export default function SubmissionSection({
                                 }
                               />
                             </td>
-                            <td className="px-4 py-2 text-[var(--ink)]">{preview.bvid}</td>
-                            <td className="px-4 py-2 text-[var(--muted)]">
-                              P{page.page || "-"} / CID {page.cid || "-"}
-                            </td>
+	                            <td className="px-4 py-2 text-[var(--ink)]">
+	                              {isDirect ? "第三方直链" : preview.bvid}
+	                            </td>
+	                            <td className="px-4 py-2 text-[var(--muted)]">
+	                              {isDirect ? "原文件" : `P${page.page || "-"} / CID ${page.cid || "-"}`}
+	                            </td>
                             <td className="px-4 py-2 text-[var(--ink)]">
                               {page.partName || page.part_title || preview.title || "-"}
                             </td>
@@ -7140,6 +7854,27 @@ export default function SubmissionSection({
               disabled={refreshingRemote}
             >
               {refreshingRemote ? "刷新中" : "刷新"}
+            </button>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => handleStartSubmissionTasks(selectedPendingSubmitIds)}
+              disabled={selectedPendingSubmitIds.length === 0}
+            >
+              开始投稿({selectedPendingSubmitIds.length})
+            </button>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => handleIgnoreRemoteStatus(selectedRemoteRejectedIds)}
+              disabled={selectedRemoteRejectedIds.length === 0}
+            >
+              忽略投稿({selectedRemoteRejectedIds.length})
+            </button>
+            <button
+              className="rounded-full border border-red-200 bg-white px-3 py-1 text-xs font-semibold text-red-600 transition hover:border-red-300 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={handleBatchDeleteTasks}
+              disabled={selectedTaskCount === 0}
+            >
+              批量删除({selectedTaskCount})
             </button>
             <select
               value={statusFilter}
@@ -7411,6 +8146,22 @@ export default function SubmissionSection({
                             onClick={() => handleIntegratedExecute(task.taskId)}
                           >
                             一键投稿
+                          </button>
+                        ) : null}
+                        {task.status === "PENDING_SUBMIT" ? (
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                            onClick={() => handleStartSubmissionTasks([task.taskId])}
+                          >
+                            开始投稿
+                          </button>
+                        ) : null}
+                        {isRemoteRejected(task) ? (
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                            onClick={() => handleIgnoreRemoteStatus([task.taskId])}
+                          >
+                            忽略投稿
                           </button>
                         ) : null}
                         <button
@@ -7980,7 +8731,9 @@ export default function SubmissionSection({
           {deleteConfirmOpen ? (
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
               <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-lg">
-              <div className="text-sm font-semibold text-[var(--ink)]">删除投稿任务</div>
+              <div className="text-sm font-semibold text-[var(--ink)]">
+                {isBatchDelete ? `批量删除投稿任务（${deleteTargetCount} 个）` : "删除投稿任务"}
+              </div>
               <div className="mt-2 text-xs text-[var(--muted)]">
                 请选择删除范围，删除后不可恢复。
               </div>
@@ -7998,10 +8751,10 @@ export default function SubmissionSection({
                       onChange={(event) => setDeleteTaskChecked(event.target.checked)}
                     />
                     <div>
-                      <div className="font-semibold text-[var(--ink)]">删除投稿任务</div>
-                      <div className="text-xs text-[var(--muted)]">
-                        同步删除任务记录与任务目录。
-                      </div>
+	                      <div className="font-semibold text-[var(--ink)]">删除投稿任务</div>
+	                      <div className="text-xs text-[var(--muted)]">
+	                        同步删除任务记录与任务目录。
+	                      </div>
                     </div>
                   </label>
                   <label className="flex items-start gap-2 text-sm">
@@ -8012,10 +8765,10 @@ export default function SubmissionSection({
                       onChange={(event) => handleDeleteFilesToggle(event.target.checked)}
                     />
                     <div>
-                      <div className="font-semibold text-[var(--ink)]">删除视频文件</div>
-                      <div className="text-xs text-[var(--muted)]">
-                        包含源视频与任务目录，默认全选。
-                      </div>
+	                      <div className="font-semibold text-[var(--ink)]">删除视频文件</div>
+	                      <div className="text-xs text-[var(--muted)]">
+	                        包含源视频与任务目录，默认全选。
+	                      </div>
                     </div>
                   </label>
                   {deleteFilesChecked ? (
@@ -8576,8 +9329,9 @@ export default function SubmissionSection({
                       <tr>
                         <th className="px-4 py-2">序号</th>
                         <th className="px-4 py-2">视频文件路径</th>
-                        <th className="px-4 py-2">源视频 BV 号</th>
+                        <th className="px-4 py-2">BV号或下载链接</th>
                         <th className="px-4 py-2">分P标题</th>
+                        <th className="px-4 py-2">上传分P标题</th>
                         <th className="px-4 py-2">开始时间</th>
                         <th className="px-4 py-2">结束时间</th>
                         <th className="px-4 py-2">操作</th>
@@ -8586,7 +9340,7 @@ export default function SubmissionSection({
                     <tbody>
                       {sourceVideos.length === 0 ? (
                         <tr>
-                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={7}>
+                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={8}>
                             暂无源视频
                           </td>
                         </tr>
@@ -8635,20 +9389,28 @@ export default function SubmissionSection({
                               <div className="space-y-2">
                                 <div className="flex flex-wrap gap-2">
                                   <input
-                                    value={item.remoteBvid || ""}
-                                    onChange={(event) =>
-                                      updateSource(index, "remoteBvid", event.target.value)
-                                    }
-                                    placeholder="可选，填写源视频 BV 号或链接"
+                                  value={resolveSourceRemoteInput(item)}
+                                  onChange={(event) =>
+                                    updateSource(index, "remoteBvid", event.target.value)
+                                  }
+                                  placeholder="可选，填写源视频 BV 号或下载链接"
                                     className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
                                   />
                                   <button
                                     type="button"
                                     className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
-                                    onClick={() => handleChooseSourceRemotePart("create", index)}
+                                    onClick={() =>
+                                      isDirectSourceInput(resolveSourceRemoteInput(item))
+                                        ? applySourceDownloadUrlBinding("create", index)
+                                        : handleChooseSourceRemotePart("create", index)
+                                    }
                                     disabled={sourcePartPickerLoadingId === item.localId}
                                   >
-                                    {sourcePartPickerLoadingId === item.localId ? "查询中" : "选择分P"}
+                                    {sourcePartPickerLoadingId === item.localId
+                                      ? "查询中"
+                                      : isDirectSourceInput(resolveSourceRemoteInput(item))
+                                        ? "保存"
+                                        : "选择分P"}
                                   </button>
                                 </div>
                                 {formatSourceBindingSummary(item) ? (
@@ -8659,7 +9421,36 @@ export default function SubmissionSection({
                               </div>
                             </td>
                             <td className="px-4 py-2 text-[var(--muted)]">
-                              {item.remotePartTitle || (item.remoteBvid ? "未指定分P" : "-")}
+                              {item.remotePartTitle ||
+                                (item.remoteBvid
+                                  ? "未指定分P"
+                                  : item.remoteVideoUrl
+                                    ? "下载链接"
+                                    : "-")}
+                            </td>
+                            <td className="px-4 py-2">
+                              <input
+                                value={
+                                  item.uploadPartTitleMode === "CUSTOM"
+                                    ? item.uploadPartTitle || ""
+                                    : ""
+                                }
+                                onChange={(event) =>
+                                  updateSourceUploadTitle(index, event.target.value)
+                                }
+                                maxLength={80}
+                                placeholder={
+                                  segmentationEnabled
+                                    ? "分段开启时自动分P"
+                                    : uploadTitleHints.sourceTitleMap.get(item.localId) ||
+                                      `P${index + 1}`
+                                }
+                                title={
+                                  segmentationEnabled ? "分段开启时使用自动分P标题" : ""
+                                }
+                                disabled={segmentationEnabled}
+                                className="w-32 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
+                              />
                             </td>
                             <td className="px-4 py-2">
                               <input
@@ -8711,8 +9502,9 @@ export default function SubmissionSection({
                     <tr>
                         <th className="px-4 py-2">序号</th>
                         <th className="px-4 py-2">视频文件路径</th>
-                        <th className="px-4 py-2">源视频 BV 号</th>
+                        <th className="px-4 py-2">BV号或下载链接</th>
                         <th className="px-4 py-2">分P标题</th>
+                        <th className="px-4 py-2">上传分P标题</th>
                         <th className="px-4 py-2">开始时间</th>
                         <th className="px-4 py-2">结束时间</th>
                         <th className="px-4 py-2">操作</th>
@@ -8721,7 +9513,7 @@ export default function SubmissionSection({
                   <tbody>
                     {selectedTask.sourceVideos.length === 0 ? (
                       <tr>
-                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={7}>
+                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={8}>
                           暂无源视频
                         </td>
                       </tr>
@@ -8731,7 +9523,7 @@ export default function SubmissionSection({
                           <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
                           <td className="px-4 py-2 text-[var(--ink)]">{item.sourceFilePath}</td>
                           <td className="px-4 py-2 text-[var(--muted)]">
-                            <div>{item.remoteBvid || ""}</div>
+                            <div className="max-w-[28rem] break-all">{resolveSourceRemoteInput(item)}</div>
                             {formatSourceBindingSummary(item) ? (
                               <div className="text-[10px] text-[var(--muted)]">
                                 {formatSourceBindingSummary(item)}
@@ -8739,7 +9531,18 @@ export default function SubmissionSection({
                             ) : null}
                           </td>
                           <td className="px-4 py-2 text-[var(--muted)]">
-                            {item.remotePartTitle || (item.remoteBvid ? "未指定分P" : "-")}
+                            {item.remotePartTitle ||
+                              (item.remoteBvid
+                                ? "未指定分P"
+                                : item.remoteVideoUrl
+                                  ? "下载链接"
+                                  : "-")}
+                          </td>
+                          <td className="px-4 py-2 text-[var(--muted)]">
+                            {String(item.uploadPartTitleMode || "").toUpperCase() === "CUSTOM" &&
+                            item.uploadPartTitle
+                              ? item.uploadPartTitle
+                              : "自动"}
                           </td>
                           <td className="px-4 py-2 text-[var(--muted)]">{item.startTime || "-"}</td>
                           <td className="px-4 py-2 text-[var(--muted)]">{item.endTime || "-"}</td>

@@ -693,6 +693,121 @@ pub fn stop_recording(context: LiveContext, room_id: &str, reason: &str) {
     context.live_runtime.stop(room_id);
 }
 
+/// 带"读超时看门狗"的流读取器(B3 修复)。
+///
+/// reqwest blocking 的 ClientBuilder 不提供 read_timeout，而 B站 CDN 边缘节点可能"僵死"
+/// (TCP 连接保持打开却长时间不发数据、也不关闭)，使阻塞式 `response.read()` 无限挂起、
+/// 期间内容持续丢失(实测可达 ~10 分钟)。这里把底层 `Read`(reqwest Response) 移交给一个
+/// 独立线程持续拉取，主线程通过有界 channel 的 `recv_timeout` 充当看门狗：超过 `timeout`
+/// 无数据即返回 `ErrorKind::TimedOut`，让调用方走已有的 stream_read_timeout 重连逻辑。
+///
+/// 注意：被丢弃时仅置位 stop 而不 join——工作线程此刻可能正阻塞在 read()，无法被强制唤醒，
+/// 待该次 read 最终返回(来数据/对端关闭/系统 TCP 超时)后线程自行退出并 drop 掉底层连接。
+/// 这是有界的资源泄漏(每次僵死一条线程+一个 socket，僵死事件稀少)，换取主循环的秒级恢复。
+struct StreamTimeoutReader {
+    rx: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    leftover: Vec<u8>,
+    pos: usize,
+}
+
+impl StreamTimeoutReader {
+    fn new<R: Read + Send + 'static>(mut inner: R) -> Self {
+        // 有界 channel：消费端(解析/写盘)变慢时对工作线程产生背压，避免无限堆积内存。
+        let (tx, rx) = mpsc::sync_channel::<std::io::Result<Vec<u8>>>(64);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_worker = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                if stop_worker.load(Ordering::Relaxed) {
+                    break;
+                }
+                match inner.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = tx.send(Ok(Vec::new()));
+                        break;
+                    }
+                    Ok(n) => {
+                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            rx,
+            stop,
+            leftover: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    /// 语义对齐 `Read::read`：返回 `Ok(0)` 表示流结束；超时返回 `ErrorKind::TimedOut`。
+    /// `timeout` 为 None 时永久等待(等价于旧的无限阻塞读)。
+    fn read(&mut self, out: &mut [u8], timeout: Option<Duration>) -> std::io::Result<usize> {
+        if self.pos >= self.leftover.len() {
+            let chunk = match timeout {
+                Some(dur) => match self.rx.recv_timeout(dur) {
+                    Ok(item) => item,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        return Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "stream read timed out",
+                        ));
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                },
+                None => match self.rx.recv() {
+                    Ok(item) => item,
+                    Err(_) => return Ok(0),
+                },
+            };
+            match chunk {
+                Ok(bytes) => {
+                    if bytes.is_empty() {
+                        return Ok(0);
+                    }
+                    self.leftover = bytes;
+                    self.pos = 0;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let n = (self.leftover.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.leftover[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl Drop for StreamTimeoutReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 计算重连前的等待时长。
+/// 录播最关键的是内容不缺失：对 B站直播 FLV 拉流而言，断开期间内容在协议层不可回放，
+/// 缺口≈重连耗时。因此首次失败立即重连(0ms)，仅在连续失败时指数退避，
+/// 上限受 `stream_retry_ms` 约束(且不超过 3s)，避免旧实现固定睡 6s 放大空洞。
+fn reconnect_backoff_ms(attempt: u32, settings: &LiveSettings) -> u64 {
+    let cap = (settings.stream_retry_ms.max(1000) as u64).min(3000);
+    let raw = match attempt {
+        0 => 0,
+        1 => 200,
+        2 => 500,
+        3 => 1000,
+        _ => 2000,
+    };
+    raw.min(cap)
+}
+
 fn run_record_loop(
     context: LiveContext,
     room_id: String,
@@ -700,16 +815,26 @@ fn run_record_loop(
     nickname: Option<String>,
     settings: LiveSettings,
 ) -> Result<(), String> {
-    let enable_timestamp_fix =
+    // A1: 始终启用时间戳修复，使 fixer 在整个会话内输出连续单调的时间戳。
+    // 这样配合 reset_on_new_segment 不再重置 fixer + 写入前 rebase_tag_to_segment_start，
+    // 可保证每个分段(含重连/切段后续段)都从 0 起、音视频同基，彻底消除转 MP4 前几秒黑屏。
+    // 用户开关仍保留用于跳变检测日志等用途。
+    let user_enable_timestamp_fix =
         settings.flv_fix_adjust_timestamp_jump || settings.flv_fix_split_on_timestamp_jump;
-    let prefer_split_reconnect = settings.record_mode == 0;
-    let apply_timestamp_fix = enable_timestamp_fix;
+    let enable_timestamp_fix = true;
+    // 方案A：重连是否滚新分段文件，由独立开关 reconnect_keep_file 决定(默认 keep=true)。
+    // keep=true → 重连续写同一文件(prefer_split_reconnect=false)，消除重连碎段与文件间接缝；
+    // 计划内切段(时长/大小/标题)仍走关键帧无缝切段，不受影响。已与 record_mode 解耦。
+    let prefer_split_reconnect = !settings.reconnect_keep_file;
+    let apply_timestamp_fix = true;
+    let _ = user_enable_timestamp_fix;
     append_log(
     &context.app_log_path,
     &format!(
-      "record_settings room={} record_mode={} fix_enabled={} fix_adjust={} fix_split={} fix_split_missing={} fix_disable_annexb={} strict_split_reconnect={} jump_disconnect_threshold_ms={}",
+      "record_settings room={} record_mode={} reconnect_keep_file={} fix_enabled={} fix_adjust={} fix_split={} fix_split_missing={} fix_disable_annexb={} strict_split_reconnect={} jump_disconnect_threshold_ms={}",
       room_id,
       settings.record_mode,
+      settings.reconnect_keep_file,
       enable_timestamp_fix,
       settings.flv_fix_adjust_timestamp_jump,
       settings.flv_fix_split_on_timestamp_jump,
@@ -806,11 +931,35 @@ fn run_record_loop(
     }
 
     let client = Client::builder()
+        // B站直播 CDN 为国内节点，强制直连、忽略系统/环境变量代理：绕道代理既慢又是单点，
+        // 代理核心重启/抖动会直接掐断拉流（本次内容大面积缺失即因此）。TUN 模式无法在此绕过，
+        // 需在 Clash 侧为 bilivideo.com/acgvideo.com/bilibili.com 等配 DIRECT 规则。
+        .no_proxy()
         .connect_timeout(Duration::from_millis(
             settings.stream_connect_timeout_ms.max(1000) as u64,
         ))
         .build()
         .map_err(|err| format!("Failed to build client: {}", err))?;
+    // B3 修复：拉流"读超时"(单次读空闲超时)。reqwest blocking 的 ClientBuilder 不支持
+    // read_timeout(只有 async 版有)，所以下方读循环把 response 交给 StreamTimeoutReader——
+    // 独立线程拉字节、主循环用 recv_timeout 当看门狗，超过该时长无数据即返回 TimedOut，
+    // 触发已有的 stream_read_timeout 处理 → 切 CDN 镜像/快速重连。<=0 视为不启用(无限阻塞)。
+    let stream_read_timeout = if settings.stream_read_timeout_ms > 0 {
+        Some(Duration::from_millis(
+            settings.stream_read_timeout_ms.max(1000) as u64,
+        ))
+    } else {
+        None
+    };
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "record_stream_client room={} connect_timeout_ms={} read_timeout_ms={}",
+            room_id,
+            settings.stream_connect_timeout_ms.max(1000),
+            stream_read_timeout.map(|d| d.as_millis()).unwrap_or(0)
+        ),
+    );
     let auth = context
         .login_store
         .load_primary_auth_info(&context.db)
@@ -818,6 +967,9 @@ fn run_record_loop(
         .flatten();
     let mut stream_urls: Vec<String> = Vec::new();
     let mut stream_url_index: usize = 0;
+    // B2: 同一路流的多条 CDN 镜像失败计数。瞬时传输类失败(连接/读取中断)时优先切换到
+    // 下一条镜像立即重连(内容相同、无需再请求 API)，仅当所有镜像都试过仍失败才清空重取地址。
+    let mut stream_url_failures: usize = 0;
     let mut force_no_qn_until: Option<i64> = None;
     let mut pipeline = LiveFlvPipeline::new(
         LivePipelineSettings {
@@ -828,6 +980,32 @@ fn run_record_loop(
         apply_timestamp_fix,
     );
     let mut disconnect_retries: usize = 0;
+    // 重连退避计数：每次重连等待后自增，成功收到数据后清零，实现“首次失败立即重连”。
+    let mut reconnect_attempt: u32 = 0;
+    // 分段时间戳基准(A1)：每开新段后清空；该段写入的第一帧的时间戳作为基准，
+    // 段内所有 tag 减去该基准，保证每个分段都从 0 开始、音视频同基，
+    // 修复重连/切段后续段首帧带大时间戳导致的转 MP4 前几秒黑屏问题。
+    let mut segment_base_ts: Option<i64> = None;
+    macro_rules! reconnect_sleep {
+        () => {{
+            let wait_ms = reconnect_backoff_ms(reconnect_attempt, &settings);
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            if wait_ms > 0 {
+                std::thread::sleep(Duration::from_millis(wait_ms));
+            }
+        }};
+    }
+    // B2: 瞬时传输失败时优先切换 CDN 镜像，所有镜像都失败才重取地址。
+    // stream_url_index 已在主循环每轮自动轮转，这里只在镜像耗尽时清空触发重新拉取。
+    macro_rules! failover_or_refetch {
+        () => {{
+            stream_url_failures = stream_url_failures.saturating_add(1);
+            if stream_urls.len() <= 1 || stream_url_failures >= stream_urls.len() {
+                stream_urls.clear();
+                stream_url_failures = 0;
+            }
+        }};
+    }
     macro_rules! rotate_for_reconnect {
         ($reason:expr) => {
             let _ = rotate_segment_for_reconnect(
@@ -845,6 +1023,7 @@ fn run_record_loop(
                 &mut pending_split,
                 &mut pending_title,
                 &mut missing_started_at,
+                prefer_split_reconnect,
                 $reason,
             )?;
         };
@@ -891,9 +1070,18 @@ fn run_record_loop(
                         &format!("fetch_stream_url_error room={} err={}", room_id, err),
                     );
                     if settings.stream_retry_no_qn_sec > 0 {
-                        std::thread::sleep(Duration::from_secs(
-                            settings.stream_retry_no_qn_sec.max(1) as u64,
-                        ));
+                        // B站 瞬时返回"无可用流"(切档/瞬断)时，进入 no-qn 模式一段时间
+                        // (stream_retry_no_qn_sec 作为 no-qn 窗口时长，而非固定睡眠)，
+                        // 并以快速退避重试。避免旧实现固定 sleep(stream_retry_no_qn_sec) 整段时间
+                        // 不取地址，导致流恢复后仍数十秒续不上、产生大段内容缺口。
+                        mark_force_no_qn(
+                            &mut force_no_qn_until,
+                            &settings,
+                            context.app_log_path.as_ref(),
+                            room_id.as_str(),
+                            "fetch_stream_error",
+                        );
+                        reconnect_sleep!();
                         match fetch_stream_urls(
                             &context.bilibili,
                             &room_info.room_id,
@@ -911,17 +1099,13 @@ fn run_record_loop(
                                     ),
                                 );
                                 rotate_for_reconnect!("获取流地址失败，重连前切段");
-                                std::thread::sleep(Duration::from_millis(
-                                    settings.stream_retry_ms.max(1000) as u64,
-                                ));
+                                reconnect_sleep!();
                                 continue;
                             }
                         }
                     } else {
                         rotate_for_reconnect!("获取流地址失败，重连前切段");
-                        std::thread::sleep(Duration::from_millis(
-                            settings.stream_retry_ms.max(1000) as u64,
-                        ));
+                        reconnect_sleep!();
                         continue;
                     }
                 }
@@ -952,9 +1136,7 @@ fn run_record_loop(
             );
             rotate_for_reconnect!("流地址过期，重连前切段");
             stream_urls.clear();
-            std::thread::sleep(Duration::from_millis(
-                settings.stream_retry_ms.max(1000) as u64
-            ));
+            reconnect_sleep!();
             continue;
         }
 
@@ -1000,9 +1182,7 @@ fn run_record_loop(
                 segment_index,
             );
             update_current_file(&context, &room_id, &current_file_path);
-            std::thread::sleep(Duration::from_millis(
-                settings.stream_retry_ms.max(1000) as u64
-            ));
+            reconnect_sleep!();
             continue;
         }
 
@@ -1032,7 +1212,7 @@ fn run_record_loop(
             }
         }
         let response = request.send();
-        let mut response = match response {
+        let response = match response {
             Ok(resp) => resp,
             Err(err) => {
                 append_log(
@@ -1040,10 +1220,8 @@ fn run_record_loop(
                     &format!("stream_connect_error room={} err={}", room_id, err),
                 );
                 rotate_for_reconnect!("连接流失败，重连前切段");
-                stream_urls.clear();
-                std::thread::sleep(Duration::from_millis(
-                    settings.stream_retry_ms.max(1000) as u64
-                ));
+                failover_or_refetch!();
+                reconnect_sleep!();
                 continue;
             }
         };
@@ -1084,9 +1262,7 @@ fn run_record_loop(
             );
             rotate_for_reconnect!("响应异常，重连前切段");
             stream_urls.clear();
-            std::thread::sleep(Duration::from_millis(
-                settings.stream_retry_ms.max(1000) as u64
-            ));
+            reconnect_sleep!();
             continue;
         }
 
@@ -1125,15 +1301,16 @@ fn run_record_loop(
             );
             rotate_for_reconnect!("响应格式异常，重连前切段");
             stream_urls.clear();
-            std::thread::sleep(Duration::from_millis(
-                settings.stream_retry_ms.max(1000) as u64
-            ));
+            reconnect_sleep!();
             continue;
         }
 
         let mut buf = vec![0u8; 8192];
         let mut parser = FlvStreamParser::new();
         let mut cache = FlvHeaderCache::new();
+        // B3：把流交给读超时看门狗读取器；超时会以 ErrorKind::TimedOut 形式返回，
+        // 命中下方读取异常分支(is_timeout)→切镜像/快速重连，避免僵死读长时间丢内容。
+        let mut reader = StreamTimeoutReader::new(response);
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 if let Some(mut seg) = segment.take() {
@@ -1146,7 +1323,7 @@ fn run_record_loop(
                 return Ok(());
             }
 
-            match response.read(&mut buf) {
+            match reader.read(&mut buf, stream_read_timeout) {
                 Ok(0) => {
                     let missing_since = missing_started_at.get_or_insert_with(Instant::now);
                     let missing_elapsed = missing_since.elapsed().as_secs();
@@ -1171,9 +1348,7 @@ fn run_record_loop(
                             return Err("直播流中断超过阈值".to_string());
                         }
                         rotate_for_reconnect!("流断开超过窗口，重连前切段");
-                        std::thread::sleep(Duration::from_millis(
-                            settings.stream_retry_ms.max(1000) as u64,
-                        ));
+                        reconnect_sleep!();
                         break;
                     }
                     append_log(
@@ -1184,10 +1359,8 @@ fn run_record_loop(
                         ),
                     );
                     rotate_for_reconnect!("读取结束，重连前切段");
-                    stream_urls.clear();
-                    std::thread::sleep(Duration::from_millis(
-                        settings.stream_retry_ms.max(1000) as u64
-                    ));
+                    failover_or_refetch!();
+                    reconnect_sleep!();
                     break;
                 }
                 Ok(n) => {
@@ -1208,9 +1381,7 @@ fn run_record_loop(
                             );
                             rotate_for_reconnect!("流头异常，重连前切段");
                             stream_urls.clear();
-                            std::thread::sleep(Duration::from_millis(
-                                settings.stream_retry_ms.max(1000) as u64,
-                            ));
+                            reconnect_sleep!();
                             break;
                         }
                     };
@@ -1373,14 +1544,22 @@ fn run_record_loop(
                                     )?;
                                     cache.write_preamble(&mut new_segment)?;
                                     pipeline.reset_on_new_segment();
+                                    // A1: 新段开启，清空时间戳基准；该段写入的第一帧将成为基准帧(归一到 0)。
+                                    segment_base_ts = None;
                                     segment_start = Instant::now();
                                     segment = Some(new_segment);
                                 }
 
                                 if let Some(seg) = segment.as_mut() {
+                                    // A1: 将本帧时间戳按分段基准归一，保证每段从 0 起、音视频同基，杜绝前几秒黑屏。
+                                    rebase_tag_to_segment_start(&mut tag, &mut segment_base_ts);
                                     seg.write(&tag.bytes)?;
                                     if decision.progressed {
                                         disconnect_retries = 0;
+                                        // 收到有效数据，重连退避计数清零，下次断流仍可立即重连。
+                                        reconnect_attempt = 0;
+                                        // B2: 当前镜像可用，重置镜像失败计数。
+                                        stream_url_failures = 0;
                                     }
                                     if settings.cutting_mode == 1 {
                                         let limit = settings.cutting_number.max(1) as u64;
@@ -1425,9 +1604,7 @@ fn run_record_loop(
                             return Err("流异常超过阈值".to_string());
                         }
                         rotate_for_reconnect!(&rotate_reason);
-                        std::thread::sleep(Duration::from_millis(
-                            settings.stream_retry_ms.max(1000) as u64,
-                        ));
+                        reconnect_sleep!();
                         break;
                     }
                 }
@@ -1476,9 +1653,7 @@ fn run_record_loop(
                             return Err("读取异常超过阈值".to_string());
                         }
                         rotate_for_reconnect!("读取异常超过窗口，重连前切段");
-                        std::thread::sleep(Duration::from_millis(
-                            settings.stream_retry_ms.max(1000) as u64,
-                        ));
+                        reconnect_sleep!();
                         break;
                     }
                     append_log(
@@ -1489,10 +1664,8 @@ fn run_record_loop(
                         ),
                     );
                     rotate_for_reconnect!("读取异常，重连前切段");
-                    stream_urls.clear();
-                    std::thread::sleep(Duration::from_millis(
-                        settings.stream_retry_ms.max(1000) as u64
-                    ));
+                    failover_or_refetch!();
+                    reconnect_sleep!();
                     break;
                 }
             }
@@ -1517,8 +1690,32 @@ fn rotate_segment_for_reconnect(
     pending_split: &mut bool,
     pending_title: &mut Option<String>,
     missing_started_at: &mut Option<Instant>,
+    split_on_reconnect: bool,
     reason: &str,
 ) -> Result<bool, String> {
+    // C1: 续写同一文件模式(record_mode != 0)。
+    // 因重连/读断/地址过期等异常触发的重连，不关闭当前分段、不切新文件，
+    // 保持文件打开，重连后把新连接的流追加写入同一文件；时间戳由 fixer 全程连续 +
+    // rebase_tag_to_segment_start 维持单调，缺口被无缝收敛，避免产生大量碎段与文件间空洞。
+    // 注意：标题/时长/大小等“计划内切段”仍走关键帧切段路径，不受此影响；
+    // 真正的编码/分辨率变更由 apply_header_change_rule 触发切段；
+    // 彻底断流(disconnect_retries>=3)由调用方显式 finish 收尾，不经过本函数。
+    if !split_on_reconnect {
+        if segment.is_some() {
+            *pending_split = false;
+            *pending_title = None;
+            *missing_started_at = None;
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "stream_reconnect_keep_file room={} reason={} file={}",
+                    room_id, reason, current_file_path
+                ),
+            );
+            return Ok(false);
+        }
+        // 尚无打开的分段(如开播即断)时，退化为按需新建，沿用下方逻辑。
+    }
     if let Some(mut seg) = segment.take() {
         let record_id = seg.record_id;
         let file_path = seg.file_path.clone();
@@ -1572,6 +1769,21 @@ fn write_flv_timestamp(tag: &mut FlvTag, timestamp: u32) {
     tag.bytes[5] = ((timestamp >> 8) & 0xff) as u8;
     tag.bytes[6] = (timestamp & 0xff) as u8;
     tag.bytes[7] = ((timestamp >> 24) & 0xff) as u8;
+}
+
+/// A1: 分段时间戳归一。
+/// 取该分段写入的第一帧时间戳作为基准，段内每个 tag 的时间戳统一减去该基准并钳到非负，
+/// 使每个分段都从 0 开始、音视频共用同一基准。这样重连/切段后续段的首帧不再带有
+/// 旧段累计的大时间戳(如 450s)，FLV 转 MP4 后视频与音频起点对齐，消除前几秒黑屏。
+/// 注意：FLV 头与 metadata/序列头由 write_preamble 直接写入(已归零)，不经过本函数。
+fn rebase_tag_to_segment_start(tag: &mut FlvTag, base: &mut Option<i64>) {
+    if tag.bytes.len() < 8 {
+        return;
+    }
+    let ts = parse_flv_timestamp(tag) as i64;
+    let base_ts = *base.get_or_insert(ts);
+    let rebased = (ts - base_ts).max(0);
+    write_flv_timestamp(tag, clamp_timestamp(rebased));
 }
 
 fn is_video_keyframe(tag: &FlvTag) -> bool {
@@ -1661,6 +1873,7 @@ impl TimestampChannelState {
         }
     }
 
+    #[allow(dead_code)]
     fn reset(&mut self) {
         self.last_original = None;
         self.last_fixed = None;
@@ -1722,6 +1935,7 @@ impl TimestampFixer {
         }
     }
 
+    #[allow(dead_code)]
     fn reset(&mut self) {
         self.last_original = None;
         self.last_fixed = None;
@@ -1762,15 +1976,28 @@ impl TimestampFixer {
             return None;
         }
         if is_header {
-            let stamp = if tag.tag_type == 18 {
-                self.next_target
-            } else {
-                self.last_fixed.unwrap_or(0)
+            // 头标签(序列头/脚本)对齐到对应流的当前时间线末端。
+            let stamp = match tag.tag_type {
+                18 => self.next_target,
+                8 => self.audio.last_fixed.unwrap_or(0),
+                9 => self.video.last_fixed.unwrap_or(0),
+                _ => self.next_target,
             };
             write_flv_timestamp(tag, clamp_timestamp(stamp));
             return None;
         }
 
+        // 读取"该路"上一帧的原始/已修复时间戳。单调性与跳变都必须按各自流判定，
+        // 否则音视频(8/9)在文件里交织、两路原始时间戳互相越位时会被误判为回退/跳变，
+        // 触发对共享 offset 的反复修正 → 每次交叉都把后续时间戳整体抬高(单向棘轮)，
+        // 累积成整条时间轴 ~6.5% 的均匀拉伸(播放变慢/时长虚标/按时间裁剪错位)。
+        let (prev_original, prev_fixed) = match tag.tag_type {
+            8 => (self.audio.last_original, self.audio.last_fixed),
+            9 => (self.video.last_original, self.video.last_fixed),
+            _ => (self.last_original, self.last_fixed),
+        };
+
+        // 步长按该路自身节奏估算(update_step 同时把该路 last_original 更新为 original)。
         let step = match tag.tag_type {
             8 => self.audio.update_step(original),
             9 => self.video.update_step(original),
@@ -1778,36 +2005,31 @@ impl TimestampFixer {
         }
         .max(TIMESTAMP_MIN_STEP_MS);
 
-        let last_original = match self.last_original {
-            Some(value) => value,
-            None => {
-                self.current_offset = original;
-                let fixed = 0;
-                self.last_original = Some(original);
-                self.last_fixed = Some(fixed);
-                match tag.tag_type {
-                    8 => self.audio.update_fixed(fixed),
-                    9 => self.video.update_fixed(fixed),
-                    _ => {}
-                }
-                self.recalculate_next_target();
-                write_flv_timestamp(tag, fixed as u32);
-                return None;
-            }
-        };
-        let last_fixed = self.last_fixed.unwrap_or(0);
-        let diff = original - last_original;
-        let mut jump_info = None;
+        // 全会话首个媒体标签：确定共享偏移，使时间线从 0 起。
+        // 共享 offset 对音频与视频施加同一变换 → 保持原始的音画相对同步关系。
+        if self.last_original.is_none() {
+            self.current_offset = original;
+        }
 
-        if diff < -TIMESTAMP_JUMP_THRESHOLD_MS || diff > TIMESTAMP_JUMP_THRESHOLD_MS {
+        // 跳变判定按"该路自身"上一帧(跨路相减会把正常交织误判为跳变)。
+        let stream_diff = prev_original.map(|prev| original - prev);
+        let is_jump = matches!(
+            stream_diff,
+            Some(diff) if diff < -TIMESTAMP_JUMP_THRESHOLD_MS || diff > TIMESTAMP_JUMP_THRESHOLD_MS
+        );
+        if is_jump {
+            // 重连/大缺口:把偏移重定到当前时间线末端,缺口收敛,音视频随同一 offset 一起平移。
             self.current_offset = original - self.next_target;
         }
 
         let mut fixed = original - self.current_offset;
-        if fixed <= last_fixed {
-            fixed = last_fixed + step;
-            self.current_offset = original - fixed;
+        // 单调下限:只与"本流"上一帧比较;且不回改共享 offset(回改会推动另一路造成音画漂移)。
+        match prev_fixed {
+            Some(pf) if fixed <= pf => fixed = pf + step,
+            None if fixed < 0 => fixed = 0,
+            _ => {}
         }
+
         self.last_original = Some(original);
         self.last_fixed = Some(fixed);
         match tag.tag_type {
@@ -1817,15 +2039,17 @@ impl TimestampFixer {
         }
         self.recalculate_next_target();
         write_flv_timestamp(tag, clamp_timestamp(fixed));
-        if diff < -TIMESTAMP_JUMP_THRESHOLD_MS || diff > TIMESTAMP_JUMP_THRESHOLD_MS {
-            jump_info = Some(TimestampJumpInfo {
-                diff,
+
+        if is_jump {
+            Some(TimestampJumpInfo {
+                diff: stream_diff.unwrap_or(0),
                 original,
                 fixed,
                 offset: self.current_offset,
-            });
+            })
+        } else {
+            None
         }
-        jump_info
     }
 
     fn recalculate_next_target(&mut self) {
@@ -1908,7 +2132,10 @@ impl LiveFlvPipeline {
     }
 
     fn reset_on_new_segment(&mut self) {
-        self.timestamp_fixer.reset();
+        // 注意(A1)：不再在每段重置 timestamp_fixer，让其在整个录制会话内保持连续单调输出。
+        // 否则开段关键帧(在 process_tag 中先于 reset 处理)会带上旧段累计的大时间戳，
+        // 而 reset 后续帧从 0 起，二者落在不同时间线上，导致转 MP4 前几秒黑屏。
+        // 分段从 0 起的归一改由 rebase_tag_to_segment_start 在写入前统一处理。
         self.last_progress_timestamp = None;
         self.stagnant_count = 0;
         self.last_progress_at = Instant::now();
@@ -2585,6 +2812,9 @@ fn build_live_remux_copy_args(source: &str, target: &str) -> Vec<String> {
         "-dn".to_string(),
         "-c".to_string(),
         "copy".to_string(),
+        // A2: 兜底将起始时间戳归零，处理任何残余的负/偏移时间戳，与录制端 A1 归一互补。
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
         target.to_string(),
     ]
 }
@@ -3985,4 +4215,153 @@ fn build_danmaku_packet(op: u32, body: Vec<u8>) -> Vec<u8> {
     buf.extend_from_slice(&1u32.to_be_bytes());
     buf.extend_from_slice(&body);
     buf
+}
+
+#[cfg(test)]
+mod timestamp_fixer_tests {
+    use super::*;
+
+    fn make_tag(tag_type: u8, ts: u32) -> FlvTag {
+        // 仅 bytes[4..8] 的时间戳与 tag_type 对修复逻辑有意义。
+        let mut bytes = vec![0u8; 11];
+        bytes[0] = tag_type;
+        let mut tag = FlvTag {
+            tag_type,
+            bytes,
+            data_offset: 11,
+            data_len: 0,
+        };
+        write_flv_timestamp(&mut tag, ts);
+        tag
+    }
+
+    /// 模拟真实交织流:60fps 视频 + 46.875pkt/s 音频(48kHz/1024),时长 dur_s 秒。
+    /// 返回 (各 tag 修复后时间戳序列, 末帧原始时间戳)。
+    fn run_interleaved(dur_s: i64) -> (Vec<(u8, i64)>, i64) {
+        // 生成各路原始时间戳(ms)
+        let nv = (dur_s * 60) as usize;
+        let na = (dur_s * 1000 / 1024 * 48000 / 1000) as usize; // ≈ dur_s*46.875
+        let mut events: Vec<(i64, u8)> = Vec::with_capacity(nv + na);
+        for i in 0..nv {
+            events.push(((i as i64 * 1000) / 60, 9));
+        }
+        for j in 0..na {
+            events.push(((j as i64 * 1024 * 1000) / 48000, 8));
+        }
+        // 按原始时间戳排序模拟封装交织;同刻视频在前(稳定排序)
+        events.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        let max_original = events.iter().map(|e| e.0).max().unwrap_or(0);
+
+        let mut fixer = TimestampFixer::new(true, true);
+        let mut out = Vec::with_capacity(events.len());
+        for (ts, ty) in &events {
+            let mut tag = make_tag(*ty, *ts as u32);
+            fixer.fix_tag(&mut tag, false);
+            out.push((*ty, parse_flv_timestamp(&tag) as i64));
+        }
+        (out, max_original)
+    }
+
+    #[test]
+    fn no_uniform_stretch_on_interleaved_av() {
+        let (out, max_original) = run_interleaved(600);
+        let max_fixed = out.iter().map(|(_, t)| *t).max().unwrap();
+        // 修复后时间轴应贴合真实原始时长;旧 bug 会拉伸 ~6.5%。允许 <0.5% 误差。
+        let drift = (max_fixed - max_original).abs() as f64 / max_original as f64;
+        assert!(
+            drift < 0.005,
+            "时间轴拉伸过大: max_fixed={max_fixed} max_original={max_original} drift={drift:.4}"
+        );
+    }
+
+    #[test]
+    fn per_stream_monotonic() {
+        let (out, _) = run_interleaved(120);
+        let mut last_a = i64::MIN;
+        let mut last_v = i64::MIN;
+        for (ty, t) in out {
+            if ty == 8 {
+                assert!(t > last_a, "音频时间戳非单调: {t} <= {last_a}");
+                last_a = t;
+            } else if ty == 9 {
+                assert!(t > last_v, "视频时间戳非单调: {t} <= {last_v}");
+                last_v = t;
+            }
+        }
+    }
+
+    #[test]
+    fn reconnect_jump_collapses_gap() {
+        // 一段正常流 → 原始时间戳大跳变(模拟重连后服务器时间戳跃变) → 继续。
+        let mut fixer = TimestampFixer::new(true, true);
+        let mut last_v = 0i64;
+        // 第一段:0..2s 视频
+        for i in 0..120 {
+            let ts = (i as i64 * 1000) / 60;
+            let mut tag = make_tag(9, ts as u32);
+            fixer.fix_tag(&mut tag, false);
+            last_v = parse_flv_timestamp(&tag) as i64;
+        }
+        // 重连:原始时间戳从 ~2000ms 跳到 500000ms
+        let mut first_after = None;
+        for i in 0..120 {
+            let ts = 500_000 + (i as i64 * 1000) / 60;
+            let mut tag = make_tag(9, ts as u32);
+            fixer.fix_tag(&mut tag, false);
+            let f = parse_flv_timestamp(&tag) as i64;
+            if first_after.is_none() {
+                first_after = Some(f);
+            }
+            assert!(f > last_v, "重连后时间戳应继续单调: {f} <= {last_v}");
+            last_v = f;
+        }
+        // 缺口应被收敛(不应把 500s 的原始跳变带入修复后时间线)。
+        let gap = first_after.unwrap() - (120 * 1000 / 60);
+        assert!(gap < 1000, "重连缺口未收敛: gap={gap}ms");
+    }
+}
+
+#[cfg(test)]
+mod stream_timeout_reader_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // 永久阻塞的 Read，模拟僵死的 B站 CDN socket(连接在、不发数据也不关闭)。
+    struct HangReader;
+    impl Read for HangReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_secs(3600));
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn reads_all_then_eof_across_buffer_boundaries() {
+        let mut reader = StreamTimeoutReader::new(Cursor::new(vec![7u8; 100_000]));
+        let mut buf = [0u8; 8192];
+        let mut total = 0;
+        loop {
+            let n = reader.read(&mut buf, Some(Duration::from_secs(2))).unwrap();
+            if n == 0 {
+                break;
+            }
+            assert!(buf[..n].iter().all(|&b| b == 7));
+            total += n;
+        }
+        assert_eq!(total, 100_000);
+    }
+
+    #[test]
+    fn hung_stream_returns_timedout_quickly() {
+        let mut reader = StreamTimeoutReader::new(HangReader);
+        let mut buf = [0u8; 8192];
+        let start = Instant::now();
+        let res = reader.read(&mut buf, Some(Duration::from_millis(300)));
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(&res, Err(e) if e.kind() == ErrorKind::TimedOut),
+            "僵死流应返回 TimedOut, 实际: {res:?}"
+        );
+        assert!(elapsed < Duration::from_millis(1500), "超时返回过慢: {elapsed:?}");
+    }
 }

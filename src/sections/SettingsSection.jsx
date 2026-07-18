@@ -64,6 +64,7 @@ export default function SettingsSection() {
     flvFixAdjustTimestampJump: false,
     flvFixSplitOnTimestampJump: true,
     flvFixDisableOnAnnexb: false,
+    reconnectKeepFile: true,
     baiduSyncEnabled: false,
     baiduSyncPath: "/录播",
   });
@@ -252,6 +253,10 @@ export default function SettingsSection() {
           flvFixAdjustTimestampJump: Boolean(data.flvFixAdjustTimestampJump),
           flvFixSplitOnTimestampJump: Boolean(data.flvFixSplitOnTimestampJump),
           flvFixDisableOnAnnexb: Boolean(data.flvFixDisableOnAnnexb),
+          reconnectKeepFile:
+            data.reconnectKeepFile === undefined
+              ? true
+              : Boolean(data.reconnectKeepFile),
           baiduSyncEnabled: Boolean(data.baiduSyncEnabled),
           baiduSyncPath: data.baiduSyncPath || "/录播",
         });
@@ -389,6 +394,7 @@ export default function SettingsSection() {
           flvFixAdjustTimestampJump: liveSettings.flvFixAdjustTimestampJump,
           flvFixSplitOnTimestampJump: liveSettings.flvFixSplitOnTimestampJump,
           flvFixDisableOnAnnexb: liveSettings.flvFixDisableOnAnnexb,
+          reconnectKeepFile: liveSettings.reconnectKeepFile,
           baiduSyncEnabled: liveSettings.baiduSyncEnabled,
           baiduSyncPath: liveSettings.baiduSyncPath,
         },
@@ -878,6 +884,24 @@ export default function SettingsSection() {
               }
               className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
             />
+          </div>
+          <div className="lg:col-span-2">
+            <label className="flex items-center gap-2 text-sm text-[var(--ink)]">
+              <input
+                type="checkbox"
+                checked={liveSettings.reconnectKeepFile}
+                onChange={(event) =>
+                  setLiveSettings((prev) => ({
+                    ...prev,
+                    reconnectKeepFile: event.target.checked,
+                  }))
+                }
+              />
+              重连续写同一文件（推荐开启）
+            </label>
+            <p className="mt-1 text-xs text-[var(--muted)]">
+              开启后，网络重连不再滚动新分段文件，而是续写当前文件，消除重连产生的碎段与文件间接缝；按时间/大小/标题的计划分段仍按关键帧无缝切段，不受影响。
+            </p>
           </div>
           <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
             <input
