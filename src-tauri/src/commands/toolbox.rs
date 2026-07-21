@@ -277,7 +277,7 @@ pub struct VideoMaskPreviewFramePayload {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VideoMaskImageDataUrlPayload {
+pub struct VideoMaskImagePreviewPayload {
     pub image_path: String,
 }
 
@@ -299,8 +299,8 @@ pub struct VideoMaskPreviewFrameResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VideoMaskImageDataUrlResult {
-    pub data_url: String,
+pub struct VideoMaskImagePreviewResult {
+    pub preview_path: String,
 }
 
 #[tauri::command]
@@ -465,9 +465,10 @@ pub async fn toolbox_video_mask_preview_frame(
 }
 
 #[tauri::command]
-pub async fn toolbox_video_mask_image_data_url(
-    payload: VideoMaskImageDataUrlPayload,
-) -> Result<ApiResponse<VideoMaskImageDataUrlResult>, String> {
+pub async fn toolbox_video_mask_image_preview(
+    app: AppHandle,
+    payload: VideoMaskImagePreviewPayload,
+) -> Result<ApiResponse<VideoMaskImagePreviewResult>, String> {
     let image_path = payload.image_path.trim();
     if image_path.is_empty() {
         return Ok(ApiResponse::error("请选择遮罩图片"));
@@ -477,13 +478,19 @@ pub async fn toolbox_video_mask_image_data_url(
     }
 
     let image_path = PathBuf::from(image_path);
-    let result = tauri::async_runtime::spawn_blocking(move || image_file_data_url(&image_path))
-        .await
-        .map_err(|_| "遮罩图片预览生成失败".to_string())?;
+    let preview_dir = match video_mask_image_preview_dir(&app) {
+        Ok(path) => path,
+        Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        prepare_video_mask_image_preview(&image_path, &preview_dir)
+    })
+    .await
+    .map_err(|_| "遮罩图片预览生成失败".to_string())?;
 
     match result {
-        Ok(data_url) => Ok(ApiResponse::success(VideoMaskImageDataUrlResult {
-            data_url,
+        Ok(preview_path) => Ok(ApiResponse::success(VideoMaskImagePreviewResult {
+            preview_path,
         })),
         Err(err) => Ok(ApiResponse::error(err)),
     }
@@ -1319,25 +1326,26 @@ fn image_data_url(path: &Path) -> Result<String, String> {
     ))
 }
 
-fn image_file_data_url(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|err| format!("读取遮罩图片失败: {}", err))?;
-    let mime = match path
+fn prepare_video_mask_image_preview(path: &Path, output_dir: &Path) -> Result<String, String> {
+    let extension = match path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()
     {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        _ => "application/octet-stream",
+        "png" => "png",
+        "jpg" | "jpeg" => "jpg",
+        "webp" => "webp",
+        _ => return Err("仅支持 png、jpg、jpeg、webp 遮罩图片".to_string()),
     };
-    Ok(format!(
-        "data:{};base64,{}",
-        mime,
-        general_purpose::STANDARD.encode(bytes)
-    ))
+    fs::create_dir_all(output_dir).map_err(|err| format!("创建遮罩图片缓存目录失败: {}", err))?;
+    let output = output_dir.join(format!("{}.{}", Uuid::new_v4(), extension));
+    fs::copy(path, &output).map_err(|err| format!("生成遮罩图片预览缓存失败: {}", err))?;
+    if !output.is_file() {
+        return Err("遮罩图片预览缓存生成失败".to_string());
+    };
+    Ok(output.to_string_lossy().into_owned())
 }
 
 fn sampled_keyframe_times(keyframes: &[f64], max_count: usize) -> Vec<f64> {
@@ -3477,6 +3485,17 @@ fn video_mask_thumbnail_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .join("toolbox")
         .join("video-mask-thumbnails");
     fs::create_dir_all(&dir).map_err(|err| format!("创建关键帧缓存目录失败: {}", err))?;
+    Ok(dir)
+}
+
+fn video_mask_image_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("读取应用数据目录失败: {}", err))?
+        .join("toolbox")
+        .join("video-mask-image-previews");
+    fs::create_dir_all(&dir).map_err(|err| format!("创建遮罩图片缓存目录失败: {}", err))?;
     Ok(dir)
 }
 
