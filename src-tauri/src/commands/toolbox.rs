@@ -275,6 +275,12 @@ pub struct VideoMaskPreviewFramePayload {
     pub width: Option<i64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoMaskImageDataUrlPayload {
+    pub image_path: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoMaskThumbnailItem {
@@ -288,6 +294,12 @@ pub struct VideoMaskThumbnailItem {
 pub struct VideoMaskPreviewFrameResult {
     pub time: f64,
     pub path: String,
+    pub data_url: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoMaskImageDataUrlResult {
     pub data_url: String,
 }
 
@@ -448,6 +460,31 @@ pub async fn toolbox_video_mask_preview_frame(
 
     match result {
         Ok(item) => Ok(ApiResponse::success(item)),
+        Err(err) => Ok(ApiResponse::error(err)),
+    }
+}
+
+#[tauri::command]
+pub async fn toolbox_video_mask_image_data_url(
+    payload: VideoMaskImageDataUrlPayload,
+) -> Result<ApiResponse<VideoMaskImageDataUrlResult>, String> {
+    let image_path = payload.image_path.trim();
+    if image_path.is_empty() {
+        return Ok(ApiResponse::error("请选择遮罩图片"));
+    }
+    if !Path::new(image_path).is_file() {
+        return Ok(ApiResponse::error("遮罩图片不存在"));
+    }
+
+    let image_path = PathBuf::from(image_path);
+    let result = tauri::async_runtime::spawn_blocking(move || image_file_data_url(&image_path))
+        .await
+        .map_err(|_| "遮罩图片预览生成失败".to_string())?;
+
+    match result {
+        Ok(data_url) => Ok(ApiResponse::success(VideoMaskImageDataUrlResult {
+            data_url,
+        })),
         Err(err) => Ok(ApiResponse::error(err)),
     }
 }
@@ -1282,6 +1319,27 @@ fn image_data_url(path: &Path) -> Result<String, String> {
     ))
 }
 
+fn image_file_data_url(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|err| format!("读取遮罩图片失败: {}", err))?;
+    let mime = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    };
+    Ok(format!(
+        "data:{};base64,{}",
+        mime,
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
 fn sampled_keyframe_times(keyframes: &[f64], max_count: usize) -> Vec<f64> {
     let mut times = keyframes
         .iter()
@@ -1744,7 +1802,8 @@ fn copy_part_args_with_timing(
     } else {
         0.0
     };
-    let copy_duration = compensated_copy_duration(duration, fps, reorder_delay_frames, trim_for_concat);
+    let copy_duration =
+        compensated_copy_duration(duration, fps, reorder_delay_frames, trim_for_concat);
     vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -3625,9 +3684,14 @@ mod tests {
     fn toolbox_video_mask_compensates_copy_reorder_delay() {
         let duration = 3770.031812;
 
-        assert!((compensated_copy_duration(duration, 60.0, 3, true) - 3769.981812).abs() < 0.000001);
+        assert!(
+            (compensated_copy_duration(duration, 60.0, 3, true) - 3769.981812).abs() < 0.000001
+        );
         assert_eq!(compensated_copy_duration(duration, 60.0, 0, true), duration);
-        assert_eq!(compensated_copy_duration(duration, 60.0, 3, false), duration);
+        assert_eq!(
+            compensated_copy_duration(duration, 60.0, 3, false),
+            duration
+        );
     }
 
     #[test]

@@ -22,6 +22,15 @@ const fileNameFromPath = (path) => {
   return normalized.split("/").filter(Boolean).pop() || "未命名资源";
 };
 
+const fileSrcFromPath = (path) => {
+  const raw = String(path || "").trim();
+  return raw ? convertFileSrc(raw) : "";
+};
+
+const resourceImageSrc = (resource) => resource?.imageSrc || fileSrcFromPath(resource?.path);
+
+const segmentImageSrc = (segment) => segment?.imageSrc || fileSrcFromPath(segment?.imagePath);
+
 const buildDefaultTarget = (sourcePath, suffix = "_masked", extension = "mp4") => {
   const normalized = normalizePath(sourcePath);
   if (!normalized) {
@@ -65,6 +74,7 @@ const createSegment = (index, startTime, duration, resource = null) => {
     label: imageName || `遮罩 ${index + 1}`,
     enabled: true,
     imagePath: resource?.path || "",
+    imageSrc: resourceImageSrc(resource),
     imageName,
     startTime: safeStart,
     endTime: safeStart + safeDuration,
@@ -590,7 +600,7 @@ export default function VideoMaskTool() {
       if (previewFrameSeqRef.current !== seq) {
         return;
       }
-      setPreviewFrameSrc(result?.dataUrl || (result?.path ? convertFileSrc(result.path) : ""));
+      setPreviewFrameSrc(result?.dataUrl || fileSrcFromPath(result?.path));
     } catch (error) {
       if (previewFrameSeqRef.current === seq) {
         setMessage(error?.message || "预览帧生成失败");
@@ -752,6 +762,31 @@ export default function VideoMaskTool() {
     }
   };
 
+  const buildImageResource = async (path) => {
+    try {
+      const result = await invokeCommand("toolbox_video_mask_image_data_url", {
+        payload: {
+          imagePath: path,
+        },
+      });
+      return {
+        id: `resource-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        path,
+        imageSrc: result?.dataUrl || fileSrcFromPath(path),
+        name: fileNameFromPath(path),
+        previewError: "",
+      };
+    } catch (error) {
+      return {
+        id: `resource-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        path,
+        imageSrc: fileSrcFromPath(path),
+        name: fileNameFromPath(path),
+        previewError: error?.message || "遮罩图片预览生成失败",
+      };
+    }
+  };
+
   const handleImportResources = async () => {
     setMessage("");
     const selected = await open({
@@ -764,22 +799,24 @@ export default function VideoMaskTool() {
     if (paths.length === 0) {
       return;
     }
+    const imported = await Promise.all(paths.map((path) => buildImageResource(path)));
     setResources((prev) => {
       const exists = new Set(prev.map((item) => item.path));
       const next = [...prev];
-      for (const path of paths) {
-        if (!exists.has(path)) {
-          next.push({
-            id: `resource-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-            path,
-            name: fileNameFromPath(path),
-          });
-          exists.add(path);
+      for (const resource of imported) {
+        if (!exists.has(resource.path)) {
+          next.push(resource);
+          exists.add(resource.path);
         }
       }
       return next;
     });
-    setMessage(`已导入 ${paths.length} 个图片资源，可拖到预览区或时间轴使用`);
+    const failedCount = imported.filter((item) => item.previewError).length;
+    setMessage(
+      failedCount > 0
+        ? `已导入 ${paths.length} 个图片资源，其中 ${failedCount} 个预览地址生成失败，已尝试使用本地路径兜底`
+        : `已导入 ${paths.length} 个图片资源，可拖到预览区或时间轴使用`,
+    );
   };
 
   const resourceFromDragEvent = (event) => {
@@ -984,7 +1021,8 @@ export default function VideoMaskTool() {
     crf: outputCrf,
     preset: "veryfast",
     segments: segments.map((segment) => ({
-      ...segment,
+      id: segment.id,
+      imagePath: segment.imagePath,
       startTime: Number(segment.startTime) || 0,
       endTime: Number(segment.endTime) || 0,
       x: Number(segment.x) || 0,
@@ -1007,6 +1045,14 @@ export default function VideoMaskTool() {
     },
   });
 
+  const serializeResources = () =>
+    resources.map((resource) => ({
+      id: resource.id,
+      path: resource.path,
+      name: resource.name,
+      previewError: resource.previewError || "",
+    }));
+
   useEffect(() => {
     if (!sourcePath && segments.length === 0 && resources.length === 0) {
       return;
@@ -1017,7 +1063,7 @@ export default function VideoMaskTool() {
         JSON.stringify({
           savedAt: new Date().toISOString(),
           payload: buildPayload(),
-          resources,
+          resources: serializeResources(),
           qualityPercent,
         }),
       );
@@ -1174,7 +1220,7 @@ export default function VideoMaskTool() {
         >
           <div className="aspect-video overflow-hidden rounded bg-black">
             <img
-              src={convertFileSrc(draggingResource.resource.path)}
+              src={resourceImageSrc(draggingResource.resource)}
               alt=""
               className="h-full w-full object-cover"
               draggable={false}
@@ -1387,7 +1433,7 @@ export default function VideoMaskTool() {
                               onContextMenu={(event) => openSegmentMenu(segment, event)}
                             >
                               <img
-                                src={convertFileSrc(segment.imagePath)}
+                                src={segmentImageSrc(segment)}
                                 alt=""
                                 className="absolute h-full w-full object-cover select-none"
                                 draggable={false}
@@ -1491,7 +1537,7 @@ export default function VideoMaskTool() {
                 event.preventDefault();
                 const rect = timelineRef.current.getBoundingClientRect();
                 const wheelDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
-                if (event.altKey || event.metaKey) {
+                if (event.ctrlKey) {
                   const zoomStep = Math.max(1, Math.min(10, Math.round(Math.abs(wheelDelta) / 20)));
                   updateTimelineZoomPercent(timelinePercent + Math.sign(wheelDelta || 1) * zoomStep);
                   return;
@@ -1645,7 +1691,7 @@ export default function VideoMaskTool() {
                         >
                           {segment.imagePath ? (
                             <img
-                              src={convertFileSrc(segment.imagePath)}
+                              src={segmentImageSrc(segment)}
                               alt=""
                               className="h-8 w-10 shrink-0 rounded-sm object-cover"
                               draggable={false}
@@ -1708,7 +1754,7 @@ export default function VideoMaskTool() {
                     >
                       <div className="aspect-video overflow-hidden rounded-md bg-black">
                         <img
-                          src={convertFileSrc(resource.path)}
+                          src={resourceImageSrc(resource)}
                           alt=""
                           className="h-full w-full object-cover"
                           draggable={false}

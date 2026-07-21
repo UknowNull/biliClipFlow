@@ -260,6 +260,7 @@ pub fn run() {
             commands::toolbox::toolbox_video_mask_keyframes,
             commands::toolbox::toolbox_video_mask_thumbnails,
             commands::toolbox::toolbox_video_mask_preview_frame,
+            commands::toolbox::toolbox_video_mask_image_data_url,
             commands::toolbox::toolbox_video_mask_build_plan,
             commands::toolbox::toolbox_video_mask_merge,
             commands::toolbox::toolbox_video_mask_render,
