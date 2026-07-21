@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{ErrorKind, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -100,6 +100,7 @@ struct SubmissionQueueContext {
     login_store: Arc<LoginStore>,
     app_log_path: Arc<PathBuf>,
     edit_upload_state: Arc<Mutex<EditUploadState>>,
+    remote_refresh_pause_count: Arc<AtomicUsize>,
 }
 
 fn build_submission_queue_context(state: &State<'_, AppState>) -> SubmissionQueueContext {
@@ -109,6 +110,7 @@ fn build_submission_queue_context(state: &State<'_, AppState>) -> SubmissionQueu
         login_store: state.login_store.clone(),
         app_log_path: state.app_log_path.clone(),
         edit_upload_state: state.edit_upload_state.clone(),
+        remote_refresh_pause_count: state.submission_remote_refresh_pause_count.clone(),
     }
 }
 
@@ -118,6 +120,7 @@ pub fn start_submission_background_tasks(
     login_store: Arc<LoginStore>,
     app_log_path: Arc<PathBuf>,
     edit_upload_state: Arc<Mutex<EditUploadState>>,
+    remote_refresh_pause_count: Arc<AtomicUsize>,
 ) {
     static SUBMISSION_BACKGROUND_TASKS_STARTED: AtomicBool = AtomicBool::new(false);
     if SUBMISSION_BACKGROUND_TASKS_STARTED.swap(true, Ordering::SeqCst) {
@@ -133,6 +136,7 @@ pub fn start_submission_background_tasks(
         login_store,
         app_log_path,
         edit_upload_state,
+        remote_refresh_pause_count,
     };
     let recovery_context = context.clone();
     tauri::async_runtime::spawn(async move {
@@ -9459,13 +9463,8 @@ pub async fn submission_start(
                 continue;
             }
             if stats.completed < stats.total {
-                let _ = update_workflow_status(
-                    &context,
-                    &task.task_id,
-                    "VIDEO_DOWNLOADING",
-                    None,
-                    0.0,
-                );
+                let _ =
+                    update_workflow_status(&context, &task.task_id, "VIDEO_DOWNLOADING", None, 0.0);
                 let _ = update_integrated_relation_workflow_status(
                     &context,
                     &task.task_id,
@@ -12106,8 +12105,8 @@ fn load_task_detail(
 ) -> Result<SubmissionTaskDetail, String> {
     let path_prefix = context.local_path_prefix.clone();
     let task = load_task_record(context, task_id)?;
-    let workflow_config = load_effective_workflow_config_record(context, task_id)?
-        .map(|(_, config)| config);
+    let workflow_config =
+        load_effective_workflow_config_record(context, task_id)?.map(|(_, config)| config);
     let mut detail = context
     .db
     .with_conn(|conn| {
@@ -13656,15 +13655,11 @@ async fn run_submission_workflow(
                 workflow_settings.segment_prefix.as_deref(),
             )?;
             // 单合并单元（无合并组配置）：若对应源视频设置了自定义上传分P标题则覆盖。
-            let single_title = resolve_merge_groups(
-                &context,
-                &task_id,
-                workflow_config.as_ref(),
-                &sources,
-            )
-            .into_iter()
-            .next()
-            .and_then(|group| group.upload_part_title);
+            let single_title =
+                resolve_merge_groups(&context, &task_id, workflow_config.as_ref(), &sources)
+                    .into_iter()
+                    .next()
+                    .and_then(|group| group.upload_part_title);
             if let Some(title) = single_title {
                 apply_non_segmented_part_title(&context, &task_id, merged_id, &title)?;
             }
@@ -15455,7 +15450,10 @@ async fn process_submission_queue_task(
                 if is_workflow_superseded_error(&err) {
                     append_log(
                         &context.app_log_path,
-                        &format!("submission_queue_upload_skip_superseded task_id={}", task_id),
+                        &format!(
+                            "submission_queue_upload_skip_superseded task_id={}",
+                            task_id
+                        ),
                     );
                     break;
                 }
@@ -15550,7 +15548,16 @@ async fn submission_remote_refresh_loop(context: SubmissionQueueContext) {
             .map(|settings| settings.submission_remote_refresh_minutes)
             .unwrap_or(DEFAULT_SUBMISSION_REMOTE_REFRESH_MINUTES)
             .max(1);
-        if let Err(err) = refresh_submission_remote_state(&context).await {
+        let pause_count = context.remote_refresh_pause_count.load(Ordering::SeqCst);
+        if pause_count > 0 {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_remote_refresh_skip reason=toolbox_bilibili_season_restore_active count={}",
+                    pause_count
+                ),
+            );
+        } else if let Err(err) = refresh_submission_remote_state(&context).await {
             append_log(
                 &context.app_log_path,
                 &format!("submission_remote_refresh_fail err={}", err),
@@ -18730,10 +18737,16 @@ fn attach_update_sources(config: Value, sources: &[SourceVideoInput]) -> Value {
                 }
             }
             if let Some(remote_aid) = source.remote_aid.filter(|value| *value > 0) {
-                map.insert("remoteAid".to_string(), Value::Number(Number::from(remote_aid)));
+                map.insert(
+                    "remoteAid".to_string(),
+                    Value::Number(Number::from(remote_aid)),
+                );
             }
             if let Some(remote_cid) = source.remote_cid.filter(|value| *value > 0) {
-                map.insert("remoteCid".to_string(), Value::Number(Number::from(remote_cid)));
+                map.insert(
+                    "remoteCid".to_string(),
+                    Value::Number(Number::from(remote_cid)),
+                );
             }
             if let Some(remote_part_title) = source.remote_part_title.as_deref() {
                 let trimmed = remote_part_title.trim();

@@ -288,14 +288,24 @@ fn timecode_to_seconds(value: &str) -> Option<i64> {
 }
 
 fn is_empty_or_zero_time(value: Option<&str>) -> bool {
-    match value.map(|item| item.trim()).filter(|item| !item.is_empty()) {
-        Some(item) => timecode_to_seconds(item).map(|seconds| seconds <= 0).unwrap_or(false),
+    match value
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+    {
+        Some(item) => timecode_to_seconds(item)
+            .map(|seconds| seconds <= 0)
+            .unwrap_or(false),
         None => true,
     }
 }
 
 fn normalize_download_source_type(value: Option<&str>) -> String {
-    match value.unwrap_or(DOWNLOAD_SOURCE_BILIBILI).trim().to_ascii_uppercase().as_str() {
+    match value
+        .unwrap_or(DOWNLOAD_SOURCE_BILIBILI)
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
         DOWNLOAD_SOURCE_BAIDU => DOWNLOAD_SOURCE_BAIDU.to_string(),
         DOWNLOAD_SOURCE_DIRECT => DOWNLOAD_SOURCE_DIRECT.to_string(),
         "URL" | "THIRD_PARTY" | "DIRECT_URL" | "REMOTE_URL" => DOWNLOAD_SOURCE_DIRECT.to_string(),
@@ -1307,10 +1317,7 @@ async fn handle_integration_download(
         return ApiResponse::error("Missing download requests".to_string());
     }
 
-    let immediate_submit = request
-        .submission_request
-        .immediate_submit
-        .unwrap_or(true);
+    let immediate_submit = request.submission_request.immediate_submit.unwrap_or(true);
     let mut download_results = Vec::new();
     for download_request in download_requests {
         match create_download_tasks_with_start(context.clone(), download_request, immediate_submit)
@@ -1465,7 +1472,9 @@ async fn handle_integration_download(
                 };
                 let remote_meta = (bvid, aid, part_title, remote_video_url);
                 source_remote_meta_by_record_id.insert(record_id, remote_meta.clone());
-                if let Some(cid) = cid.filter(|value| cid_counts.get(value).copied().unwrap_or(0) == 1) {
+                if let Some(cid) =
+                    cid.filter(|value| cid_counts.get(value).copied().unwrap_or(0) == 1)
+                {
                     source_remote_meta_by_cid.insert(cid, remote_meta);
                 }
             }
@@ -1816,9 +1825,13 @@ async fn create_direct_download_tasks_with_start(
     let output_path = build_output_path(&base_dir, &sanitized_folder, &file_name);
     let expected_path = output_path.to_string_lossy().to_string();
 
-    if let Some((record_id, actual_path, status)) =
-        find_reusable_download_record(&context, None, &url_value, &part_title, DOWNLOAD_SOURCE_DIRECT)?
-    {
+    if let Some((record_id, actual_path, status)) = find_reusable_download_record(
+        &context,
+        None,
+        &url_value,
+        &part_title,
+        DOWNLOAD_SOURCE_DIRECT,
+    )? {
         let actual_path_buf = PathBuf::from(&actual_path);
         let has_file = actual_path_buf.is_file();
         let can_reuse = status == 0 || status == 1 || status == 3 || status == 4 || status == 5;
@@ -2661,8 +2674,14 @@ async fn run_direct_download_job(
             record_id, download_url
         ),
     );
-    let result =
-        download_direct_url(&context, record_id, &download_url, &output_path, resume_progress).await;
+    let result = download_direct_url(
+        &context,
+        record_id,
+        &download_url,
+        &output_path,
+        resume_progress,
+    )
+    .await;
     release_download_slot(&context);
     let context_clone = context.clone();
     tauri::async_runtime::spawn(async move {
@@ -3496,8 +3515,7 @@ async fn probe_direct_url_duration(url: &str) -> Result<i64, String> {
             url,
         ];
         let data = run_ffprobe_json(&args)?;
-        extract_probe_duration_seconds(&data)
-            .ok_or_else(|| "无法获取第三方视频时长".to_string())
+        extract_probe_duration_seconds(&data).ok_or_else(|| "无法获取第三方视频时长".to_string())
     })
     .await
     .map_err(|err| format!("获取第三方视频时长失败: {}", err))?
@@ -4344,11 +4362,7 @@ fn extract_probe_duration_seconds(data: &Value) -> Option<i64> {
                 .and_then(|streams| {
                     streams
                         .iter()
-                        .filter_map(|stream| {
-                            stream
-                                .get("duration")
-                                .and_then(json_duration_seconds)
-                        })
+                        .filter_map(|stream| stream.get("duration").and_then(json_duration_seconds))
                         .max()
                 })
         })

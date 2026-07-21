@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::process::Child;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use tokio::time::{sleep, Duration};
@@ -31,6 +32,7 @@ struct AppState {
     download_runtime: Arc<DownloadRuntime>,
     live_runtime: Arc<live_recorder::LiveRuntime>,
     edit_upload_state: Arc<Mutex<commands::submission::EditUploadState>>,
+    submission_remote_refresh_pause_count: Arc<AtomicUsize>,
     baidu_sync_runtime: Arc<baidu_sync::BaiduSyncRuntime>,
     baidu_login_runtime: Arc<Mutex<commands::baidu_sync::BaiduLoginRuntime>>,
 }
@@ -144,6 +146,7 @@ pub fn run() {
                 edit_upload_state: Arc::new(Mutex::new(
                     commands::submission::EditUploadState::default(),
                 )),
+                submission_remote_refresh_pause_count: Arc::new(AtomicUsize::new(0)),
                 baidu_sync_runtime: Arc::new(baidu_sync::BaiduSyncRuntime::new()),
                 baidu_login_runtime: Arc::new(Mutex::new(
                     commands::baidu_sync::BaiduLoginRuntime::default(),
@@ -174,6 +177,7 @@ pub fn run() {
                 Arc::clone(&state.login_store),
                 Arc::clone(&state.app_log_path),
                 Arc::clone(&state.edit_upload_state),
+                Arc::clone(&state.submission_remote_refresh_pause_count),
             );
             let baidu_context = baidu_sync::BaiduSyncContext {
                 db: Arc::clone(&state.db),
@@ -251,6 +255,19 @@ pub fn run() {
             commands::process::process_create,
             commands::process::process_status,
             commands::toolbox::toolbox_remux,
+            commands::toolbox::toolbox_video_probe,
+            commands::toolbox::toolbox_video_mask_probe,
+            commands::toolbox::toolbox_video_mask_keyframes,
+            commands::toolbox::toolbox_video_mask_thumbnails,
+            commands::toolbox::toolbox_video_mask_preview_frame,
+            commands::toolbox::toolbox_video_mask_build_plan,
+            commands::toolbox::toolbox_video_mask_merge,
+            commands::toolbox::toolbox_video_mask_render,
+            commands::toolbox::toolbox_bilibili_season_list,
+            commands::toolbox::toolbox_bilibili_season_backups,
+            commands::toolbox::toolbox_bilibili_season_backup_delete,
+            commands::toolbox::toolbox_bilibili_season_backup,
+            commands::toolbox::toolbox_bilibili_season_restore,
             commands::submission::submission_queue_prioritize,
             commands::baidu_sync::baidu_sync_settings,
             commands::baidu_sync::baidu_sync_status,

@@ -18,7 +18,22 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": [
+            "$HOME/**",
+            "$VIDEO/**",
+            "$DOWNLOAD/**",
+            "$PICTURE/**",
+            "$TEMP/**",
+            "$APPCACHE/**",
+            "$APPDATA/**",
+            "$APPLOCALDATA/**"
+          ]
+        }
+      }
     }
   },
   "bundle": {

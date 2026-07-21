@@ -4362,6 +4362,9 @@ mod stream_timeout_reader_tests {
             matches!(&res, Err(e) if e.kind() == ErrorKind::TimedOut),
             "僵死流应返回 TimedOut, 实际: {res:?}"
         );
-        assert!(elapsed < Duration::from_millis(1500), "超时返回过慢: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "超时返回过慢: {elapsed:?}"
+        );
     }
 }

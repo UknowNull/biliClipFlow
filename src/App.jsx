@@ -19,7 +19,11 @@ const sections = [
     id: "toolbox",
     label: "工具箱",
     short: "工",
-    children: [{ id: "toolbox.remux", label: "格式转码" }],
+    children: [
+      { id: "toolbox.remux", label: "格式转码" },
+      { id: "toolbox.video_mask", label: "视频遮罩" },
+      { id: "toolbox.bilibili_season_backup", label: "合集备份" },
+    ],
   },
   { id: "settings", label: "设置", short: "设" },
   { id: "about", label: "关于", short: "关" },
@@ -33,6 +37,8 @@ const sectionLabels = {
   submission_sync: "视频同步",
   toolbox: "工具箱",
   "toolbox.remux": "格式转码",
+  "toolbox.video_mask": "视频遮罩",
+  "toolbox.bilibili_season_backup": "合集备份",
   settings: "设置",
   about: "关于",
 };
@@ -282,7 +288,12 @@ function App() {
       case "submission_sync":
         return <SubmissionSyncSection />;
       case "toolbox":
-        return <ToolboxSection />;
+        return (
+          <ToolboxSection
+            activeTool={active.split(".")[1] || "remux"}
+            onToolChange={(tool) => setActive(`toolbox.${tool}`)}
+          />
+        );
       case "settings":
         return <SettingsSection />;
       case "about":

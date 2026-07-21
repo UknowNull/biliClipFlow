@@ -13,12 +13,14 @@
     "version:bump": "node scripts/bump-version.mjs"
   },
   "dependencies": {
+    "@remotion/player": "4.0.494",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-opener": "^2.0.0",
     "jsencrypt": "^3.5.4",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "remotion": "4.0.494"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
