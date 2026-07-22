@@ -1368,7 +1368,8 @@ export default function VideoMaskTool() {
                       key={videoSrc}
                       ref={videoRef}
                       src={videoSrc}
-                      className={`absolute inset-0 z-0 h-full w-full bg-black object-contain ${useDomPreview ? "invisible" : "visible"}`}
+                      className="absolute inset-0 z-0 h-full w-full bg-black object-contain"
+                      style={{ display: useDomPreview ? "none" : "block" }}
                       preload="auto"
                       muted
                       playsInline
@@ -1424,9 +1425,10 @@ export default function VideoMaskTool() {
                           top: previewMetrics.top,
                           width: previewMetrics.width,
                           height: previewMetrics.height,
+                          zIndex: 20,
                         }}
                       >
-                        {previewSegments.map((segment) => {
+                        {previewSegments.map((segment, index) => {
                           const left = clamp(segment.x, 0, width);
                           const top = clamp(segment.y, 0, height);
                           const boxWidth = clamp(segment.width, 16, width - left);
@@ -1449,6 +1451,7 @@ export default function VideoMaskTool() {
                                 top: top * previewMetrics.scale,
                                 width: boxWidth * previewMetrics.scale,
                                 height: boxHeight * previewMetrics.scale,
+                                zIndex: 30 + index,
                                 boxShadow: "0 0 0 1px rgba(0,0,0,.35) inset",
                                 cursor: selected ? "move" : "pointer",
                               }}
