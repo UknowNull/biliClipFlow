@@ -218,6 +218,7 @@ export default function VideoMaskTool() {
       }),
     [segments, currentTime],
   );
+  const useDomPreview = Boolean(!playing || videoPreviewFailed || !videoPreviewReady);
   const markDirty = () => {
     setPlan(null);
     setRenderResult(null);
@@ -1367,7 +1368,7 @@ export default function VideoMaskTool() {
                       key={videoSrc}
                       ref={videoRef}
                       src={videoSrc}
-                      className="absolute inset-0 z-0 h-full w-full bg-black object-contain"
+                      className={`absolute inset-0 z-0 h-full w-full bg-black object-contain ${useDomPreview ? "invisible" : "visible"}`}
                       preload="auto"
                       muted
                       playsInline
@@ -1408,7 +1409,7 @@ export default function VideoMaskTool() {
                         setMessage("当前视频格式无法直接播放，已切换为抽帧预览");
                       }}
                     />
-                    {previewFrameSrc && (!videoPreviewReady || videoPreviewFailed) ? (
+                    {useDomPreview && previewFrameSrc ? (
                       <img
                         src={previewFrameSrc}
                         alt=""
