@@ -31,6 +31,10 @@ const resourceImageSrc = (resource) => resource?.imageSrc || fileSrcFromPath(res
 
 const segmentImageSrc = (segment) => segment?.imageSrc || fileSrcFromPath(segment?.imagePath);
 
+const logVideoMaskClient = (message) => {
+  invokeCommand("auth_client_log", { message: `video_mask:${message}` }).catch(() => {});
+};
+
 const buildDefaultTarget = (sourcePath, suffix = "_masked", extension = "mp4") => {
   const normalized = normalizePath(sourcePath);
   if (!normalized) {
@@ -604,11 +608,12 @@ export default function VideoMaskTool() {
     previewFrameSeqRef.current = seq;
     setLoadingPreviewFrame(true);
     try {
+      const previewWidth = clamp(Math.round(Number(sourceInfo.width) || width || 1920), 720, 3840);
       const result = await invokeCommand("toolbox_video_mask_preview_frame", {
         payload: {
           sourcePath: normalizedPath,
           time: Number(time) || 0,
-          width: 720,
+          width: previewWidth,
         },
       });
       if (previewFrameSeqRef.current !== seq) {
@@ -785,20 +790,28 @@ export default function VideoMaskTool() {
         },
       });
       const previewPath = result?.previewPath || "";
+      const imageSrc = fileSrcFromPath(previewPath || path);
+      logVideoMaskClient(
+        `image_preview_ok name=${fileNameFromPath(path)} previewPath=${previewPath || "-"} imageSrcLen=${imageSrc.length}`,
+      );
       return {
         id: `resource-${Date.now()}-${Math.random().toString(16).slice(2)}`,
         path,
         previewPath,
-        imageSrc: fileSrcFromPath(previewPath || path),
+        imageSrc,
         name: fileNameFromPath(path),
         previewError: "",
       };
     } catch (error) {
+      const fallbackSrc = fileSrcFromPath(path);
+      logVideoMaskClient(
+        `image_preview_err name=${fileNameFromPath(path)} err=${error?.message || "unknown"} fallbackSrcLen=${fallbackSrc.length}`,
+      );
       return {
         id: `resource-${Date.now()}-${Math.random().toString(16).slice(2)}`,
         path,
         previewPath: "",
-        imageSrc: fileSrcFromPath(path),
+        imageSrc: fallbackSrc,
         name: fileNameFromPath(path),
         previewError: error?.message || "遮罩图片预览生成失败",
       };
@@ -877,6 +890,9 @@ export default function VideoMaskTool() {
       delete next[segmentId];
       return next;
     });
+    logVideoMaskClient(
+      `segment_add id=${segmentId} name=${resource?.name || "-"} start=${startTime.toFixed(3)} end=${(startTime + length).toFixed(3)} srcLen=${resourceImageSrc(resource).length}`,
+    );
     setSelectedId(segmentId);
     setSelectedResourceId("");
     seekTo(startTime);
@@ -1396,7 +1412,7 @@ export default function VideoMaskTool() {
                       <img
                         src={previewFrameSrc}
                         alt=""
-                        className={`absolute inset-0 h-full w-full bg-black object-contain transition-opacity ${playing && videoPreviewReady && !videoPreviewFailed ? "opacity-0" : "opacity-100"}`}
+                        className={`absolute inset-0 h-full w-full bg-black object-contain transition-opacity ${videoPreviewReady && !videoPreviewFailed ? "opacity-0" : "opacity-100"}`}
                       />
                     ) : null}
                     {previewMetrics ? (
@@ -1422,6 +1438,7 @@ export default function VideoMaskTool() {
                           const cropHeight = Math.max(0.05, 1 - cropTop - cropBottom);
                           const selected = segment.id === selectedId;
                           const imageFailed = Boolean(imageLoadErrors[segment.id]);
+                          const imageSrc = segmentImageSrc(segment);
                           return (
                             <div
                               key={segment.id}
@@ -1458,11 +1475,14 @@ export default function VideoMaskTool() {
                               onContextMenu={(event) => openSegmentMenu(segment, event)}
                             >
                               <img
-                                src={segmentImageSrc(segment)}
+                                src={imageSrc}
                                 alt=""
                                 className="absolute h-full w-full object-cover select-none"
                                 draggable={false}
                                 onLoad={() => {
+                                  logVideoMaskClient(
+                                    `preview_img_load id=${segment.id} name=${segment.imageName || segment.label || "-"} srcLen=${imageSrc.length}`,
+                                  );
                                   setImageLoadErrors((prev) => {
                                     if (!prev[segment.id]) {
                                       return prev;
@@ -1473,6 +1493,9 @@ export default function VideoMaskTool() {
                                   });
                                 }}
                                 onError={() => {
+                                  logVideoMaskClient(
+                                    `preview_img_error id=${segment.id} name=${segment.imageName || segment.label || "-"} srcLen=${imageSrc.length}`,
+                                  );
                                   setImageLoadErrors((prev) => ({ ...prev, [segment.id]: true }));
                                   setMessage(`遮罩图片加载失败：${segment.imageName || segment.label || segment.imagePath}`);
                                 }}

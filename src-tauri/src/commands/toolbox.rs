@@ -451,7 +451,7 @@ pub async fn toolbox_video_mask_preview_frame(
 
     let source_path = source.to_string();
     let time = payload.time.max(0.0);
-    let width = payload.width.unwrap_or(720).clamp(180, 1280);
+    let width = payload.width.unwrap_or(1920).clamp(180, 3840);
     let result = tauri::async_runtime::spawn_blocking(move || {
         extract_video_mask_preview_frame(&source_path, time, width, &output_dir)
     })
@@ -467,6 +467,7 @@ pub async fn toolbox_video_mask_preview_frame(
 #[tauri::command]
 pub async fn toolbox_video_mask_image_preview(
     app: AppHandle,
+    state: State<'_, AppState>,
     payload: VideoMaskImagePreviewPayload,
 ) -> Result<ApiResponse<VideoMaskImagePreviewResult>, String> {
     let image_path = payload.image_path.trim();
@@ -478,9 +479,29 @@ pub async fn toolbox_video_mask_image_preview(
     }
 
     let image_path = PathBuf::from(image_path);
+    let source_size = fs::metadata(&image_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    utils::append_log(
+        state.app_log_path.as_ref(),
+        &format!(
+            "toolbox_video_mask_image_preview_start source={} size={}",
+            image_path.to_string_lossy(),
+            source_size
+        ),
+    );
     let preview_dir = match video_mask_image_preview_dir(&app) {
         Ok(path) => path,
-        Err(err) => return Ok(ApiResponse::error(err)),
+        Err(err) => {
+            utils::append_log(
+                state.app_log_path.as_ref(),
+                &format!(
+                    "toolbox_video_mask_image_preview_done status=err err={}",
+                    err
+                ),
+            );
+            return Ok(ApiResponse::error(err));
+        }
     };
     let result = tauri::async_runtime::spawn_blocking(move || {
         prepare_video_mask_image_preview(&image_path, &preview_dir)
@@ -489,10 +510,31 @@ pub async fn toolbox_video_mask_image_preview(
     .map_err(|_| "遮罩图片预览生成失败".to_string())?;
 
     match result {
-        Ok(preview_path) => Ok(ApiResponse::success(VideoMaskImagePreviewResult {
-            preview_path,
-        })),
-        Err(err) => Ok(ApiResponse::error(err)),
+        Ok(preview_path) => {
+            let preview_size = fs::metadata(&preview_path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            utils::append_log(
+                state.app_log_path.as_ref(),
+                &format!(
+                    "toolbox_video_mask_image_preview_done status=ok preview={} size={}",
+                    preview_path, preview_size
+                ),
+            );
+            Ok(ApiResponse::success(VideoMaskImagePreviewResult {
+                preview_path,
+            }))
+        }
+        Err(err) => {
+            utils::append_log(
+                state.app_log_path.as_ref(),
+                &format!(
+                    "toolbox_video_mask_image_preview_done status=err err={}",
+                    err
+                ),
+            );
+            Ok(ApiResponse::error(err))
+        }
     }
 }
 
@@ -1304,7 +1346,7 @@ fn extract_video_mask_preview_frame(
         "-vf".to_string(),
         format!("scale={}:-2", width),
         "-q:v".to_string(),
-        "3".to_string(),
+        "2".to_string(),
         output.to_string_lossy().into_owned(),
     ];
     run_ffmpeg(&args)?;
