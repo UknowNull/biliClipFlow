@@ -1344,7 +1344,7 @@ export default function VideoMaskTool() {
               </div>
               <div
                 ref={previewRef}
-                className="relative overflow-hidden rounded-lg bg-black"
+                className="relative isolate overflow-hidden rounded-lg bg-black"
                 style={{ aspectRatio: previewRatio, minHeight: "min(64vh, 680px)" }}
                 onDragOver={(event) => {
                   if (sourcePath && duration > 0) {
@@ -1367,7 +1367,7 @@ export default function VideoMaskTool() {
                       key={videoSrc}
                       ref={videoRef}
                       src={videoSrc}
-                      className="absolute inset-0 h-full w-full bg-black object-contain"
+                      className="absolute inset-0 z-0 h-full w-full bg-black object-contain"
                       preload="auto"
                       muted
                       playsInline
@@ -1408,16 +1408,16 @@ export default function VideoMaskTool() {
                         setMessage("当前视频格式无法直接播放，已切换为抽帧预览");
                       }}
                     />
-                    {previewFrameSrc ? (
+                    {previewFrameSrc && (!videoPreviewReady || videoPreviewFailed) ? (
                       <img
                         src={previewFrameSrc}
                         alt=""
-                        className={`absolute inset-0 h-full w-full bg-black object-contain transition-opacity ${videoPreviewReady && !videoPreviewFailed ? "opacity-0" : "opacity-100"}`}
+                        className="absolute inset-0 z-10 h-full w-full bg-black object-contain"
                       />
                     ) : null}
                     {previewMetrics ? (
                       <div
-                        className="absolute pointer-events-none"
+                        className="pointer-events-none absolute z-20"
                         style={{
                           left: previewMetrics.left,
                           top: previewMetrics.top,
@@ -1477,7 +1477,7 @@ export default function VideoMaskTool() {
                               <img
                                 src={imageSrc}
                                 alt=""
-                                className="absolute h-full w-full object-cover select-none"
+                                className="absolute inset-0 h-full w-full object-cover select-none"
                                 draggable={false}
                                 onLoad={() => {
                                   logVideoMaskClient(
