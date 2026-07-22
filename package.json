@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev:windows": "tauri dev --config src-tauri/tauri.windows.conf.json",
+    "tauri:release:windows": "node scripts/run-windows-release.mjs",
     "tauri:build": "pnpm run install-bins && tauri build",
     "install-bins": "node scripts/install-bins.js",
     "version:bump": "node scripts/bump-version.mjs"

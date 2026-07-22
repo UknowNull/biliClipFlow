@@ -138,6 +138,7 @@ export default function VideoMaskTool() {
   const timelineRef = useRef(null);
   const dragRef = useRef(null);
   const maskDragRef = useRef(null);
+  const previewCanvasRefs = useRef(new Map());
   const resourceDragRef = useRef(null);
   const renderIdRef = useRef("");
   const importSeqRef = useRef(0);
@@ -1442,7 +1443,13 @@ export default function VideoMaskTool() {
                           const selected = segment.id === selectedId;
                           const imageFailed = Boolean(imageLoadErrors[segment.id]);
                           const imageSrc = segmentImageSrc(segment);
-                          const backgroundImage = imageSrc ? `url("${imageSrc.replace(/"/g, '\\"')}")` : undefined;
+                          const imageLayerStyle = {
+                            left: `${(-cropLeft / cropWidth) * 100}%`,
+                            top: `${(-cropTop / cropHeight) * 100}%`,
+                            width: `${100 / cropWidth}%`,
+                            height: `${100 / cropHeight}%`,
+                            opacity: segment.opacity,
+                          };
                           return (
                             <div
                               key={segment.id}
@@ -1454,10 +1461,8 @@ export default function VideoMaskTool() {
                                 height: boxHeight * previewMetrics.scale,
                                 zIndex: 30 + index,
                                 boxShadow: "0 0 0 1px rgba(0,0,0,.35) inset",
-                                backgroundImage,
-                                backgroundPosition: "center",
-                                backgroundRepeat: "no-repeat",
-                                backgroundSize: "cover",
+                                transform: "translateZ(0)",
+                                willChange: "transform",
                                 cursor: selected ? "move" : "pointer",
                               }}
                               onPointerDown={(event) => {
@@ -1483,6 +1488,17 @@ export default function VideoMaskTool() {
                               }}
                               onContextMenu={(event) => openSegmentMenu(segment, event)}
                             >
+                              <canvas
+                                ref={(node) => {
+                                  if (node) {
+                                    previewCanvasRefs.current.set(segment.id, node);
+                                  } else {
+                                    previewCanvasRefs.current.delete(segment.id);
+                                  }
+                                }}
+                                className="absolute inset-0 h-full w-full object-cover select-none"
+                                style={imageLayerStyle}
+                              />
                               <img
                                 src={imageSrc}
                                 alt=""
@@ -1491,8 +1507,25 @@ export default function VideoMaskTool() {
                                 onLoad={(event) => {
                                   const imageRect = event.currentTarget.getBoundingClientRect();
                                   const boxRect = event.currentTarget.parentElement?.getBoundingClientRect();
+                                  const canvas = previewCanvasRefs.current.get(segment.id);
+                                  let canvasPainted = false;
+                                  if (canvas) {
+                                    try {
+                                      canvas.width = Math.max(1, event.currentTarget.naturalWidth);
+                                      canvas.height = Math.max(1, event.currentTarget.naturalHeight);
+                                      const context = canvas.getContext("2d");
+                                      context?.clearRect(0, 0, canvas.width, canvas.height);
+                                      context?.drawImage(event.currentTarget, 0, 0);
+                                      canvasPainted = Boolean(context);
+                                    } catch (error) {
+                                      logVideoMaskClient(
+                                        `preview_canvas_error id=${segment.id} message=${error?.message || error}`,
+                                      );
+                                    }
+                                  }
+                                  event.currentTarget.style.visibility = canvasPainted ? "hidden" : "visible";
                                   logVideoMaskClient(
-                                    `preview_img_load id=${segment.id} name=${segment.imageName || segment.label || "-"} srcLen=${imageSrc.length} current=${currentTime.toFixed(3)} range=${Number(segment.startTime || 0).toFixed(3)}-${Number(segment.endTime || 0).toFixed(3)} box=${Math.round(boxRect?.width || 0)}x${Math.round(boxRect?.height || 0)}@${Math.round(boxRect?.left || 0)},${Math.round(boxRect?.top || 0)} img=${Math.round(imageRect.width)}x${Math.round(imageRect.height)} natural=${event.currentTarget.naturalWidth}x${event.currentTarget.naturalHeight} scale=${previewMetrics.scale.toFixed(4)} videoHidden=${useDomPreview ? 1 : 0}`,
+                                    `preview_img_load id=${segment.id} name=${segment.imageName || segment.label || "-"} srcLen=${imageSrc.length} current=${currentTime.toFixed(3)} range=${Number(segment.startTime || 0).toFixed(3)}-${Number(segment.endTime || 0).toFixed(3)} box=${Math.round(boxRect?.width || 0)}x${Math.round(boxRect?.height || 0)}@${Math.round(boxRect?.left || 0)},${Math.round(boxRect?.top || 0)} img=${Math.round(imageRect.width)}x${Math.round(imageRect.height)} natural=${event.currentTarget.naturalWidth}x${event.currentTarget.naturalHeight} scale=${previewMetrics.scale.toFixed(4)} videoHidden=${useDomPreview ? 1 : 0} canvas=${canvasPainted ? 1 : 0}`,
                                   );
                                   setImageLoadErrors((prev) => {
                                     if (!prev[segment.id]) {
@@ -1510,13 +1543,7 @@ export default function VideoMaskTool() {
                                   setImageLoadErrors((prev) => ({ ...prev, [segment.id]: true }));
                                   setMessage(`遮罩图片加载失败：${segment.imageName || segment.label || segment.imagePath}`);
                                 }}
-                                style={{
-                                  left: `${(-cropLeft / cropWidth) * 100}%`,
-                                  top: `${(-cropTop / cropHeight) * 100}%`,
-                                  width: `${100 / cropWidth}%`,
-                                  height: `${100 / cropHeight}%`,
-                                  opacity: segment.opacity,
-                                }}
+                                style={imageLayerStyle}
                               />
                               {imageFailed ? (
                                 <div className="absolute inset-0 flex items-center justify-center bg-red-600 px-2 text-center text-[10px] font-semibold text-white">

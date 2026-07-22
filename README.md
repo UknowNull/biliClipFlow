@@ -74,7 +74,13 @@ Windows IDEA 本地调试（直接启动 WebView2 窗口，无需生成安装包
 pnpm run tauri:dev:windows
 ```
 
-该命令必须在 Windows 环境执行；macOS 无法模拟 Windows WebView2 的渲染行为。
+Windows 生产模式验证（使用内嵌生产页面和 Release 后端，但不生成安装包）：
+
+```bash
+pnpm run tauri:release:windows
+```
+
+排查仅在安装包中出现的问题时应使用生产模式验证命令。以上命令必须在 Windows 环境执行；macOS 无法模拟 Windows WebView2 的渲染行为。
 
 仅启动前端：
 
