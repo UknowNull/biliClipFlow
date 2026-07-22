@@ -1442,6 +1442,7 @@ export default function VideoMaskTool() {
                           const selected = segment.id === selectedId;
                           const imageFailed = Boolean(imageLoadErrors[segment.id]);
                           const imageSrc = segmentImageSrc(segment);
+                          const backgroundImage = imageSrc ? `url("${imageSrc.replace(/"/g, '\\"')}")` : undefined;
                           return (
                             <div
                               key={segment.id}
@@ -1453,6 +1454,10 @@ export default function VideoMaskTool() {
                                 height: boxHeight * previewMetrics.scale,
                                 zIndex: 30 + index,
                                 boxShadow: "0 0 0 1px rgba(0,0,0,.35) inset",
+                                backgroundImage,
+                                backgroundPosition: "center",
+                                backgroundRepeat: "no-repeat",
+                                backgroundSize: "cover",
                                 cursor: selected ? "move" : "pointer",
                               }}
                               onPointerDown={(event) => {
@@ -1483,9 +1488,11 @@ export default function VideoMaskTool() {
                                 alt=""
                                 className="absolute inset-0 h-full w-full object-cover select-none"
                                 draggable={false}
-                                onLoad={() => {
+                                onLoad={(event) => {
+                                  const imageRect = event.currentTarget.getBoundingClientRect();
+                                  const boxRect = event.currentTarget.parentElement?.getBoundingClientRect();
                                   logVideoMaskClient(
-                                    `preview_img_load id=${segment.id} name=${segment.imageName || segment.label || "-"} srcLen=${imageSrc.length}`,
+                                    `preview_img_load id=${segment.id} name=${segment.imageName || segment.label || "-"} srcLen=${imageSrc.length} current=${currentTime.toFixed(3)} range=${Number(segment.startTime || 0).toFixed(3)}-${Number(segment.endTime || 0).toFixed(3)} box=${Math.round(boxRect?.width || 0)}x${Math.round(boxRect?.height || 0)}@${Math.round(boxRect?.left || 0)},${Math.round(boxRect?.top || 0)} img=${Math.round(imageRect.width)}x${Math.round(imageRect.height)} natural=${event.currentTarget.naturalWidth}x${event.currentTarget.naturalHeight} scale=${previewMetrics.scale.toFixed(4)} videoHidden=${useDomPreview ? 1 : 0}`,
                                   );
                                   setImageLoadErrors((prev) => {
                                     if (!prev[segment.id]) {

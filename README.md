@@ -68,6 +68,14 @@ pnpm install
 pnpm tauri dev
 ```
 
+Windows IDEA 本地调试（直接启动 WebView2 窗口，无需生成安装包）：
+
+```bash
+pnpm run tauri:dev:windows
+```
+
+该命令必须在 Windows 环境执行；macOS 无法模拟 Windows WebView2 的渲染行为。
+
 仅启动前端：
 
 ```bash
