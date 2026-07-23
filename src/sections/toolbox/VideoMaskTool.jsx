@@ -12,6 +12,7 @@ const TIMELINE_PADDING_Y = 12;
 const TIMELINE_SNAP_PIXELS = 12;
 const VIDEO_MASK_DRAFT_STORAGE_KEY = "biliClipFlow.videoMask.lastDraft";
 const VIDEO_MASK_RENDER_PROGRESS_EVENT = "toolbox://video-mask-render-progress";
+const VIDEO_MASK_DEFAULT_CRF = 16;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -168,8 +169,7 @@ export default function VideoMaskTool() {
   const [currentTime, setCurrentTime] = useState(0);
   const [timelineStart, setTimelineStart] = useState(0);
   const [timelineZoomPercent, setTimelineZoomPercent] = useState(100);
-  const [qualityPercent, setQualityPercent] = useState(90);
-  const [encoderMode, setEncoderMode] = useState("software");
+  const [hardwareAcceleration, setHardwareAcceleration] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [plan, setPlan] = useState(null);
   const [renderResult, setRenderResult] = useState(null);
@@ -197,13 +197,11 @@ export default function VideoMaskTool() {
   const minTimelineSpan = duration > 0 ? Math.min(duration, minSegmentLength) : 1;
   const timelineSpan = percentToTimelineSpan(duration, minTimelineSpan, timelinePercent);
   const timelineEnd = timelineStart + timelineSpan;
-  const qualityValue = clamp(Number(qualityPercent) || 90, 1, 100);
-  const outputCrf = Math.round(30 - ((qualityValue - 1) / 99) * 14);
   const selectedSegment = useMemo(
     () => segments.find((segment) => segment.id === selectedId) || null,
     [segments, selectedId],
   );
-  const qualityControlValue = selectedSegment ? Math.round(clamp(Number(selectedSegment.opacity) || 1, 0.01, 1) * 100) : qualityValue;
+  const opacityControlValue = selectedSegment ? Math.round(clamp(Number(selectedSegment.opacity) || 1, 0.01, 1) * 100) : 100;
   const trackCount = useMemo(
     () => Math.max(1, ...segments.map((segment) => Number(segment.trackIndex || 0) + 1)),
     [segments],
@@ -329,9 +327,7 @@ export default function VideoMaskTool() {
     const nextValue = clamp(Number(value) || 1, 1, 100);
     if (selectedSegment) {
       updateSegment(selectedSegment.id, { opacity: nextValue / 100 });
-      return;
     }
-    setQualityPercent(nextValue);
   };
 
   useEffect(() => () => {
@@ -1098,9 +1094,9 @@ export default function VideoMaskTool() {
     colorTransfer: sourceInfo.colorTransfer,
     colorPrimaries: sourceInfo.colorPrimaries,
     keyframes: sourceInfo.keyframes,
-    crf: outputCrf,
+    crf: VIDEO_MASK_DEFAULT_CRF,
     preset: "veryfast",
-    encoderMode,
+    encoderMode: hardwareAcceleration ? "auto" : "software",
     segments: segments.map((segment) => ({
       id: segment.id,
       imagePath: segment.imagePath,
@@ -1145,13 +1141,12 @@ export default function VideoMaskTool() {
           savedAt: new Date().toISOString(),
           payload: buildPayload(),
           resources: serializeResources(),
-          qualityPercent,
         }),
       );
     } catch {
       // localStorage 不可用时忽略，避免影响遮罩编辑。
     }
-  }, [sourcePath, targetPath, sourceInfo, segments, resources, qualityPercent, outputCrf, encoderMode]);
+  }, [sourcePath, targetPath, sourceInfo, segments, resources, hardwareAcceleration]);
 
   const handleBuildPlan = async () => {
     setMessage("");
@@ -1348,32 +1343,35 @@ export default function VideoMaskTool() {
             <div className="desc">导入长视频和图片资源后，将图片拖到时间轴生成遮罩片段，导出时仅对命中的片段重编码。</div>
           </div>
           <div className="flex flex-wrap gap-2">
-            <label className="flex h-8 items-center gap-2 rounded-lg border border-[var(--split-color)] px-3 text-xs text-[var(--desc-color)]">
-              <span className="whitespace-nowrap">{selectedSegment ? "遮罩清晰度" : "导出质量"} {Math.round(qualityControlValue)}%</span>
-              <input
-                className="w-24"
-                type="range"
-                min="1"
-                max="100"
-                step="1"
-                value={qualityControlValue}
-                onInput={(event) => updateQualityControl(event.target.value)}
-                onChange={(event) => updateQualityControl(event.target.value)}
-              />
-            </label>
-            <label className="flex h-8 items-center gap-2 rounded-lg border border-[var(--split-color)] px-2 text-xs text-[var(--desc-color)]">
-              <span className="whitespace-nowrap">导出加速</span>
-              <select
-                className="h-6 rounded border border-[var(--split-color)] bg-[var(--card-bg)] px-1 text-xs text-[var(--ink)]"
-                value={encoderMode}
-                onChange={(event) => setEncoderMode(event.target.value)}
-                disabled={rendering}
-                title="硬件编码不可用时，自动模式会回退到软件编码"
+            {selectedSegment ? (
+              <label
+                className="flex h-8 items-center gap-2 rounded-lg border border-[var(--split-color)] px-3 text-xs text-[var(--desc-color)]"
+                title="调整当前遮罩图片的透明度"
               >
-                <option value="software">软件编码</option>
-                <option value="auto">自动硬件编码</option>
-                <option value="hardware">强制硬件编码</option>
-              </select>
+                <span className="whitespace-nowrap">遮罩透明度 {Math.round(opacityControlValue)}%</span>
+                <input
+                  className="w-24"
+                  type="range"
+                  min="1"
+                  max="100"
+                  step="1"
+                  value={opacityControlValue}
+                  onInput={(event) => updateQualityControl(event.target.value)}
+                  onChange={(event) => updateQualityControl(event.target.value)}
+                />
+              </label>
+            ) : null}
+            <label
+              className="flex h-8 items-center gap-2 rounded-lg border border-[var(--split-color)] px-3 text-xs text-[var(--desc-color)]"
+              title="开启后优先使用电脑硬件加速，硬件不可用时自动改用软件编码"
+            >
+              <input
+                type="checkbox"
+                checked={hardwareAcceleration}
+                onChange={(event) => setHardwareAcceleration(event.target.checked)}
+                disabled={rendering}
+              />
+              <span className="whitespace-nowrap">硬件加速</span>
             </label>
             <button className="h-8 px-3 rounded-lg" onClick={handlePickVideo} disabled={loadingProbe}>
               {loadingProbe ? "读取中..." : "导入视频"}

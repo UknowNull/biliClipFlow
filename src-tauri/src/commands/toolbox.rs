@@ -24,6 +24,7 @@ const BILIBILI_ARCHIVE_STATUS_PUBLISHED: &str = "pubed";
 const VIDEO_MASK_COPY_SEEK_EPSILON: f64 = 0.001;
 const VIDEO_MASK_RENDER_PROGRESS_EVENT: &str = "toolbox://video-mask-render-progress";
 const SEASON_BACKUP_TASK_INTERVAL_SECONDS: u64 = 3;
+const VIDEO_MASK_DEFAULT_CRF: i64 = 16;
 
 struct RemoteRefreshPauseGuard {
     counter: Arc<AtomicUsize>,
@@ -630,7 +631,11 @@ pub async fn toolbox_video_mask_merge(
         }
         _ => "veryfast".to_string(),
     };
-    let crf = payload.crf.unwrap_or(20).clamp(16, 30).to_string();
+    let crf = payload
+        .crf
+        .unwrap_or(VIDEO_MASK_DEFAULT_CRF)
+        .clamp(16, 30)
+        .to_string();
     let filter = format!(
         "[1:v]format=rgba,crop=iw*{:.6}:ih*{:.6}:iw*{:.6}:ih*{:.6},scale={}:{}[mask];[0:v][mask]overlay={}:{}:enable='between(t,{:.3},{:.3})':shortest=0:repeatlast=1:format=auto[v]",
         crop_w, crop_h, crop_left, crop_top, width, height, x, y, start, end
@@ -2168,7 +2173,8 @@ struct VideoMaskEncoder {
 
 fn normalize_encoder_mode(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
-        "hardware" | "hw" => "hardware",
+        // 兼容旧版本保存的强制硬件值，但现在统一按自动硬件处理。
+        "hardware" | "hw" => "auto",
         "auto" => "auto",
         _ => "software",
     }
@@ -2276,7 +2282,7 @@ fn resolve_video_encoder(
     height: i64,
     fps: f64,
 ) -> Result<VideoMaskEncoder, String> {
-    let crf = payload.crf.unwrap_or(18).clamp(16, 30);
+    let crf = payload.crf.unwrap_or(VIDEO_MASK_DEFAULT_CRF).clamp(16, 30);
     let preset = normalized_preset(payload.preset.as_deref());
     let software = || software_video_encoder(video_codec, crf, &preset);
     let mode = normalize_encoder_mode(&payload.encoder_mode);
@@ -2286,9 +2292,6 @@ fn resolve_video_encoder(
 
     let candidates = hardware_encoder_candidates(video_codec);
     if candidates.is_empty() {
-        if mode == "hardware" {
-            return Err("当前系统不支持硬件编码器".to_string());
-        }
         let mut fallback = software();
         fallback.fallback_note = Some("当前系统没有可用硬件编码器，已回退软件编码".to_string());
         return Ok(fallback);
@@ -2309,16 +2312,6 @@ fn resolve_video_encoder(
     }
 
     let detail = failures.join("；");
-    if mode == "hardware" {
-        return Err(format!(
-            "硬件编码不可用。请检查显卡驱动或改用自动硬件/软件编码。{}",
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(" 原因：{}", detail)
-            }
-        ));
-    }
     let mut fallback = software();
     fallback.fallback_note = Some(if detail.is_empty() {
         "没有可用硬件编码器，已回退软件编码".to_string()
@@ -2382,7 +2375,7 @@ fn encode_part_args(
 ) -> Vec<String> {
     let encoder = software_video_encoder(
         video_codec,
-        payload.crf.unwrap_or(18).clamp(16, 30),
+        payload.crf.unwrap_or(VIDEO_MASK_DEFAULT_CRF).clamp(16, 30),
         &normalized_preset(payload.preset.as_deref()),
     );
     encode_part_args_with_encoder(
@@ -4664,8 +4657,8 @@ mod tests {
 
     #[test]
     fn video_mask_encoder_mode_normalization_is_safe() {
-        assert_eq!(normalize_encoder_mode("hardware"), "hardware");
-        assert_eq!(normalize_encoder_mode("HW"), "hardware");
+        assert_eq!(normalize_encoder_mode("hardware"), "auto");
+        assert_eq!(normalize_encoder_mode("HW"), "auto");
         assert_eq!(normalize_encoder_mode("auto"), "auto");
         assert_eq!(normalize_encoder_mode("unexpected"), "software");
     }
