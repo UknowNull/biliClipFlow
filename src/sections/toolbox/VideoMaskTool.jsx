@@ -224,6 +224,7 @@ export default function VideoMaskTool() {
       !videoPreviewReady ||
       (previewSegments.length > 0 && !playing),
   );
+  const showVideoElement = Boolean(videoSrc && (!useDomPreview || !videoPreviewReady || playing));
   const markDirty = () => {
     setPlan(null);
     setRenderResult(null);
@@ -1048,6 +1049,7 @@ export default function VideoMaskTool() {
   const togglePlayback = async () => {
     const video = videoRef.current;
     if (!video) {
+      setPlaying(true);
       return;
     }
     if (video.paused) {
@@ -1260,6 +1262,20 @@ export default function VideoMaskTool() {
     };
   }, [sourcePath]);
 
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !sourcePath) {
+      return;
+    }
+    const nextTime = clamp(Number(currentTime) || 0, 0, Number(video.duration) || duration || 0);
+    if (Number.isFinite(nextTime) && Math.abs((Number(video.currentTime) || 0) - nextTime) > 0.05) {
+      video.currentTime = nextTime;
+    }
+    if (playing && video.paused) {
+      video.play().catch(() => {});
+    }
+  }, [currentTime, duration, playing, showVideoElement, sourcePath]);
+
   return (
     <div className="space-y-4" onPointerDown={() => setSegmentMenu(null)}>
       {draggingResource ? (
@@ -1378,60 +1394,70 @@ export default function VideoMaskTool() {
               >
                 {videoSrc ? (
                   <>
-                    <video
-                      key={videoSrc}
-                      ref={videoRef}
-                      src={videoSrc}
-                      className="absolute inset-0 z-0 h-full w-full bg-black object-contain"
-                      style={{ display: useDomPreview ? "none" : "block" }}
-                      preload="auto"
-                      muted
-                      playsInline
-                      onLoadedMetadata={(event) => {
-                        const video = event.currentTarget;
-                        const nextDuration = Number(video.duration) || 0;
-                        const nextWidth = Number(video.videoWidth) || 0;
-                        const nextHeight = Number(video.videoHeight) || 0;
-                        logVideoMaskClient(
-                          `video_metadata duration=${nextDuration.toFixed(3)} size=${nextWidth}x${nextHeight}`,
-                        );
-                        setSourceInfo((prev) => ({
-                          ...prev,
-                          duration: prev.duration || nextDuration,
-                          width: prev.width || nextWidth,
-                          height: prev.height || nextHeight,
-                        }));
-                      }}
-                      onLoadedData={(event) => {
-                        setVideoPreviewReady(true);
-                        setVideoPreviewFailed(false);
-                        const nextTime = Number(event.currentTarget.currentTime) || 0;
-                        logVideoMaskClient(`video_loaded_data current=${nextTime.toFixed(3)}`);
-                        setCurrentTime(nextTime);
-                        focusTimeline(nextTime);
-                      }}
-                      onTimeUpdate={(event) => {
-                        const nextTime = Number(event.currentTarget.currentTime) || 0;
-                        setCurrentTime(nextTime);
-                        focusTimeline(nextTime);
-                      }}
-                      onSeeked={(event) => {
-                        const nextTime = Number(event.currentTarget.currentTime) || 0;
-                        setCurrentTime(nextTime);
-                        focusTimeline(nextTime);
-                      }}
-                      onPlay={() => setPlaying(true)}
-                      onPause={() => setPlaying(false)}
-                      onEnded={() => setPlaying(false)}
-                      onError={(event) => {
-                        const error = event.currentTarget.error;
-                        logVideoMaskClient(
-                          `video_error code=${error?.code || 0} message=${error?.message || "unknown"}`,
-                        );
-                        setVideoPreviewFailed(true);
-                        setMessage("当前视频格式无法直接播放，已切换为抽帧预览");
-                      }}
-                    />
+                    {showVideoElement ? (
+                      <video
+                        key={videoSrc}
+                        ref={videoRef}
+                        src={videoSrc}
+                        className="absolute inset-0 z-0 h-full w-full bg-black object-contain"
+                        preload="auto"
+                        muted
+                        playsInline
+                        onLoadedMetadata={(event) => {
+                          const video = event.currentTarget;
+                          const nextDuration = Number(video.duration) || 0;
+                          const nextWidth = Number(video.videoWidth) || 0;
+                          const nextHeight = Number(video.videoHeight) || 0;
+                          const requestedTime = clamp(Number(currentTime) || 0, 0, nextDuration || duration || 0);
+                          if (requestedTime > 0 && Math.abs((Number(video.currentTime) || 0) - requestedTime) > 0.05) {
+                            video.currentTime = requestedTime;
+                          }
+                          logVideoMaskClient(
+                            `video_metadata duration=${nextDuration.toFixed(3)} size=${nextWidth}x${nextHeight}`,
+                          );
+                          setSourceInfo((prev) => ({
+                            ...prev,
+                            duration: prev.duration || nextDuration,
+                            width: prev.width || nextWidth,
+                            height: prev.height || nextHeight,
+                          }));
+                        }}
+                        onLoadedData={(event) => {
+                          setVideoPreviewReady(true);
+                          setVideoPreviewFailed(false);
+                          const video = event.currentTarget;
+                          const requestedTime = clamp(Number(currentTime) || 0, 0, Number(video.duration) || duration || 0);
+                          if (requestedTime > 0 && Math.abs((Number(video.currentTime) || 0) - requestedTime) > 0.05) {
+                            video.currentTime = requestedTime;
+                          }
+                          const nextTime = requestedTime || Number(video.currentTime) || 0;
+                          logVideoMaskClient(`video_loaded_data current=${nextTime.toFixed(3)}`);
+                          setCurrentTime(nextTime);
+                          focusTimeline(nextTime);
+                        }}
+                        onTimeUpdate={(event) => {
+                          const nextTime = Number(event.currentTarget.currentTime) || 0;
+                          setCurrentTime(nextTime);
+                          focusTimeline(nextTime);
+                        }}
+                        onSeeked={(event) => {
+                          const nextTime = Number(event.currentTarget.currentTime) || 0;
+                          setCurrentTime(nextTime);
+                          focusTimeline(nextTime);
+                        }}
+                        onPlay={() => setPlaying(true)}
+                        onPause={() => setPlaying(false)}
+                        onEnded={() => setPlaying(false)}
+                        onError={(event) => {
+                          const error = event.currentTarget.error;
+                          logVideoMaskClient(
+                            `video_error code=${error?.code || 0} message=${error?.message || "unknown"}`,
+                          );
+                          setVideoPreviewFailed(true);
+                          setMessage("当前视频格式无法直接播放，已切换为抽帧预览");
+                        }}
+                      />
+                    ) : null}
                     {useDomPreview && previewFrameSrc ? (
                       <img
                         src={previewFrameSrc}
