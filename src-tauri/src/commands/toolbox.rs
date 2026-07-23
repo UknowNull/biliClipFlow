@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{Duration as ChronoDuration, Local, Utc};
@@ -246,6 +247,7 @@ pub struct VideoMaskRenderResult {
     pub copy_duration: f64,
     pub output_size: u64,
     pub encoder: String,
+    pub elapsed_seconds: f64,
     pub warnings: Vec<String>,
 }
 
@@ -1855,6 +1857,7 @@ fn render_video_mask_segments_with_progress<F>(
 where
     F: FnMut(VideoMaskRenderProgress),
 {
+    let render_started_at = Instant::now();
     payload.render_id = normalized_render_id(&payload.render_id);
     let mut warnings = Vec::new();
     let mut duration = payload.duration;
@@ -1973,6 +1976,7 @@ where
         copy_duration: plan.copy_duration,
         output_size,
         encoder: encoder.name,
+        elapsed_seconds: render_started_at.elapsed().as_secs_f64(),
         warnings,
     })
 }

@@ -179,6 +179,8 @@ export default function VideoMaskTool() {
   const [segmentMenu, setSegmentMenu] = useState(null);
   const [imageLoadErrors, setImageLoadErrors] = useState({});
   const [renderProgress, setRenderProgress] = useState(null);
+  const [renderStartedAt, setRenderStartedAt] = useState(0);
+  const [renderElapsedSeconds, setRenderElapsedSeconds] = useState(0);
   const [loadingPreviewFrame, setLoadingPreviewFrame] = useState(false);
   const [videoPreviewReady, setVideoPreviewReady] = useState(false);
   const [videoPreviewFailed, setVideoPreviewFailed] = useState(false);
@@ -202,6 +204,10 @@ export default function VideoMaskTool() {
     [segments, selectedId],
   );
   const opacityControlValue = selectedSegment ? Math.round(clamp(Number(selectedSegment.opacity) || 1, 0.01, 1) * 100) : 100;
+  const renderPercent = clamp(Number(renderProgress?.percent) || 0, 0, 100);
+  const estimatedRemainingSeconds = rendering && renderPercent >= 5 && renderElapsedSeconds > 0
+    ? Math.max(0, renderElapsedSeconds * (100 / renderPercent - 1))
+    : null;
   const trackCount = useMemo(
     () => Math.max(1, ...segments.map((segment) => Number(segment.trackIndex || 0) + 1)),
     [segments],
@@ -335,6 +341,18 @@ export default function VideoMaskTool() {
       clearTimeout(previewFrameTimerRef.current);
     }
   }, []);
+
+  useEffect(() => {
+    if (!rendering || !renderStartedAt) {
+      return undefined;
+    }
+    const updateElapsed = () => {
+      setRenderElapsedSeconds(Math.max(0, (Date.now() - renderStartedAt) / 1000));
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 250);
+    return () => window.clearInterval(timer);
+  }, [renderStartedAt, rendering]);
 
   useEffect(() => {
     let disposed = false;
@@ -1182,7 +1200,10 @@ export default function VideoMaskTool() {
       return;
     }
     const renderId = `video-mask-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const startedAt = Date.now();
     renderIdRef.current = renderId;
+    setRenderStartedAt(startedAt);
+    setRenderElapsedSeconds(0);
     setRenderProgress({
       percent: 0,
       stage: "准备导出",
@@ -1199,6 +1220,7 @@ export default function VideoMaskTool() {
         },
       });
       setRenderResult(result);
+      setRenderElapsedSeconds(Number(result?.elapsedSeconds) > 0 ? Number(result.elapsedSeconds) : (Date.now() - startedAt) / 1000);
       setRenderProgress((prev) => ({
         ...(prev || {}),
         percent: 100,
@@ -1208,6 +1230,7 @@ export default function VideoMaskTool() {
       const warnings = Array.isArray(result?.warnings) && result.warnings.length > 0 ? `；提示：${result.warnings.slice(0, 2).join("；")}` : "";
       setMessage(`导出完成：${result?.outputPath || targetPath}${warnings}`);
     } catch (error) {
+      setRenderElapsedSeconds((Date.now() - startedAt) / 1000);
       setRenderProgress((prev) => prev ? { ...prev, stage: "导出失败" } : null);
       setMessage(error?.message || "导出失败");
     } finally {
@@ -1396,6 +1419,16 @@ export default function VideoMaskTool() {
                 className="h-full rounded-full bg-[var(--primary-color)] transition-[width] duration-200"
                 style={{ width: `${clamp(renderProgress.percent, 0, 100)}%` }}
               />
+            </div>
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--desc-color)]">
+              <span>已用时 {formatTime(renderElapsedSeconds)}</span>
+              <span>
+                {rendering
+                  ? estimatedRemainingSeconds === null
+                    ? "预计剩余计算中"
+                    : `预计剩余 ${formatTime(estimatedRemainingSeconds)}`
+                  : `总耗时 ${formatTime(renderElapsedSeconds)}`}
+              </span>
             </div>
           </div>
         ) : null}
@@ -1977,6 +2010,7 @@ export default function VideoMaskTool() {
                 <div>大小：{formatSize(renderResult.outputSize)}</div>
                 <div>分段：{renderResult.partCount}</div>
                 {renderResult.encoder ? <div>编码器：{renderResult.encoder}</div> : null}
+                {Number(renderResult.elapsedSeconds) > 0 ? <div>合并耗时：{formatTime(renderResult.elapsedSeconds)}</div> : null}
                 {Array.isArray(renderResult.warnings) && renderResult.warnings.length > 0 ? (
                   <div>提示：{renderResult.warnings.join("；")}</div>
                 ) : null}
