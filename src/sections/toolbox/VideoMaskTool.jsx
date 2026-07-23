@@ -219,7 +219,11 @@ export default function VideoMaskTool() {
       }),
     [segments, currentTime],
   );
-  const useDomPreview = Boolean(!playing || videoPreviewFailed || !videoPreviewReady);
+  const useDomPreview = Boolean(
+    videoPreviewFailed ||
+      !videoPreviewReady ||
+      (previewSegments.length > 0 && !playing),
+  );
   const markDirty = () => {
     setPlan(null);
     setRenderResult(null);
@@ -609,6 +613,7 @@ export default function VideoMaskTool() {
     const seq = previewFrameSeqRef.current + 1;
     previewFrameSeqRef.current = seq;
     setLoadingPreviewFrame(true);
+    logVideoMaskClient(`preview_frame_start time=${(Number(time) || 0).toFixed(3)}`);
     try {
       const previewWidth = clamp(Math.round(Number(sourceInfo.width) || width || 1920), 720, 3840);
       const result = await invokeCommand("toolbox_video_mask_preview_frame", {
@@ -621,9 +626,17 @@ export default function VideoMaskTool() {
       if (previewFrameSeqRef.current !== seq) {
         return;
       }
-      setPreviewFrameSrc(result?.dataUrl || fileSrcFromPath(result?.path));
+      const nextSrc = result?.dataUrl || fileSrcFromPath(result?.path);
+      if (!nextSrc) {
+        throw new Error("预览帧返回为空");
+      }
+      logVideoMaskClient(
+        `preview_frame_done time=${(Number(result?.time) || Number(time) || 0).toFixed(3)} dataUrlLen=${String(result?.dataUrl || "").length} path=${result?.path ? 1 : 0} srcLen=${nextSrc.length}`,
+      );
+      setPreviewFrameSrc(nextSrc);
     } catch (error) {
       if (previewFrameSeqRef.current === seq) {
+        logVideoMaskClient(`preview_frame_error time=${(Number(time) || 0).toFixed(3)} message=${error?.message || error}`);
         setMessage(error?.message || "预览帧生成失败");
       }
     } finally {
@@ -1379,6 +1392,9 @@ export default function VideoMaskTool() {
                         const nextDuration = Number(video.duration) || 0;
                         const nextWidth = Number(video.videoWidth) || 0;
                         const nextHeight = Number(video.videoHeight) || 0;
+                        logVideoMaskClient(
+                          `video_metadata duration=${nextDuration.toFixed(3)} size=${nextWidth}x${nextHeight}`,
+                        );
                         setSourceInfo((prev) => ({
                           ...prev,
                           duration: prev.duration || nextDuration,
@@ -1390,6 +1406,7 @@ export default function VideoMaskTool() {
                         setVideoPreviewReady(true);
                         setVideoPreviewFailed(false);
                         const nextTime = Number(event.currentTarget.currentTime) || 0;
+                        logVideoMaskClient(`video_loaded_data current=${nextTime.toFixed(3)}`);
                         setCurrentTime(nextTime);
                         focusTimeline(nextTime);
                       }}
@@ -1406,7 +1423,11 @@ export default function VideoMaskTool() {
                       onPlay={() => setPlaying(true)}
                       onPause={() => setPlaying(false)}
                       onEnded={() => setPlaying(false)}
-                      onError={() => {
+                      onError={(event) => {
+                        const error = event.currentTarget.error;
+                        logVideoMaskClient(
+                          `video_error code=${error?.code || 0} message=${error?.message || "unknown"}`,
+                        );
                         setVideoPreviewFailed(true);
                         setMessage("当前视频格式无法直接播放，已切换为抽帧预览");
                       }}
@@ -1416,6 +1437,15 @@ export default function VideoMaskTool() {
                         src={previewFrameSrc}
                         alt=""
                         className="absolute inset-0 z-10 h-full w-full bg-black object-contain"
+                        onLoad={(event) => {
+                          logVideoMaskClient(
+                            `preview_frame_load srcLen=${previewFrameSrc.length} natural=${event.currentTarget.naturalWidth}x${event.currentTarget.naturalHeight}`,
+                          );
+                        }}
+                        onError={() => {
+                          logVideoMaskClient(`preview_frame_img_error srcLen=${previewFrameSrc.length}`);
+                          setMessage("视频预览帧加载失败");
+                        }}
                       />
                     ) : null}
                     {previewMetrics ? (
