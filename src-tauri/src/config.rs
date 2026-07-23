@@ -98,18 +98,32 @@ pub fn resolve_resource_bin_dir(app_handle: &AppHandle) -> Option<PathBuf> {
         .path()
         .resolve("bin", BaseDirectory::Resource)
         .ok();
-    if let Some(path) = primary.as_ref() {
-        if path.exists() {
-            return Some(path.clone());
-        }
+    if let Some(path) = primary.as_ref().filter(|path| resource_bin_dir_ready(path)) {
+        return Some(path.clone());
     }
     let fallback = app_handle
         .path()
         .resolve("resources/bin", BaseDirectory::Resource)
         .ok();
-    if let Some(path) = fallback.as_ref() {
-        if path.exists() {
-            return Some(path.clone());
+    if let Some(path) = fallback
+        .as_ref()
+        .filter(|path| resource_bin_dir_ready(path))
+    {
+        return Some(path.clone());
+    }
+    if cfg!(debug_assertions) {
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin");
+        if resource_bin_dir_ready(&source_dir) {
+            return Some(source_dir);
+        }
+        if let Some(exe_dir) = env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+        {
+            let exe_dir = exe_dir.join("bin");
+            if resource_bin_dir_ready(&exe_dir) {
+                return Some(exe_dir);
+            }
         }
     }
     primary.or(fallback)
@@ -172,7 +186,19 @@ fn resolve_bin_path(env_key: &str, fallback: &str) -> PathBuf {
     PathBuf::from(fallback)
 }
 
+fn resource_bin_dir_ready(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let platform_dir = path.join(platform_subdir());
+    platform_dir.join(bin_name("ffmpeg")).is_file()
+        || platform_dir.join(bin_name("ffprobe")).is_file()
+        || path.join(bin_name("ffmpeg")).is_file()
+        || path.join(bin_name("ffprobe")).is_file()
+}
+
 fn set_env_if_exists(key: &str, path: PathBuf) {
+    let path = normalize_process_path(path);
     if path.exists() {
         #[cfg(unix)]
         {
@@ -180,6 +206,20 @@ fn set_env_if_exists(key: &str, path: PathBuf) {
         }
         env::set_var(key, path.to_string_lossy().to_string());
     }
+}
+
+fn normalize_process_path(path: PathBuf) -> PathBuf {
+    if !cfg!(target_os = "windows") {
+        return path;
+    }
+    let raw = path.to_string_lossy();
+    let Some(stripped) = raw.strip_prefix("\\\\?\\") else {
+        return path;
+    };
+    if let Some(unc_path) = stripped.strip_prefix("UNC\\") {
+        return PathBuf::from(format!("\\\\{}", unc_path));
+    }
+    PathBuf::from(stripped)
 }
 
 fn set_env_if_dir(key: &str, path: PathBuf) {
