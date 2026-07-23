@@ -186,6 +186,7 @@ pub fn run() {
             };
             baidu_sync::start_baidu_sync_loop(baidu_context);
             app.manage(state);
+            commands::toolbox::start_bilibili_season_backup_scheduler(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -266,6 +267,11 @@ pub fn run() {
             commands::toolbox::toolbox_video_mask_render,
             commands::toolbox::toolbox_bilibili_season_list,
             commands::toolbox::toolbox_bilibili_season_backups,
+            commands::toolbox::toolbox_bilibili_season_backup_schedules,
+            commands::toolbox::toolbox_bilibili_season_backup_schedule_set,
+            commands::toolbox::toolbox_bilibili_season_backup_schedule_delete,
+            commands::toolbox::toolbox_bilibili_season_backup_export,
+            commands::toolbox::toolbox_bilibili_season_backup_import,
             commands::toolbox::toolbox_bilibili_season_backup_delete,
             commands::toolbox::toolbox_bilibili_season_backup,
             commands::toolbox::toolbox_bilibili_season_restore,

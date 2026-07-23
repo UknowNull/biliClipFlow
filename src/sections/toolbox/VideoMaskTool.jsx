@@ -169,6 +169,7 @@ export default function VideoMaskTool() {
   const [timelineStart, setTimelineStart] = useState(0);
   const [timelineZoomPercent, setTimelineZoomPercent] = useState(100);
   const [qualityPercent, setQualityPercent] = useState(90);
+  const [encoderMode, setEncoderMode] = useState("software");
   const [playing, setPlaying] = useState(false);
   const [plan, setPlan] = useState(null);
   const [renderResult, setRenderResult] = useState(null);
@@ -1046,6 +1047,28 @@ export default function VideoMaskTool() {
     schedulePreviewFrame(nextTime);
   };
 
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+        return;
+      }
+      const tagName = String(document.activeElement?.tagName || "").toLowerCase();
+      if (tagName === "input" || tagName === "textarea" || tagName === "select" || document.activeElement?.isContentEditable) {
+        return;
+      }
+      if (!sourcePath || duration <= 0 || fps <= 0) {
+        return;
+      }
+      event.preventDefault();
+      const currentFrame = Math.round((Number(currentTime) || 0) * fps);
+      const nextFrame = currentFrame + (event.key === "ArrowLeft" ? -1 : 1);
+      pausePreview();
+      seekTo(nextFrame / fps);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [currentTime, duration, fps, sourcePath]);
+
   const togglePlayback = async () => {
     const video = videoRef.current;
     if (!video) {
@@ -1077,6 +1100,7 @@ export default function VideoMaskTool() {
     keyframes: sourceInfo.keyframes,
     crf: outputCrf,
     preset: "veryfast",
+    encoderMode,
     segments: segments.map((segment) => ({
       id: segment.id,
       imagePath: segment.imagePath,
@@ -1127,7 +1151,7 @@ export default function VideoMaskTool() {
     } catch {
       // localStorage 不可用时忽略，避免影响遮罩编辑。
     }
-  }, [sourcePath, targetPath, sourceInfo, segments, resources, qualityPercent, outputCrf]);
+  }, [sourcePath, targetPath, sourceInfo, segments, resources, qualityPercent, outputCrf, encoderMode]);
 
   const handleBuildPlan = async () => {
     setMessage("");
@@ -1336,6 +1360,20 @@ export default function VideoMaskTool() {
                 onInput={(event) => updateQualityControl(event.target.value)}
                 onChange={(event) => updateQualityControl(event.target.value)}
               />
+            </label>
+            <label className="flex h-8 items-center gap-2 rounded-lg border border-[var(--split-color)] px-2 text-xs text-[var(--desc-color)]">
+              <span className="whitespace-nowrap">导出加速</span>
+              <select
+                className="h-6 rounded border border-[var(--split-color)] bg-[var(--card-bg)] px-1 text-xs text-[var(--ink)]"
+                value={encoderMode}
+                onChange={(event) => setEncoderMode(event.target.value)}
+                disabled={rendering}
+                title="硬件编码不可用时，自动模式会回退到软件编码"
+              >
+                <option value="software">软件编码</option>
+                <option value="auto">自动硬件编码</option>
+                <option value="hardware">强制硬件编码</option>
+              </select>
             </label>
             <button className="h-8 px-3 rounded-lg" onClick={handlePickVideo} disabled={loadingProbe}>
               {loadingProbe ? "读取中..." : "导入视频"}
@@ -1940,6 +1978,7 @@ export default function VideoMaskTool() {
                 <div>输出：{renderResult.outputPath}</div>
                 <div>大小：{formatSize(renderResult.outputSize)}</div>
                 <div>分段：{renderResult.partCount}</div>
+                {renderResult.encoder ? <div>编码器：{renderResult.encoder}</div> : null}
                 {Array.isArray(renderResult.warnings) && renderResult.warnings.length > 0 ? (
                   <div>提示：{renderResult.warnings.join("；")}</div>
                 ) : null}

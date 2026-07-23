@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use base64::{engine::general_purpose, Engine as _};
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -23,6 +23,7 @@ const BILIBILI_ARCHIVE_STATUS_REJECTED: &str = "not_pubed";
 const BILIBILI_ARCHIVE_STATUS_PUBLISHED: &str = "pubed";
 const VIDEO_MASK_COPY_SEEK_EPSILON: f64 = 0.001;
 const VIDEO_MASK_RENDER_PROGRESS_EVENT: &str = "toolbox://video-mask-render-progress";
+const SEASON_BACKUP_TASK_INTERVAL_SECONDS: u64 = 3;
 
 struct RemoteRefreshPauseGuard {
     counter: Arc<AtomicUsize>,
@@ -210,6 +211,8 @@ pub struct VideoMaskRenderPayload {
     pub segments: Vec<VideoMaskSegmentPayload>,
     pub crf: Option<i64>,
     pub preset: Option<String>,
+    #[serde(default = "default_encoder_mode")]
+    pub encoder_mode: String,
     #[serde(default)]
     pub keyframes: Vec<f64>,
 }
@@ -241,7 +244,12 @@ pub struct VideoMaskRenderResult {
     pub encode_duration: f64,
     pub copy_duration: f64,
     pub output_size: u64,
+    pub encoder: String,
     pub warnings: Vec<String>,
+}
+
+fn default_encoder_mode() -> String {
+    "software".to_string()
 }
 
 #[derive(Clone, Serialize)]
@@ -722,10 +730,11 @@ pub async fn toolbox_video_mask_render(
     utils::append_log(
         log_path.as_ref(),
         &format!(
-            "toolbox_video_mask_render_start source={} target={} segments={}",
+            "toolbox_video_mask_render_start source={} target={} segments={} encoder_mode={}",
             source,
             target,
-            payload.segments.len()
+            payload.segments.len(),
+            payload.encoder_mode
         ),
     );
 
@@ -748,8 +757,12 @@ pub async fn toolbox_video_mask_render(
             utils::append_log(
                 log_path.as_ref(),
                 &format!(
-                    "toolbox_video_mask_render_done status=ok target={} parts={} encode_duration={:.3} copy_duration={:.3}",
-                    value.output_path, value.part_count, value.encode_duration, value.copy_duration
+                    "toolbox_video_mask_render_done status=ok target={} parts={} encoder={} encode_duration={:.3} copy_duration={:.3}",
+                    value.output_path,
+                    value.part_count,
+                    value.encoder,
+                    value.encode_duration,
+                    value.copy_duration
                 ),
             );
             Ok(ApiResponse::success(value))
@@ -894,6 +907,66 @@ pub struct SeasonBackupDeletePayload {
     pub backup_id: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeasonBackupSchedule {
+    pub season_id: i64,
+    pub title: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub last_run_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeasonBackupScheduleSetPayload {
+    pub season_id: i64,
+    pub title: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeasonBackupScheduleDeletePayload {
+    pub season_id: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeasonBackupFilePayload {
+    pub path: String,
+    #[serde(default)]
+    pub backup_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeasonBackupExportResult {
+    pub path: String,
+    pub backup_count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeasonBackupImportResult {
+    pub imported_count: usize,
+    pub total_count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SeasonBackupExportFile {
+    version: u32,
+    exported_at: String,
+    backup_count: usize,
+    backups: Vec<SeasonBackup>,
+}
+
 #[tauri::command]
 pub async fn toolbox_bilibili_season_list(
     state: State<'_, AppState>,
@@ -916,6 +989,175 @@ pub fn toolbox_bilibili_season_backups(app: AppHandle) -> ApiResponse<Vec<Season
         Ok(items) => ApiResponse::success(items),
         Err(err) => ApiResponse::error(err),
     }
+}
+
+#[tauri::command]
+pub fn toolbox_bilibili_season_backup_schedules(
+    app: AppHandle,
+) -> ApiResponse<Vec<SeasonBackupSchedule>> {
+    match read_season_backup_schedules(&app) {
+        Ok(items) => ApiResponse::success(items),
+        Err(err) => ApiResponse::error(err),
+    }
+}
+
+#[tauri::command]
+pub fn toolbox_bilibili_season_backup_schedule_set(
+    app: AppHandle,
+    payload: SeasonBackupScheduleSetPayload,
+) -> ApiResponse<SeasonBackupSchedule> {
+    if payload.season_id <= 0 {
+        return ApiResponse::error("合集ID无效");
+    }
+    let mut schedules = match read_season_backup_schedules(&app) {
+        Ok(items) => items,
+        Err(err) => return ApiResponse::error(err),
+    };
+    let now = Utc::now().to_rfc3339();
+    let schedule = if let Some(item) = schedules
+        .iter_mut()
+        .find(|item| item.season_id == payload.season_id)
+    {
+        item.title = payload.title.trim().to_string();
+        item.enabled = payload.enabled;
+        item.updated_at = now;
+        item.clone()
+    } else {
+        let item = SeasonBackupSchedule {
+            season_id: payload.season_id,
+            title: payload.title.trim().to_string(),
+            enabled: payload.enabled,
+            created_at: now.clone(),
+            updated_at: now,
+            last_run_at: None,
+            last_error: None,
+        };
+        schedules.insert(0, item.clone());
+        item
+    };
+    if let Err(err) = write_season_backup_schedules(&app, &schedules) {
+        return ApiResponse::error(err);
+    }
+    ApiResponse::success(schedule)
+}
+
+#[tauri::command]
+pub fn toolbox_bilibili_season_backup_schedule_delete(
+    app: AppHandle,
+    payload: SeasonBackupScheduleDeletePayload,
+) -> ApiResponse<bool> {
+    let mut schedules = match read_season_backup_schedules(&app) {
+        Ok(items) => items,
+        Err(err) => return ApiResponse::error(err),
+    };
+    let before = schedules.len();
+    schedules.retain(|item| item.season_id != payload.season_id);
+    if schedules.len() == before {
+        return ApiResponse::error("未找到定时备份配置");
+    }
+    match write_season_backup_schedules(&app, &schedules) {
+        Ok(()) => ApiResponse::success(true),
+        Err(err) => ApiResponse::error(err),
+    }
+}
+
+#[tauri::command]
+pub fn toolbox_bilibili_season_backup_export(
+    app: AppHandle,
+    payload: SeasonBackupFilePayload,
+) -> ApiResponse<SeasonBackupExportResult> {
+    let path = payload.path.trim();
+    if path.is_empty() {
+        return ApiResponse::error("请选择导出文件路径");
+    }
+    let all_backups = match read_season_backups(&app) {
+        Ok(items) => items,
+        Err(err) => return ApiResponse::error(err),
+    };
+    let backups = if payload.backup_ids.is_empty() {
+        all_backups
+    } else {
+        all_backups
+            .into_iter()
+            .filter(|backup| payload.backup_ids.iter().any(|id| id == &backup.backup_id))
+            .collect::<Vec<_>>()
+    };
+    if backups.is_empty() {
+        return ApiResponse::error("没有找到要导出的合集备份");
+    }
+    let export_file = SeasonBackupExportFile {
+        version: 1,
+        exported_at: Utc::now().to_rfc3339(),
+        backup_count: backups.len(),
+        backups,
+    };
+    let text = match serde_json::to_string_pretty(&export_file) {
+        Ok(value) => value,
+        Err(err) => return ApiResponse::error(format!("生成备份JSON失败: {}", err)),
+    };
+    if let Some(parent) = Path::new(path).parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return ApiResponse::error(format!("创建导出目录失败: {}", err));
+        }
+    }
+    if let Err(err) = fs::write(path, text) {
+        return ApiResponse::error(format!("写入导出文件失败: {}", err));
+    }
+    ApiResponse::success(SeasonBackupExportResult {
+        path: path.to_string(),
+        backup_count: export_file.backups.len(),
+    })
+}
+
+#[tauri::command]
+pub fn toolbox_bilibili_season_backup_import(
+    app: AppHandle,
+    payload: SeasonBackupFilePayload,
+) -> ApiResponse<SeasonBackupImportResult> {
+    let path = payload.path.trim();
+    if path.is_empty() {
+        return ApiResponse::error("请选择导入文件");
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(err) => return ApiResponse::error(format!("读取导入文件失败: {}", err)),
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(err) => return ApiResponse::error(format!("解析备份JSON失败: {}", err)),
+    };
+    let raw_backups = if value.is_array() {
+        value
+    } else {
+        value.get("backups").cloned().unwrap_or(Value::Null)
+    };
+    let mut imported: Vec<SeasonBackup> = match serde_json::from_value(raw_backups) {
+        Ok(items) => items,
+        Err(err) => return ApiResponse::error(format!("备份JSON格式无效: {}", err)),
+    };
+    if imported.is_empty() {
+        return ApiResponse::error("导入文件中没有合集备份");
+    }
+    for backup in &mut imported {
+        if backup.backup_id.trim().is_empty() {
+            backup.backup_id = Uuid::new_v4().to_string();
+        }
+    }
+    let mut backups = match read_season_backups(&app) {
+        Ok(items) => items,
+        Err(err) => return ApiResponse::error(err),
+    };
+    let imported_count = imported.len();
+    for backup in imported {
+        upsert_season_backup(&mut backups, backup, false);
+    }
+    if let Err(err) = write_season_backups(&app, &backups) {
+        return ApiResponse::error(err);
+    }
+    ApiResponse::success(SeasonBackupImportResult {
+        imported_count,
+        total_count: backups.len(),
+    })
 }
 
 #[tauri::command]
@@ -960,8 +1202,7 @@ pub async fn toolbox_bilibili_season_backup(
         Ok(items) => items,
         Err(err) => return Ok(ApiResponse::error(err)),
     };
-    backups.retain(|item| item.source_season_id != backup.source_season_id);
-    backups.insert(0, backup.clone());
+    upsert_season_backup(&mut backups, backup.clone(), false);
     if let Err(err) = write_season_backups(&app, &backups) {
         return Ok(ApiResponse::error(err));
     }
@@ -1620,7 +1861,7 @@ where
     let mut color_transfer = payload.color_transfer.clone();
     let mut color_primaries = payload.color_primaries.clone();
 
-    if duration <= 0.0 || width <= 0 || height <= 0 || video_codec.is_empty() {
+    if duration <= 0.0 || width <= 0 || height <= 0 || fps <= 0.0 || video_codec.is_empty() {
         let probe = probe_video_mask_source(&payload.source_path)?;
         duration = if duration > 0.0 {
             duration
@@ -1653,6 +1894,28 @@ where
     if plan.parts.is_empty() {
         return Err("没有可导出的时间段".to_string());
     }
+    let encoder = if plan.encode_duration > 0.0 {
+        resolve_video_encoder(&payload, &video_codec, width, height, fps)?
+    } else {
+        VideoMaskEncoder {
+            name: "copy".to_string(),
+            options: Vec::new(),
+            hardware: false,
+            fallback_note: None,
+        }
+    };
+    if let Some(note) = encoder.fallback_note.clone() {
+        warnings.push(note);
+    }
+    warnings.push(format!(
+        "遮罩分段编码器：{}{}",
+        encoder.name,
+        if encoder.hardware {
+            "（硬件）"
+        } else {
+            "（软件/复制）"
+        }
+    ));
     emit_video_mask_render_progress(
         &payload.render_id,
         0,
@@ -1683,12 +1946,12 @@ where
         width,
         height,
         fps,
-        &video_codec,
         &color_space,
         &color_transfer,
         &color_primaries,
         video_timescale,
         copy_reorder_delay_frames,
+        &encoder,
         &mut warnings,
         &mut on_progress,
     )
@@ -1704,6 +1967,7 @@ where
         encode_duration: plan.encode_duration,
         copy_duration: plan.copy_duration,
         output_size,
+        encoder: encoder.name,
         warnings,
     })
 }
@@ -1715,12 +1979,12 @@ fn render_video_mask_parts<F>(
     width: i64,
     height: i64,
     fps: f64,
-    video_codec: &str,
     color_space: &str,
     color_transfer: &str,
     color_primaries: &str,
     video_timescale: i64,
     copy_reorder_delay_frames: i64,
+    encoder: &VideoMaskEncoder,
     warnings: &mut Vec<String>,
     on_progress: &mut F,
 ) -> Result<Vec<PathBuf>, String>
@@ -1778,18 +2042,18 @@ where
                 );
             })?;
         } else {
-            let args = ffmpeg_args_with_progress(encode_part_args(
+            let args = ffmpeg_args_with_progress(encode_part_args_with_encoder(
                 payload,
                 part,
                 &part_path,
                 width,
                 height,
                 fps,
-                video_codec,
                 color_space,
                 color_transfer,
                 color_primaries,
                 video_timescale,
+                encoder,
             ));
             let duration_ms = duration_to_millis(part.duration);
             run_ffmpeg_with_progress(&args, duration_ms, |stage_percent| {
@@ -1894,6 +2158,215 @@ fn compensated_copy_duration(
     (duration - compensation).max(frame_duration)
 }
 
+#[derive(Clone, Debug)]
+struct VideoMaskEncoder {
+    name: String,
+    options: Vec<String>,
+    hardware: bool,
+    fallback_note: Option<String>,
+}
+
+fn normalize_encoder_mode(value: &str) -> &str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "hardware" | "hw" => "hardware",
+        "auto" => "auto",
+        _ => "software",
+    }
+}
+
+fn hardware_encoder_candidates(video_codec: &str) -> Vec<&'static str> {
+    let is_hevc = matches!(video_codec.to_ascii_lowercase().as_str(), "hevc" | "h265");
+    if cfg!(target_os = "windows") {
+        if is_hevc {
+            vec!["hevc_nvenc", "hevc_qsv", "hevc_amf"]
+        } else {
+            vec!["h264_nvenc", "h264_qsv", "h264_amf"]
+        }
+    } else if cfg!(target_os = "macos") {
+        if is_hevc {
+            vec!["hevc_videotoolbox"]
+        } else {
+            vec!["h264_videotoolbox"]
+        }
+    } else {
+        Vec::new()
+    }
+}
+
+fn videotoolbox_bitrate_kbps(width: i64, height: i64, fps: f64, crf: i64) -> i64 {
+    let pixels_per_second = (width.max(1) * height.max(1)) as f64 * fps.max(1.0);
+    let quality = (30 - crf.clamp(16, 30)) as f64 / 14.0;
+    let bits_per_pixel = 0.06 + quality * 0.24;
+    ((pixels_per_second * bits_per_pixel) / 1_000.0)
+        .round()
+        .clamp(1_000.0, 100_000.0) as i64
+}
+
+fn build_encoder_options(
+    encoder: &str,
+    crf: i64,
+    preset: &str,
+    width: i64,
+    height: i64,
+    fps: f64,
+) -> Vec<String> {
+    match encoder {
+        name if name.ends_with("_nvenc") => vec![
+            "-preset".to_string(),
+            "p5".to_string(),
+            "-rc".to_string(),
+            "constqp".to_string(),
+            "-qp".to_string(),
+            crf.to_string(),
+        ],
+        name if name.ends_with("_qsv") => vec![
+            "-preset".to_string(),
+            if preset == "ultrafast" {
+                "veryfast"
+            } else {
+                "medium"
+            }
+            .to_string(),
+            "-global_quality".to_string(),
+            crf.to_string(),
+        ],
+        name if name.ends_with("_amf") => vec![
+            "-quality".to_string(),
+            "quality".to_string(),
+            "-rc".to_string(),
+            "cqp".to_string(),
+            "-qp_i".to_string(),
+            crf.to_string(),
+            "-qp_p".to_string(),
+            (crf + 2).clamp(16, 30).to_string(),
+        ],
+        // VideoToolbox does not support CRF or qscale. Convert the existing quality
+        // setting to a high target bitrate that scales with the source frame size.
+        name if name.ends_with("_videotoolbox") => vec![
+            "-b:v".to_string(),
+            format!("{}k", videotoolbox_bitrate_kbps(width, height, fps, crf)),
+        ],
+        _ => vec![
+            "-preset".to_string(),
+            preset.to_string(),
+            "-crf".to_string(),
+            crf.to_string(),
+        ],
+    }
+}
+
+fn software_video_encoder(video_codec: &str, crf: i64, preset: &str) -> VideoMaskEncoder {
+    let name = if matches!(video_codec.to_ascii_lowercase().as_str(), "hevc" | "h265") {
+        "libx265"
+    } else {
+        "libx264"
+    };
+    VideoMaskEncoder {
+        name: name.to_string(),
+        options: build_encoder_options(name, crf, preset, 0, 0, 0.0),
+        hardware: false,
+        fallback_note: None,
+    }
+}
+
+fn resolve_video_encoder(
+    payload: &VideoMaskRenderPayload,
+    video_codec: &str,
+    width: i64,
+    height: i64,
+    fps: f64,
+) -> Result<VideoMaskEncoder, String> {
+    let crf = payload.crf.unwrap_or(18).clamp(16, 30);
+    let preset = normalized_preset(payload.preset.as_deref());
+    let software = || software_video_encoder(video_codec, crf, &preset);
+    let mode = normalize_encoder_mode(&payload.encoder_mode);
+    if mode == "software" {
+        return Ok(software());
+    }
+
+    let candidates = hardware_encoder_candidates(video_codec);
+    if candidates.is_empty() {
+        if mode == "hardware" {
+            return Err("当前系统不支持硬件编码器".to_string());
+        }
+        let mut fallback = software();
+        fallback.fallback_note = Some("当前系统没有可用硬件编码器，已回退软件编码".to_string());
+        return Ok(fallback);
+    }
+
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        let encoder = VideoMaskEncoder {
+            name: candidate.to_string(),
+            options: build_encoder_options(candidate, crf, &preset, width, height, fps),
+            hardware: true,
+            fallback_note: None,
+        };
+        match probe_hardware_encoder(&payload.source_path, &encoder) {
+            Ok(()) => return Ok(encoder),
+            Err(error) => failures.push(format!("{}: {}", candidate, compact_ffmpeg_error(&error))),
+        }
+    }
+
+    let detail = failures.join("；");
+    if mode == "hardware" {
+        return Err(format!(
+            "硬件编码不可用。请检查显卡驱动或改用自动硬件/软件编码。{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" 原因：{}", detail)
+            }
+        ));
+    }
+    let mut fallback = software();
+    fallback.fallback_note = Some(if detail.is_empty() {
+        "没有可用硬件编码器，已回退软件编码".to_string()
+    } else {
+        format!("硬件编码不可用，已回退软件编码：{}", detail)
+    });
+    Ok(fallback)
+}
+
+fn probe_hardware_encoder(source_path: &str, encoder: &VideoMaskEncoder) -> Result<(), String> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-ss".to_string(),
+        "0".to_string(),
+        "-i".to_string(),
+        source_path.to_string(),
+        "-map".to_string(),
+        "0:v:0".to_string(),
+        "-frames:v".to_string(),
+        "1".to_string(),
+        "-an".to_string(),
+        "-c:v".to_string(),
+        encoder.name.clone(),
+    ];
+    args.extend(encoder.options.clone());
+    args.extend([
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        "-f".to_string(),
+        "null".to_string(),
+        "-".to_string(),
+    ]);
+    run_ffmpeg(&args)
+}
+
+fn compact_ffmpeg_error(error: &str) -> String {
+    error
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("FFmpeg failed:"))
+        .unwrap_or(error)
+        .chars()
+        .take(240)
+        .collect()
+}
+
 fn encode_part_args(
     payload: &VideoMaskRenderPayload,
     part: &VideoMaskRenderPart,
@@ -1907,12 +2380,39 @@ fn encode_part_args(
     color_primaries: &str,
     video_timescale: i64,
 ) -> Vec<String> {
-    let preset = normalized_preset(payload.preset.as_deref());
-    let crf = payload.crf.unwrap_or(18).clamp(16, 30).to_string();
-    let encoder = match video_codec {
-        "hevc" | "h265" => "libx265",
-        _ => "libx264",
-    };
+    let encoder = software_video_encoder(
+        video_codec,
+        payload.crf.unwrap_or(18).clamp(16, 30),
+        &normalized_preset(payload.preset.as_deref()),
+    );
+    encode_part_args_with_encoder(
+        payload,
+        part,
+        output,
+        width,
+        height,
+        fps,
+        color_space,
+        color_transfer,
+        color_primaries,
+        video_timescale,
+        &encoder,
+    )
+}
+
+fn encode_part_args_with_encoder(
+    payload: &VideoMaskRenderPayload,
+    part: &VideoMaskRenderPart,
+    output: &Path,
+    width: i64,
+    height: i64,
+    fps: f64,
+    color_space: &str,
+    color_transfer: &str,
+    color_primaries: &str,
+    video_timescale: i64,
+    encoder: &VideoMaskEncoder,
+) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -1939,11 +2439,10 @@ fn encode_part_args(
         "-t".to_string(),
         format_seconds(part.duration),
         "-c:v".to_string(),
-        encoder.to_string(),
-        "-preset".to_string(),
-        preset,
-        "-crf".to_string(),
-        crf,
+        encoder.name.clone(),
+    ]);
+    args.extend(encoder.options.clone());
+    args.extend([
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
         "-c:a".to_string(),
@@ -3557,6 +4056,186 @@ fn write_season_backups(app: &AppHandle, backups: &[SeasonBackup]) -> Result<(),
     fs::write(path, text).map_err(|err| format!("写入备份失败: {}", err))
 }
 
+fn season_backup_schedules_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("读取应用数据目录失败: {}", err))?
+        .join("toolbox");
+    fs::create_dir_all(&dir).map_err(|err| format!("创建定时备份目录失败: {}", err))?;
+    Ok(dir.join("bilibili-season-backup-schedules.json"))
+}
+
+fn read_season_backup_schedules(app: &AppHandle) -> Result<Vec<SeasonBackupSchedule>, String> {
+    let path = season_backup_schedules_path(app)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path).map_err(|err| format!("读取定时备份配置失败: {}", err))?;
+    serde_json::from_str(&text).map_err(|err| format!("解析定时备份配置失败: {}", err))
+}
+
+fn write_season_backup_schedules(
+    app: &AppHandle,
+    schedules: &[SeasonBackupSchedule],
+) -> Result<(), String> {
+    let path = season_backup_schedules_path(app)?;
+    let text = serde_json::to_string_pretty(schedules)
+        .map_err(|err| format!("序列化定时备份配置失败: {}", err))?;
+    fs::write(path, text).map_err(|err| format!("写入定时备份配置失败: {}", err))
+}
+
+fn upsert_season_backup(
+    backups: &mut Vec<SeasonBackup>,
+    mut backup: SeasonBackup,
+    preserve_backup_id: bool,
+) {
+    let existing_index = if backup.source_season_id > 0 {
+        backups
+            .iter()
+            .position(|item| item.source_season_id == backup.source_season_id)
+    } else {
+        backups
+            .iter()
+            .position(|item| item.backup_id == backup.backup_id)
+    };
+    if let Some(index) = existing_index {
+        if preserve_backup_id {
+            backup.backup_id = backups[index].backup_id.clone();
+        }
+        backups.remove(index);
+    }
+    backups.insert(0, backup);
+}
+
+fn update_schedule_status(
+    schedules: &mut [SeasonBackupSchedule],
+    season_id: i64,
+    error: Option<String>,
+) {
+    if let Some(schedule) = schedules
+        .iter_mut()
+        .find(|item| item.season_id == season_id)
+    {
+        let now = Utc::now().to_rfc3339();
+        schedule.updated_at = now.clone();
+        if error.is_none() {
+            schedule.last_run_at = Some(now);
+        }
+        schedule.last_error = error;
+    }
+}
+
+fn seconds_until_next_local_midnight() -> u64 {
+    let now = Local::now();
+    let next_date = now.date_naive() + ChronoDuration::days(1);
+    let next_midnight = next_date
+        .and_hms_opt(0, 0, 0)
+        .expect("valid local midnight");
+    next_midnight
+        .signed_duration_since(now.naive_local())
+        .num_seconds()
+        .max(1) as u64
+}
+
+pub fn start_bilibili_season_backup_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let wait_seconds = seconds_until_next_local_midnight();
+            sleep(Duration::from_secs(wait_seconds)).await;
+            if let Err(err) = run_scheduled_season_backups(&app).await {
+                let state = app.state::<AppState>();
+                append_toolbox_log(
+                    &state,
+                    &format!("toolbox_bilibili_season_schedule_error {}", err),
+                );
+            }
+        }
+    });
+}
+
+async fn run_scheduled_season_backups(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut schedules = read_season_backup_schedules(app)?;
+    let targets = schedules
+        .iter()
+        .filter(|item| item.enabled)
+        .map(|item| (item.season_id, item.title.clone()))
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let auth = load_active_auth(&state)?;
+    let seasons = fetch_all_seasons(&state, &auth).await?;
+    let mut seasons_by_id = HashMap::new();
+    for item in seasons {
+        if let Some(season_id) = item
+            .get("season")
+            .and_then(|season| season.get("id"))
+            .and_then(Value::as_i64)
+        {
+            seasons_by_id.insert(season_id, item);
+        }
+    }
+
+    append_toolbox_log(
+        &state,
+        &format!(
+            "toolbox_bilibili_season_schedule_start targets={} interval_seconds={}",
+            targets.len(),
+            SEASON_BACKUP_TASK_INTERVAL_SECONDS
+        ),
+    );
+    for (index, (season_id, title)) in targets.iter().enumerate() {
+        if index > 0 {
+            sleep(Duration::from_secs(SEASON_BACKUP_TASK_INTERVAL_SECONDS)).await;
+        }
+        let Some(raw) = seasons_by_id.get(season_id) else {
+            let error = format!("合集 {}（{}）未出现在最新合集列表", season_id, title);
+            update_schedule_status(&mut schedules, *season_id, Some(error.clone()));
+            write_season_backup_schedules(app, &schedules)?;
+            append_toolbox_log(
+                &state,
+                &format!(
+                    "toolbox_bilibili_season_schedule_item_error season_id={} err={}",
+                    season_id, error
+                ),
+            );
+            continue;
+        };
+        match build_season_backup(&state, &auth, raw).await {
+            Ok(backup) => {
+                let mut backups = read_season_backups(app)?;
+                upsert_season_backup(&mut backups, backup.clone(), true);
+                write_season_backups(app, &backups)?;
+                update_schedule_status(&mut schedules, *season_id, None);
+                write_season_backup_schedules(app, &schedules)?;
+                append_toolbox_log(
+                    &state,
+                    &format!(
+                        "toolbox_bilibili_season_schedule_item_ok season_id={} title={} sections={} episodes={}",
+                        season_id, backup.title, backup.section_count, backup.captured_episode_count
+                    ),
+                );
+            }
+            Err(error) => {
+                update_schedule_status(&mut schedules, *season_id, Some(error.clone()));
+                write_season_backup_schedules(app, &schedules)?;
+                append_toolbox_log(
+                    &state,
+                    &format!(
+                        "toolbox_bilibili_season_schedule_item_error season_id={} err={}",
+                        season_id, error
+                    ),
+                );
+            }
+        }
+    }
+    append_toolbox_log(&state, "toolbox_bilibili_season_schedule_done");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3695,6 +4374,79 @@ mod tests {
             ep_count: episodes.len() as i64,
             episodes,
         }
+    }
+
+    fn test_season_backup(backup_id: &str, source_season_id: i64, title: &str) -> SeasonBackup {
+        SeasonBackup {
+            backup_id: backup_id.to_string(),
+            source_season_id,
+            title: title.to_string(),
+            description: String::new(),
+            cover: String::new(),
+            season_price: 0,
+            no_section: Some(1),
+            section_id: 1,
+            section_count: 1,
+            episode_count: 0,
+            captured_episode_count: 0,
+            complete: true,
+            sections: Vec::new(),
+            episodes: Vec::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn scheduled_backup_upsert_updates_existing_backup_and_keeps_id() {
+        let mut backups = vec![test_season_backup("old-id", 861, "旧标题")];
+        let incoming = test_season_backup("new-id", 861, "新标题");
+
+        upsert_season_backup(&mut backups, incoming, true);
+
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].backup_id, "old-id");
+        assert_eq!(backups[0].title, "新标题");
+    }
+
+    #[test]
+    fn season_backup_export_file_round_trips_backup_list() {
+        let file = SeasonBackupExportFile {
+            version: 1,
+            exported_at: "2026-01-01T00:00:00Z".to_string(),
+            backup_count: 1,
+            backups: vec![test_season_backup("backup-id", 861, "测试合集")],
+        };
+        let json_text = serde_json::to_string(&file).expect("serialize export file");
+        let value: Value = serde_json::from_str(&json_text).expect("parse export file");
+        let backups: Vec<SeasonBackup> =
+            serde_json::from_value(value.get("backups").cloned().expect("export backups field"))
+                .expect("deserialize exported backups");
+
+        assert_eq!(file.version, 1);
+        assert_eq!(file.backup_count, backups.len());
+        assert_eq!(backups[0].source_season_id, 861);
+        assert_eq!(backups[0].title, "测试合集");
+    }
+
+    #[test]
+    fn schedule_status_records_failure_and_success() {
+        let mut schedules = vec![SeasonBackupSchedule {
+            season_id: 861,
+            title: "测试合集".to_string(),
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+            last_error: None,
+        }];
+
+        update_schedule_status(&mut schedules, 861, Some("请求失败".to_string()));
+        assert_eq!(schedules[0].last_error.as_deref(), Some("请求失败"));
+        assert!(schedules[0].last_run_at.is_none());
+
+        update_schedule_status(&mut schedules, 861, None);
+        assert!(schedules[0].last_error.is_none());
+        assert!(schedules[0].last_run_at.is_some());
     }
 
     #[test]
@@ -3887,6 +4639,67 @@ mod tests {
     }
 
     #[test]
+    fn video_mask_render_payload_defaults_to_software_encoding() {
+        let payload: VideoMaskRenderPayload = serde_json::from_value(json!({
+            "sourcePath": "/tmp/source.mp4",
+            "targetPath": "/tmp/output.mp4",
+            "segments": []
+        }))
+        .expect("deserialize render payload");
+
+        assert_eq!(payload.encoder_mode, "software");
+    }
+
+    #[test]
+    fn video_mask_software_encoder_preserves_source_codec_family() {
+        let h264 = software_video_encoder("h264", 22, "veryfast");
+        let hevc = software_video_encoder("hevc", 22, "veryfast");
+
+        assert_eq!(h264.name, "libx264");
+        assert_eq!(hevc.name, "libx265");
+        assert_eq!(h264.options, vec!["-preset", "veryfast", "-crf", "22"]);
+        assert!(!h264.hardware);
+        assert!(!hevc.hardware);
+    }
+
+    #[test]
+    fn video_mask_encoder_mode_normalization_is_safe() {
+        assert_eq!(normalize_encoder_mode("hardware"), "hardware");
+        assert_eq!(normalize_encoder_mode("HW"), "hardware");
+        assert_eq!(normalize_encoder_mode("auto"), "auto");
+        assert_eq!(normalize_encoder_mode("unexpected"), "software");
+    }
+
+    #[test]
+    fn videotoolbox_uses_resolution_aware_bitrate() {
+        let high_quality = videotoolbox_bitrate_kbps(1920, 1080, 30.0, 16);
+        let lower_quality = videotoolbox_bitrate_kbps(1920, 1080, 30.0, 30);
+        let four_k = videotoolbox_bitrate_kbps(3840, 2160, 30.0, 16);
+        let options = build_encoder_options("h264_videotoolbox", 16, "veryfast", 1920, 1080, 30.0);
+
+        assert!(high_quality > lower_quality);
+        assert!(four_k > high_quality);
+        assert_eq!(options.first().map(String::as_str), Some("-b:v"));
+        assert!(options
+            .get(1)
+            .and_then(|value| value.strip_suffix('k'))
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|value| value >= high_quality));
+    }
+
+    #[test]
+    fn video_mask_hardware_encoder_candidates_match_platform() {
+        let candidates = hardware_encoder_candidates("h264");
+        if cfg!(target_os = "windows") {
+            assert_eq!(candidates, vec!["h264_nvenc", "h264_qsv", "h264_amf"]);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(candidates, vec!["h264_videotoolbox"]);
+        } else {
+            assert!(candidates.is_empty());
+        }
+    }
+
+    #[test]
     fn toolbox_video_mask_render_outputs_readable_video() {
         let dir = test_dir();
         let (source, mask) = make_test_source(&dir, 8);
@@ -3914,6 +4727,7 @@ mod tests {
             segments,
             crf: Some(24),
             preset: Some("ultrafast".to_string()),
+            encoder_mode: "software".to_string(),
             keyframes,
         })
         .expect("render masked video");
@@ -3965,6 +4779,7 @@ mod tests {
             segments: vec![test_segment(&mask, "a", 1.2, 1.5)],
             crf: Some(24),
             preset: Some("ultrafast".to_string()),
+            encoder_mode: "software".to_string(),
             keyframes: Vec::new(),
         };
         let part = VideoMaskRenderPart {
@@ -4020,6 +4835,7 @@ mod tests {
             segments,
             crf: Some(24),
             preset: Some("ultrafast".to_string()),
+            encoder_mode: "software".to_string(),
             keyframes,
         })
         .expect("render masked video");

@@ -23,25 +23,6 @@ pub fn run_ffmpeg(args: &[String]) -> Result<(), String> {
     Err(format!("FFmpeg failed: {}", stderr.trim()))
 }
 
-pub fn run_ffmpeg_capture(args: &[String]) -> Result<(String, String), String> {
-    let ffmpeg_path = resolve_ffmpeg_path();
-    let mut command = Command::new(ffmpeg_path);
-    apply_no_window(&mut command);
-    let output = command
-        .args(args)
-        .output()
-        .map_err(|err| format!("Failed to start FFmpeg: {}", err))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    if output.status.success() {
-        return Ok((stdout, stderr));
-    }
-
-    Err(format!("FFmpeg failed: {}", stderr.trim()))
-}
-
 pub fn run_ffmpeg_with_progress<F>(
     args: &[String],
     duration_ms: Option<i64>,

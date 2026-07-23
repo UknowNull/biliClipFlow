@@ -31,6 +31,14 @@ const ensureExtension = (path, extension) => {
   return path.toLowerCase().endsWith(`.${extension}`) ? path : `${path}.${extension}`;
 };
 
+const safeJsonFileName = (title) => {
+  const safeTitle = String(title || "bilibili-season-backup")
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .trim()
+    .slice(0, 80) || "bilibili-season-backup";
+  return `${safeTitle}.json`;
+};
+
 const formatDateTime = (value) => {
   if (!value) {
     return "-";
@@ -195,6 +203,9 @@ function RemuxTool() {
 function BilibiliSeasonBackupTool() {
   const [seasons, setSeasons] = useState([]);
   const [backups, setBackups] = useState([]);
+  const [schedules, setSchedules] = useState([]);
+  const [batchExportMode, setBatchExportMode] = useState(false);
+  const [selectedBackupIds, setSelectedBackupIds] = useState([]);
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [operatingId, setOperatingId] = useState("");
@@ -217,14 +228,27 @@ function BilibiliSeasonBackupTool() {
   const loadBackups = async () => {
     try {
       const data = await invokeCommand("toolbox_bilibili_season_backups");
-      setBackups(Array.isArray(data) ? data : []);
+      const nextBackups = Array.isArray(data) ? data : [];
+      setBackups(nextBackups);
+      setSelectedBackupIds((prev) => prev.filter((id) => nextBackups.some((backup) => backup.backupId === id)));
     } catch (error) {
       setMessage(error?.message || "读取本地备份失败");
     }
   };
 
+  const loadSchedules = async () => {
+    try {
+      const data = await invokeCommand("toolbox_bilibili_season_backup_schedules");
+      setSchedules(Array.isArray(data) ? data : []);
+    } catch (error) {
+      setMessage(error?.message || "读取定时备份配置失败");
+    }
+  };
+
   useEffect(() => {
+    loadSeasons();
     loadBackups();
+    loadSchedules();
   }, []);
 
   const handleBackup = async (seasonId) => {
@@ -311,11 +335,130 @@ function BilibiliSeasonBackupTool() {
     }
   };
 
+  const handleSchedule = async (season, enabled) => {
+    const seasonId = Number(season?.seasonId) || 0;
+    if (seasonId <= 0) {
+      return;
+    }
+    setMessage("");
+    setOperatingId(`schedule-${seasonId}`);
+    try {
+      if (enabled) {
+        await invokeCommand("toolbox_bilibili_season_backup_schedule_set", {
+          payload: {
+            seasonId,
+            title: season.title || `合集 ${seasonId}`,
+            enabled: true,
+          },
+        });
+        setMessage(`已设置「${season.title || seasonId}」每天 00:00 自动备份`);
+      } else {
+        await invokeCommand("toolbox_bilibili_season_backup_schedule_delete", {
+          payload: { seasonId },
+        });
+        setMessage(`已取消「${season.title || seasonId}」的定时备份`);
+      }
+      await loadSchedules();
+    } catch (error) {
+      setMessage(error?.message || (enabled ? "设置定时备份失败" : "取消定时备份失败"));
+    } finally {
+      setOperatingId("");
+    }
+  };
+
+  const handleExportBackups = async (backupIds, defaultPath, clearSelection = false) => {
+    setMessage("");
+    setOperatingId("export");
+    let selected;
+    try {
+      selected = await save({
+        title: "导出合集备份 JSON",
+        defaultPath: defaultPath || "bilibili-season-backups.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+    } catch (error) {
+      setOperatingId("");
+      setMessage(error?.message || "打开导出文件对话框失败");
+      return;
+    }
+    if (typeof selected !== "string" || !selected.trim()) {
+      setOperatingId("");
+      return;
+    }
+    try {
+      const result = await invokeCommand("toolbox_bilibili_season_backup_export", {
+        payload: { path: ensureExtension(selected, "json"), backupIds },
+      });
+      setMessage(`已导出 ${result?.backupCount || 0} 个合集备份：${result?.path || selected}`);
+      if (clearSelection) {
+        setSelectedBackupIds([]);
+        setBatchExportMode(false);
+      }
+    } catch (error) {
+      setMessage(error?.message || "导出合集备份失败");
+    } finally {
+      setOperatingId("");
+    }
+  };
+
+  const handleBatchExport = async () => {
+    if (!batchExportMode) {
+      setBatchExportMode(true);
+      setMessage("请选择要导出的本地合集备份");
+      return;
+    }
+    if (selectedBackupIds.length === 0) {
+      setMessage("请至少选择一个本地合集备份");
+      return;
+    }
+    await handleExportBackups(selectedBackupIds, "bilibili-season-backups-selected.json", true);
+  };
+
+  const toggleBackupSelection = (backupId) => {
+    setSelectedBackupIds((prev) => (
+      prev.includes(backupId) ? prev.filter((id) => id !== backupId) : [...prev, backupId]
+    ));
+  };
+
+  const toggleAllBackupSelection = () => {
+    setSelectedBackupIds((prev) => (
+      prev.length === backups.length ? [] : backups.map((backup) => backup.backupId)
+    ));
+  };
+
+  const handleImportBackups = async () => {
+    setMessage("");
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      title: "导入合集备份 JSON",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (typeof selected !== "string" || !selected.trim()) {
+      return;
+    }
+    try {
+      const result = await invokeCommand("toolbox_bilibili_season_backup_import", {
+        payload: { path: selected },
+      });
+      await loadBackups();
+      setMessage(`已导入 ${result?.importedCount || 0} 个合集备份，本地共 ${result?.totalCount || 0} 个`);
+    } catch (error) {
+      setMessage(error?.message || "导入合集备份失败");
+    }
+  };
+
   const backupMap = useMemo(() => {
     const map = new Map();
     backups.forEach((item) => map.set(item.sourceSeasonId, item));
     return map;
   }, [backups]);
+
+  const scheduleMap = useMemo(() => {
+    const map = new Map();
+    schedules.forEach((item) => map.set(item.seasonId, item));
+    return map;
+  }, [schedules]);
 
   const restoreModal = restoreDialog ? createPortal(
     <div className="fixed inset-0 z-[220] flex items-center justify-center bg-black/35 p-4">
@@ -359,7 +502,7 @@ function BilibiliSeasonBackupTool() {
             <div className="desc">查询当前登录账号合集，保存合集信息和接口返回的绑定视频，本地备份不保存 Cookie。</div>
           </div>
           <button className="h-8 px-3 rounded-lg" onClick={loadSeasons} disabled={loading}>
-            {loading ? "查询中..." : "查询当前合集"}
+            {loading ? "查询中..." : "刷新"}
           </button>
         </div>
         {message ? <div className="text-xs text-[var(--desc-color)]">{message}</div> : null}
@@ -379,6 +522,7 @@ function BilibiliSeasonBackupTool() {
               {seasons.length > 0 ? (
                 seasons.map((season) => {
                   const backup = backupMap.get(season.seasonId);
+                  const schedule = scheduleMap.get(season.seasonId);
                   return (
                     <tr key={season.seasonId} className="border-t border-[var(--split-color)]">
                       <td className="px-3 py-2">
@@ -388,11 +532,24 @@ function BilibiliSeasonBackupTool() {
                       <td className="px-3 py-2">{season.seasonId}</td>
                       <td className="px-3 py-2">{seasonStructureText(season.sectionCount, season.episodeCount)}</td>
                       <td className="px-3 py-2">{season.complete ? "是" : "否"}</td>
-                      <td className="px-3 py-2">{backup ? "已备份" : "未备份"}</td>
                       <td className="px-3 py-2">
-                        <button className="h-8 px-3 rounded-lg" onClick={() => handleBackup(season.seasonId)} disabled={Boolean(operatingId)}>
-                          {operatingId === `backup-${season.seasonId}` ? "备份中..." : "备份"}
-                        </button>
+                        <div>{backup ? "已备份" : "未备份"}</div>
+                        {schedule?.enabled ? <div className="text-xs text-[var(--primary-color)]">每日 00:00 自动备份</div> : null}
+                        {schedule?.lastError ? <div className="max-w-[220px] truncate text-xs text-red-500" title={schedule.lastError}>上次失败</div> : null}
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex flex-wrap gap-2">
+                          <button className="h-8 px-3 rounded-lg" onClick={() => handleBackup(season.seasonId)} disabled={Boolean(operatingId)}>
+                            {operatingId === `backup-${season.seasonId}` ? "备份中..." : "备份"}
+                          </button>
+                          <button
+                            className={`h-8 rounded-lg px-3 ${schedule?.enabled ? "border border-[var(--split-color)] bg-[var(--solid-button-color)]" : "bg-[var(--primary-color)] text-white"}`}
+                            onClick={() => handleSchedule(season, !schedule?.enabled)}
+                            disabled={Boolean(operatingId)}
+                          >
+                            {operatingId === `schedule-${season.seasonId}` ? "处理中..." : schedule?.enabled ? "取消定时" : "定时备份"}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -400,7 +557,7 @@ function BilibiliSeasonBackupTool() {
               ) : (
                 <tr>
                   <td className="px-3 py-6 text-center text-[var(--desc-color)]" colSpan={6}>
-                    点击“查询当前合集”加载列表
+                    点击“刷新”加载列表
                   </td>
                 </tr>
               )}
@@ -410,13 +567,47 @@ function BilibiliSeasonBackupTool() {
       </div>
 
       <div className="panel p-4 space-y-3">
-        <div className="text-sm font-semibold">本地备份</div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm font-semibold">本地备份</div>
+          <div className="flex flex-wrap gap-2">
+            <button className="h-8 px-3 rounded-lg border border-[var(--split-color)] bg-[var(--solid-button-color)]" onClick={handleImportBackups} disabled={Boolean(operatingId)}>
+              导入
+            </button>
+            <button className="h-8 px-3 rounded-lg" onClick={handleBatchExport} disabled={Boolean(operatingId) || backups.length === 0}>
+              {batchExportMode ? `导出已选 (${selectedBackupIds.length})` : "批量导出"}
+            </button>
+            {batchExportMode ? (
+              <button className="h-8 px-3 rounded-lg border border-[var(--split-color)] bg-[var(--solid-button-color)]" onClick={() => { setBatchExportMode(false); setSelectedBackupIds([]); }} disabled={Boolean(operatingId)}>
+                取消
+              </button>
+            ) : null}
+          </div>
+        </div>
+        {batchExportMode ? (
+          <div className="flex items-center gap-3 text-xs text-[var(--desc-color)]">
+            <button className="underline" onClick={toggleAllBackupSelection} disabled={Boolean(operatingId)}>
+              {selectedBackupIds.length === backups.length ? "取消全选" : "全选"}
+            </button>
+            <span>已选择 {selectedBackupIds.length} / {backups.length}</span>
+          </div>
+        ) : null}
         <div className="space-y-2">
           {backups.length > 0 ? (
             backups.map((backup) => (
               <div key={backup.backupId} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--split-color)] p-3">
                 <div className="min-w-0">
-                  <div className="font-medium">{backup.title}</div>
+                  <div className="flex items-center gap-2">
+                    {batchExportMode ? (
+                      <input
+                        type="checkbox"
+                        checked={selectedBackupIds.includes(backup.backupId)}
+                        onChange={() => toggleBackupSelection(backup.backupId)}
+                        disabled={Boolean(operatingId)}
+                        aria-label={`选择 ${backup.title} 导出`}
+                      />
+                    ) : null}
+                    <div className="font-medium">{backup.title}</div>
+                  </div>
                   <div className="text-xs text-[var(--desc-color)]">
                     原合集ID {backup.sourceSeasonId} · {seasonStructureText(backupSectionCount(backup), backupEpisodeCount(backup))} · {backup.complete ? "完整" : "不完整"} · {formatDateTime(backup.createdAt)}
                   </div>
@@ -424,6 +615,9 @@ function BilibiliSeasonBackupTool() {
                 <div className="flex items-center gap-2">
                   <button className="h-8 px-3 rounded-lg" onClick={() => openRestoreDialog(backup)} disabled={Boolean(operatingId) || !backup.complete}>
                     {operatingId === `restore-${backup.backupId}` ? "恢复中..." : "恢复"}
+                  </button>
+                  <button className="h-8 rounded-lg border border-[var(--split-color)] bg-[var(--solid-button-color)] px-3" onClick={() => handleExportBackups([backup.backupId], safeJsonFileName(backup.title))} disabled={Boolean(operatingId)}>
+                    {operatingId === "export" ? "导出中..." : "导出"}
                   </button>
                   <button className="h-8 rounded-lg bg-red-500 px-3 text-white hover:bg-red-600 disabled:opacity-60" onClick={() => handleDeleteBackup(backup)} disabled={Boolean(operatingId)}>
                     {operatingId === `delete-${backup.backupId}` ? "删除中..." : "删除"}
