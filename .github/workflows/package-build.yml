@@ -74,10 +74,6 @@ jobs:
           node scripts/bump-version.mjs -- "$version"
           Write-Host "Version synced from tag: $rawTag -> $version"
 
-      - name: Install WiX
-        if: matrix.os == 'windows-latest'
-        run: choco install -y wixtoolset
-
       - name: Install deps
         run: pnpm install
 
@@ -91,11 +87,16 @@ jobs:
 
       - name: Build bundles (Windows)
         if: matrix.os == 'windows-latest'
-        run: pnpm exec tauri build --config src-tauri/tauri.windows.conf.json --bundles nsis,msi
+        run: pnpm exec tauri build --config src-tauri/tauri.windows.conf.json --bundles nsis
 
       - name: Build bundles (macOS)
         if: matrix.os == 'macos-latest'
         run: pnpm exec tauri build --config src-tauri/tauri.macos.conf.json --bundles dmg
+
+      - name: Add macOS installation instructions
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: cp "packaging/macos/安装须知.txt" "src-tauri/target/release/bundle/dmg/安装须知.txt"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -103,8 +104,8 @@ jobs:
           name: "biliClipFlow-${{ matrix.os }}-${{ runner.arch }}"
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/dmg/安装须知.txt
 
   release:
     runs-on: ubuntu-latest

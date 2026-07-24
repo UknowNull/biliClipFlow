@@ -40,7 +40,11 @@ jobs:
         run: pnpm install
       - name: Build DMG
         run: pnpm tauri build --bundles dmg
+      - name: Add installation instructions
+        run: cp "packaging/macos/安装须知.txt" "src-tauri/target/release/bundle/dmg/安装须知.txt"
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: src-tauri/target/release/bundle/dmg/*.dmg
+          files: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/dmg/安装须知.txt
