@@ -1,5 +1,20 @@
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS video_mask_project (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  source_path TEXT,
+  duration REAL NOT NULL DEFAULT 0,
+  editor_state_json TEXT NOT NULL DEFAULT '{}',
+  revision INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_opened_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_mask_project_updated_at
+  ON video_mask_project (updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS anchor (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   uid TEXT NOT NULL UNIQUE,

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { confirm as dialogConfirm, open, save } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../lib/tauri";
-import VideoMaskWorkspace from "./toolbox/VideoMaskTool";
+import VideoMaskWorkspace from "./toolbox/VideoMaskProjectTool";
 
 const toolboxTabs = [
   { key: "remux", label: "格式转码" },

@@ -10,3 +10,4 @@ pub mod settings;
 pub mod submission;
 pub mod toolbox;
 pub mod video;
+pub mod video_mask_project;

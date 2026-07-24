@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../../lib/tauri";
 
@@ -10,7 +12,6 @@ const TIMELINE_LANE_HEIGHT = 56;
 const TIMELINE_LANE_GAP = 8;
 const TIMELINE_PADDING_Y = 12;
 const TIMELINE_SNAP_PIXELS = 12;
-const VIDEO_MASK_DRAFT_STORAGE_KEY = "biliClipFlow.videoMask.lastDraft";
 const VIDEO_MASK_RENDER_PROGRESS_EVENT = "toolbox://video-mask-render-progress";
 const VIDEO_MASK_DEFAULT_CRF = 16;
 
@@ -30,7 +31,214 @@ const fileSrcFromPath = (path) => {
 
 const resourceImageSrc = (resource) => resource?.imageSrc || fileSrcFromPath(resource?.path);
 
-const segmentImageSrc = (segment) => segment?.imageSrc || fileSrcFromPath(segment?.imagePath);
+const segmentImageSrc = (segment) =>
+  segment?.imageSrc || fileSrcFromPath(segment?.imagePreviewPath || segment?.imagePath);
+
+const createDefaultSourceInfo = () => ({
+  duration: 0,
+  width: 0,
+  height: 0,
+  fps: 30,
+  videoCodec: "",
+  audioStreams: 0,
+  subtitleStreams: 0,
+  chapterCount: 0,
+  colorSpace: "",
+  colorTransfer: "",
+  colorPrimaries: "",
+  keyframes: [],
+});
+
+const hydrateResources = (resources) =>
+  (Array.isArray(resources) ? resources : []).map((resource) => ({
+    ...resource,
+    imageSrc: fileSrcFromPath(resource.previewPath || resource.path),
+  }));
+
+const hydrateSegments = (segments) =>
+  (Array.isArray(segments) ? segments : []).map((segment) => ({
+    ...segment,
+    imageSrc: fileSrcFromPath(segment.imagePreviewPath || segment.imagePath),
+  }));
+
+const serializeResources = (resources) =>
+  resources.map(({ imageSrc, ...resource }) => ({
+    ...resource,
+    previewPath: resource.previewPath || "",
+    previewError: resource.previewError || "",
+  }));
+
+const serializeSegments = (segments) =>
+  segments.map(({ imageSrc, ...segment }) => segment);
+
+const useProjectAutosave = (project, snapshot, onProjectSaved) => {
+  const [saveStatus, setSaveStatus] = useState("saved");
+  const [saveError, setSaveError] = useState("");
+  const mountedRef = useRef(true);
+  const initializedRef = useRef(false);
+  const controllerRef = useRef({
+    revision: Number(project.revision) || 0,
+    pending: null,
+    inFlight: null,
+    timer: null,
+    lastSavedJson: "",
+  });
+  const snapshotJson = useMemo(() => JSON.stringify(snapshot), [snapshot]);
+
+  const runSave = useCallback(() => {
+    const controller = controllerRef.current;
+    if (controller.timer) {
+      window.clearTimeout(controller.timer);
+      controller.timer = null;
+    }
+    if (controller.inFlight) {
+      return controller.inFlight;
+    }
+    if (!controller.pending) {
+      return Promise.resolve(true);
+    }
+
+    controller.inFlight = (async () => {
+      let activeItem = null;
+      try {
+        while (controller.pending) {
+          activeItem = controller.pending;
+          controller.pending = null;
+          if (activeItem.json === controller.lastSavedJson) {
+            continue;
+          }
+          if (mountedRef.current) {
+            setSaveStatus("saving");
+            setSaveError("");
+          }
+          const result = await invokeCommand("toolbox_video_mask_project_save", {
+            payload: {
+              projectId: project.id,
+              revision: controller.revision,
+              editorState: activeItem.snapshot,
+              sourcePath: activeItem.snapshot.sourcePath || null,
+              duration: Number(activeItem.snapshot.sourceInfo?.duration) || 0,
+            },
+          });
+          controller.revision = Number(result?.revision) || controller.revision + 1;
+          controller.lastSavedJson = activeItem.json;
+          onProjectSaved?.(result);
+        }
+        if (mountedRef.current) {
+          setSaveStatus("saved");
+        }
+        return true;
+      } catch (error) {
+        if (!controller.pending && activeItem) {
+          controller.pending = activeItem;
+        }
+        if (mountedRef.current) {
+          setSaveStatus("error");
+          setSaveError(error?.message || "自动保存失败");
+        }
+        return false;
+      } finally {
+        controller.inFlight = null;
+      }
+    })();
+    return controller.inFlight;
+  }, [onProjectSaved, project.id]);
+
+  useEffect(() => {
+    const controller = controllerRef.current;
+    if (!initializedRef.current) {
+      initializedRef.current = true;
+      controller.lastSavedJson = snapshotJson;
+      return undefined;
+    }
+    if (snapshotJson === controller.lastSavedJson) {
+      controller.pending = null;
+      if (controller.timer) {
+        window.clearTimeout(controller.timer);
+        controller.timer = null;
+      }
+      setSaveStatus("saved");
+      return undefined;
+    }
+    controller.pending = { snapshot, json: snapshotJson };
+    setSaveStatus("dirty");
+    setSaveError("");
+    if (controller.timer) {
+      window.clearTimeout(controller.timer);
+    }
+    controller.timer = window.setTimeout(() => {
+      controller.timer = null;
+      void runSave();
+    }, 300);
+    return () => {
+      if (controller.timer) {
+        window.clearTimeout(controller.timer);
+        controller.timer = null;
+      }
+    };
+  }, [runSave, snapshot, snapshotJson]);
+
+  useEffect(() => {
+    const flushAfterPointerEdit = () => {
+      if (controllerRef.current.pending) {
+        void runSave();
+      }
+    };
+    window.addEventListener("pointerup", flushAfterPointerEdit);
+    window.addEventListener("pointercancel", flushAfterPointerEdit);
+    return () => {
+      window.removeEventListener("pointerup", flushAfterPointerEdit);
+      window.removeEventListener("pointercancel", flushAfterPointerEdit);
+    };
+  }, [runSave]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    let closing = false;
+    getCurrentWindow().onCloseRequested(async (event) => {
+      const controller = controllerRef.current;
+      if (!controller.pending && !controller.inFlight) {
+        return;
+      }
+      event.preventDefault();
+      if (closing) {
+        return;
+      }
+      closing = true;
+      const saved = await runSave();
+      if (saved) {
+        await getCurrentWindow().destroy();
+      } else {
+        closing = false;
+      }
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => {
+      // 浏览器预览环境没有原生窗口事件时忽略。
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [runSave]);
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+    void runSave();
+  }, [runSave]);
+
+  return {
+    saveStatus,
+    saveError,
+    flush: runSave,
+    retry: runSave,
+  };
+};
 
 const logVideoMaskClient = (message) => {
   invokeCommand("auth_client_log", { message: `video_mask:${message}` }).catch(() => {});
@@ -79,6 +287,7 @@ const createSegment = (index, startTime, duration, resource = null) => {
     label: imageName || `遮罩 ${index + 1}`,
     enabled: true,
     imagePath: resource?.path || "",
+    imagePreviewPath: resource?.previewPath || "",
     imageSrc: resourceImageSrc(resource),
     imageName,
     startTime: safeStart,
@@ -133,7 +342,10 @@ const percentToTimelineSpan = (duration, minSpan, percent) => {
   return clamp(minSpan * Math.pow(duration / minSpan, ratio), minSpan, duration);
 };
 
-export default function VideoMaskTool() {
+export default function VideoMaskTool({ project, onBack, onProjectSaved }) {
+  const initialEditorState = project?.editorState && typeof project.editorState === "object"
+    ? project.editorState
+    : {};
   const videoRef = useRef(null);
   const previewRef = useRef(null);
   const timelineRef = useRef(null);
@@ -145,31 +357,32 @@ export default function VideoMaskTool() {
   const importSeqRef = useRef(0);
   const previewFrameSeqRef = useRef(0);
   const previewFrameTimerRef = useRef(null);
-  const [sourcePath, setSourcePath] = useState("");
-  const [targetPath, setTargetPath] = useState("");
-  const [message, setMessage] = useState("");
-  const [sourceInfo, setSourceInfo] = useState({
-    duration: 0,
-    width: 0,
-    height: 0,
-    fps: 30,
-    videoCodec: "",
-    audioStreams: 0,
-    subtitleStreams: 0,
-    chapterCount: 0,
-    colorSpace: "",
-    colorTransfer: "",
-    colorPrimaries: "",
-    keyframes: [],
-  });
-  const [segments, setSegments] = useState([]);
-  const [resources, setResources] = useState([]);
-  const [selectedId, setSelectedId] = useState("");
-  const [selectedResourceId, setSelectedResourceId] = useState("");
-  const [currentTime, setCurrentTime] = useState(0);
-  const [timelineStart, setTimelineStart] = useState(0);
-  const [timelineZoomPercent, setTimelineZoomPercent] = useState(100);
-  const [hardwareAcceleration, setHardwareAcceleration] = useState(false);
+  const nativeDropHandlerRef = useRef(null);
+  const windowScaleFactorRef = useRef(1);
+  const [sourcePath, setSourcePath] = useState(() => String(initialEditorState.sourcePath || project?.sourcePath || ""));
+  const [targetPath, setTargetPath] = useState(() => String(initialEditorState.targetPath || ""));
+  const [message, setMessage] = useState(() => (
+    project?.sourcePath && project?.sourceExists === false
+      ? "源视频已移动或删除，请重新关联视频；已有图片和时间轴不会被清空"
+      : ""
+  ));
+  const [sourceInfo, setSourceInfo] = useState(() => ({
+    ...createDefaultSourceInfo(),
+    ...(initialEditorState.sourceInfo || {}),
+    keyframes: Array.isArray(initialEditorState.sourceInfo?.keyframes)
+      ? initialEditorState.sourceInfo.keyframes
+      : [],
+  }));
+  const [segments, setSegments] = useState(() => hydrateSegments(initialEditorState.segments));
+  const [resources, setResources] = useState(() => hydrateResources(initialEditorState.resources));
+  const [selectedId, setSelectedId] = useState(() => String(initialEditorState.selectedId || ""));
+  const [selectedResourceId, setSelectedResourceId] = useState(() => String(initialEditorState.selectedResourceId || ""));
+  const [currentTime, setCurrentTime] = useState(() => Math.max(0, Number(initialEditorState.currentTime) || 0));
+  const [timelineStart, setTimelineStart] = useState(() => Math.max(0, Number(initialEditorState.timelineStart) || 0));
+  const [timelineZoomPercent, setTimelineZoomPercent] = useState(() => clamp(Number(initialEditorState.timelineZoomPercent) || 100, 1, 100));
+  const [hardwareAcceleration, setHardwareAcceleration] = useState(() => Boolean(initialEditorState.hardwareAcceleration));
+  const [sourceMissing, setSourceMissing] = useState(() => Boolean(project?.sourcePath && project?.sourceExists === false));
+  const [nativeDragOver, setNativeDragOver] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [plan, setPlan] = useState(null);
   const [renderResult, setRenderResult] = useState(null);
@@ -230,9 +443,56 @@ export default function VideoMaskTool() {
       (previewSegments.length > 0 && !playing),
   );
   const showVideoElement = Boolean(videoSrc && (!useDomPreview || !videoPreviewReady || playing));
+  const editorStateSnapshot = useMemo(() => ({
+    version: 1,
+    sourcePath,
+    targetPath,
+    sourceInfo,
+    segments: serializeSegments(segments),
+    resources: serializeResources(resources),
+    selectedId,
+    selectedResourceId,
+    currentTime,
+    timelineStart,
+    timelineZoomPercent,
+    hardwareAcceleration,
+  }), [
+    currentTime,
+    hardwareAcceleration,
+    resources,
+    segments,
+    selectedId,
+    selectedResourceId,
+    sourceInfo,
+    sourcePath,
+    targetPath,
+    timelineStart,
+    timelineZoomPercent,
+  ]);
+  const { saveStatus, saveError, flush: flushProjectSave, retry: retryProjectSave } = useProjectAutosave(
+    project,
+    editorStateSnapshot,
+    onProjectSaved,
+  );
+  const saveStatusText = saveStatus === "saving"
+    ? "保存中"
+    : saveStatus === "dirty"
+      ? "等待保存"
+      : saveStatus === "error"
+        ? "保存失败"
+        : "已保存";
   const markDirty = () => {
     setPlan(null);
     setRenderResult(null);
+  };
+
+  const handleBackToProjects = async () => {
+    const saved = await flushProjectSave();
+    if (!saved) {
+      setMessage(saveError || "项目保存失败，请重试后返回");
+      return;
+    }
+    await onBack?.();
   };
 
   const focusTimeline = (time) => {
@@ -679,6 +939,13 @@ export default function VideoMaskTool() {
     }, delay);
   };
 
+  useEffect(() => {
+    if (sourcePath && !sourceMissing) {
+      schedulePreviewFrame(currentTime, sourcePath, 0);
+    }
+    // 项目组件按项目 ID 重建，只需在首次打开时恢复当前画面。
+  }, []);
+
   const handlePickVideo = async () => {
     setMessage("");
     const selected = await open({
@@ -690,42 +957,41 @@ export default function VideoMaskTool() {
     if (typeof selected !== "string") {
       return;
     }
+    const relinkingSource = sourceMissing && segments.length > 0;
     const importSeq = importSeqRef.current + 1;
     importSeqRef.current = importSeq;
     setLoadingProbe(true);
     setLoadingKeyframes(false);
     setLoadingPreviewFrame(false);
     setSourcePath(selected);
-    setTargetPath(buildDefaultTarget(selected));
+    setSourceMissing(false);
+    if (!relinkingSource) {
+      setTargetPath(buildDefaultTarget(selected));
+    }
     setRenderResult(null);
     setPlan(null);
     setPreviewFrameSrc("");
     setRenderProgress(null);
     setVideoPreviewReady(false);
     setVideoPreviewFailed(false);
-    setCurrentTime(0);
-    setTimelineStart(0);
-    setTimelineZoomPercent(100);
+    if (!relinkingSource) {
+      setCurrentTime(0);
+      setTimelineStart(0);
+      setTimelineZoomPercent(100);
+    }
     setPlaying(false);
-    setSegments([]);
+    if (!relinkingSource) {
+      setSegments([]);
+    }
     setImageLoadErrors({});
-    setSelectedId("");
-    setSourceInfo({
-      duration: 0,
-      width: 0,
-      height: 0,
-      fps: 30,
-      videoCodec: "",
-      audioStreams: 0,
-      subtitleStreams: 0,
-      chapterCount: 0,
-      colorSpace: "",
-      colorTransfer: "",
-      colorPrimaries: "",
-      keyframes: [],
-    });
-    setMessage("视频已导入，正在读取基础信息");
-    schedulePreviewFrame(0, selected, 0);
+    if (!relinkingSource) {
+      setSelectedId("");
+      setSourceInfo(createDefaultSourceInfo());
+    } else {
+      setSourceInfo((prev) => ({ ...prev, keyframes: [] }));
+    }
+    setMessage(relinkingSource ? "源视频已重新关联，正在校验视频信息" : "视频已导入，正在读取基础信息");
+    schedulePreviewFrame(relinkingSource ? currentTime : 0, selected, 0);
     try {
       const info = await invokeCommand("toolbox_video_mask_probe", {
         payload: { sourcePath: selected },
@@ -813,7 +1079,7 @@ export default function VideoMaskTool() {
     }
   };
 
-  const buildImageResource = async (path) => {
+  const buildImageResource = async (path, details = {}) => {
     try {
       const result = await invokeCommand("toolbox_video_mask_image_preview", {
         payload: {
@@ -826,11 +1092,11 @@ export default function VideoMaskTool() {
         `image_preview_ok name=${fileNameFromPath(path)} previewPath=${previewPath || "-"} imageSrcLen=${imageSrc.length}`,
       );
       return {
-        id: `resource-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        id: details.id || `resource-${Date.now()}-${Math.random().toString(16).slice(2)}`,
         path,
         previewPath,
         imageSrc,
-        name: fileNameFromPath(path),
+        name: details.name || fileNameFromPath(path),
         previewError: "",
       };
     } catch (error) {
@@ -839,14 +1105,36 @@ export default function VideoMaskTool() {
         `image_preview_err name=${fileNameFromPath(path)} err=${error?.message || "unknown"} fallbackSrcLen=${fallbackSrc.length}`,
       );
       return {
-        id: `resource-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        id: details.id || `resource-${Date.now()}-${Math.random().toString(16).slice(2)}`,
         path,
         previewPath: "",
         imageSrc: fallbackSrc,
-        name: fileNameFromPath(path),
+        name: details.name || fileNameFromPath(path),
         previewError: error?.message || "遮罩图片预览生成失败",
       };
     }
+  };
+
+  const importProjectResources = async (paths) => {
+    const assets = await invokeCommand("toolbox_video_mask_project_asset_import", {
+      payload: {
+        projectId: project.id,
+        paths,
+      },
+    });
+    const imported = await Promise.all(
+      (Array.isArray(assets) ? assets : []).map((asset) =>
+        buildImageResource(asset.managedPath, {
+          id: `resource-${asset.id}`,
+          name: asset.originalName,
+        }),
+      ),
+    );
+    setResources((prev) => {
+      const exists = new Set(prev.map((item) => item.path));
+      return [...prev, ...imported.filter((resource) => !exists.has(resource.path))];
+    });
+    return imported;
   };
 
   const handleImportResources = async () => {
@@ -861,24 +1149,17 @@ export default function VideoMaskTool() {
     if (paths.length === 0) {
       return;
     }
-    const imported = await Promise.all(paths.map((path) => buildImageResource(path)));
-    setResources((prev) => {
-      const exists = new Set(prev.map((item) => item.path));
-      const next = [...prev];
-      for (const resource of imported) {
-        if (!exists.has(resource.path)) {
-          next.push(resource);
-          exists.add(resource.path);
-        }
-      }
-      return next;
-    });
-    const failedCount = imported.filter((item) => item.previewError).length;
-    setMessage(
-      failedCount > 0
-        ? `已导入 ${paths.length} 个图片资源，其中 ${failedCount} 个预览地址生成失败，已尝试使用本地路径兜底`
-        : `已导入 ${paths.length} 个图片资源，可拖到预览区或时间轴使用`,
-    );
+    try {
+      const imported = await importProjectResources(paths);
+      const failedCount = imported.filter((item) => item.previewError).length;
+      setMessage(
+        failedCount > 0
+          ? `已导入 ${imported.length} 个图片资源，其中 ${failedCount} 个预览地址生成失败，已尝试使用项目图片兜底`
+          : `已导入 ${imported.length} 个图片资源，可拖到预览区或时间轴使用`,
+      );
+    } catch (error) {
+      setMessage(error?.message || "导入图片资源失败");
+    }
   };
 
   const resourceFromDragEvent = (event) => {
@@ -955,6 +1236,93 @@ export default function VideoMaskTool() {
       height: baseHeight,
     });
   };
+
+  nativeDropHandlerRef.current = async (payload) => {
+    const position = payload?.position;
+    if (!position) {
+      setNativeDragOver(false);
+      return;
+    }
+    if (payload.type === "enter" || payload.type === "drop") {
+      try {
+        windowScaleFactorRef.current = await getCurrentWindow().scaleFactor();
+      } catch {
+        // 使用上一次读取到的缩放比例。
+      }
+    }
+    const logicalPosition = typeof position.toLogical === "function"
+      ? position.toLogical(windowScaleFactorRef.current || 1)
+      : {
+          x: Number(position.x) / (windowScaleFactorRef.current || 1),
+          y: Number(position.y) / (windowScaleFactorRef.current || 1),
+        };
+    const point = {
+      clientX: Number(logicalPosition.x) || 0,
+      clientY: Number(logicalPosition.y) || 0,
+    };
+    const previewRect = previewRef.current?.getBoundingClientRect();
+    const insidePreview = Boolean(
+      previewRect &&
+      point.clientX >= previewRect.left &&
+      point.clientX <= previewRect.right &&
+      point.clientY >= previewRect.top &&
+      point.clientY <= previewRect.bottom
+    );
+
+    if (payload.type === "enter" || payload.type === "over") {
+      setNativeDragOver(insidePreview);
+      return;
+    }
+    setNativeDragOver(false);
+    if (payload.type !== "drop" || !insidePreview) {
+      return;
+    }
+    if (!sourcePath || duration <= 0) {
+      setMessage("请先导入视频，再把图片拖入播放预览");
+      return;
+    }
+    const paths = Array.isArray(payload.paths) ? payload.paths : [];
+    if (paths.length === 0) {
+      return;
+    }
+    try {
+      const imported = await importProjectResources(paths);
+      imported.forEach((resource, index) => {
+        addResourceToPreview(resource, {
+          clientX: point.clientX + index * 12,
+          clientY: point.clientY + index * 12,
+        });
+      });
+      setMessage(`已从文件夹导入 ${imported.length} 张图片并加入时间轴`);
+    } catch (error) {
+      setMessage(error?.message || "从文件夹导入图片失败");
+    }
+  };
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    const register = async () => {
+      try {
+        windowScaleFactorRef.current = await getCurrentWindow().scaleFactor();
+        const dispose = await getCurrentWebview().onDragDropEvent((event) => {
+          void nativeDropHandlerRef.current?.(event.payload);
+        });
+        if (disposed) {
+          dispose();
+        } else {
+          unlisten = dispose;
+        }
+      } catch (error) {
+        logVideoMaskClient(`native_drop_register_error message=${error?.message || error}`);
+      }
+    };
+    void register();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   const startResourceDrag = (resource, event) => {
     if (event.button !== 0) {
@@ -1139,32 +1507,6 @@ export default function VideoMaskTool() {
       codecStrategy: "source",
     },
   });
-
-  const serializeResources = () =>
-    resources.map((resource) => ({
-      id: resource.id,
-      path: resource.path,
-      name: resource.name,
-      previewError: resource.previewError || "",
-    }));
-
-  useEffect(() => {
-    if (!sourcePath && segments.length === 0 && resources.length === 0) {
-      return;
-    }
-    try {
-      localStorage.setItem(
-        VIDEO_MASK_DRAFT_STORAGE_KEY,
-        JSON.stringify({
-          savedAt: new Date().toISOString(),
-          payload: buildPayload(),
-          resources: serializeResources(),
-        }),
-      );
-    } catch {
-      // localStorage 不可用时忽略，避免影响遮罩编辑。
-    }
-  }, [sourcePath, targetPath, sourceInfo, segments, resources, hardwareAcceleration]);
 
   const handleBuildPlan = async () => {
     setMessage("");
@@ -1361,9 +1703,27 @@ export default function VideoMaskTool() {
 
       <div className="panel p-4 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="space-y-1">
-            <div className="text-lg font-semibold">视频遮罩</div>
-            <div className="desc">导入长视频和图片资源后，将图片拖到时间轴生成遮罩片段，导出时仅对命中的片段重编码。</div>
+          <div className="flex min-w-0 items-center gap-3">
+            <button
+              className="h-8 shrink-0 rounded-lg border border-[var(--split-color)] bg-[var(--solid-button-color)] px-3"
+              onClick={() => void handleBackToProjects()}
+              disabled={saveStatus === "saving"}
+            >
+              返回项目
+            </button>
+            <div className="min-w-0 space-y-1">
+              <div className="truncate text-lg font-semibold" title={project.name}>{project.name}</div>
+              <div className="flex items-center gap-2 text-xs text-[var(--desc-color)]">
+                <span>视频遮罩</span>
+                {saveStatus === "error" ? (
+                  <button className="text-red-500 underline" onClick={() => void retryProjectSave()} title={saveError}>
+                    {saveStatusText}
+                  </button>
+                ) : (
+                  <span>{saveStatusText}</span>
+                )}
+              </div>
+            </div>
           </div>
           <div className="flex flex-wrap gap-2">
             {selectedSegment ? (
@@ -1397,7 +1757,7 @@ export default function VideoMaskTool() {
               <span className="whitespace-nowrap">硬件加速</span>
             </label>
             <button className="h-8 px-3 rounded-lg" onClick={handlePickVideo} disabled={loadingProbe}>
-              {loadingProbe ? "读取中..." : "导入视频"}
+              {loadingProbe ? "读取中..." : sourceMissing ? "重新关联视频" : "导入视频"}
             </button>
             <button className="h-8 px-3 rounded-lg" onClick={handleRender} disabled={!sourcePath || !targetPath || rendering}>
               {rendering ? "导出中..." : "合并导出"}
@@ -1444,7 +1804,7 @@ export default function VideoMaskTool() {
               </div>
               <div
                 ref={previewRef}
-                className="relative isolate overflow-hidden rounded-lg bg-black"
+                className={`relative isolate overflow-hidden rounded-lg bg-black ${nativeDragOver ? "ring-2 ring-[var(--primary-color)]" : ""}`}
                 style={{ aspectRatio: previewRatio, minHeight: "min(64vh, 680px)" }}
                 onDragOver={(event) => {
                   if (sourcePath && duration > 0) {
@@ -1574,6 +1934,7 @@ export default function VideoMaskTool() {
                             width: `${100 / cropWidth}%`,
                             height: `${100 / cropHeight}%`,
                             opacity: segment.opacity,
+                            visibility: "visible",
                           };
                           return (
                             <div
@@ -1648,7 +2009,7 @@ export default function VideoMaskTool() {
                                       );
                                     }
                                   }
-                                  event.currentTarget.style.visibility = canvasPainted ? "hidden" : "visible";
+                                  event.currentTarget.style.visibility = "visible";
                                   logVideoMaskClient(
                                     `preview_img_load id=${segment.id} name=${segment.imageName || segment.label || "-"} srcLen=${imageSrc.length} current=${currentTime.toFixed(3)} range=${Number(segment.startTime || 0).toFixed(3)}-${Number(segment.endTime || 0).toFixed(3)} box=${Math.round(boxRect?.width || 0)}x${Math.round(boxRect?.height || 0)}@${Math.round(boxRect?.left || 0)},${Math.round(boxRect?.top || 0)} img=${Math.round(imageRect.width)}x${Math.round(imageRect.height)} natural=${event.currentTarget.naturalWidth}x${event.currentTarget.naturalHeight} scale=${previewMetrics.scale.toFixed(4)} videoHidden=${useDomPreview ? 1 : 0} canvas=${canvasPainted ? 1 : 0}`,
                                   );
