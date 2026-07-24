@@ -1,0 +1,11 @@
+macOS 安装须知
+
+将 biliClipFlow.app 拖入“应用程序”文件夹后，如果系统提示应用无法打开，请打开“终端”并执行：
+
+xattr -dr com.apple.quarantine "/Applications/biliClipFlow.app"
+
+执行完成后，重新打开 biliClipFlow。
+
+如果提示权限不足，请执行：
+
+sudo xattr -dr com.apple.quarantine "/Applications/biliClipFlow.app"
