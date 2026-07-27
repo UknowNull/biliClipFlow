@@ -1964,7 +1964,14 @@ where
         &mut on_progress,
     )
     .and_then(|part_paths| {
-        concat_video_mask_parts(&payload, &plan, &temp_dir, &part_paths, &mut on_progress)
+        concat_video_mask_parts(
+            &payload,
+            &plan,
+            fps,
+            &temp_dir,
+            &part_paths,
+            &mut on_progress,
+        )
     });
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -2542,6 +2549,7 @@ fn build_overlay_filter(part: &VideoMaskRenderPart, width: i64, height: i64) -> 
 fn concat_video_mask_parts<F>(
     payload: &VideoMaskRenderPayload,
     plan: &VideoMaskRenderPlan,
+    fps: f64,
     temp_dir: &Path,
     part_paths: &[PathBuf],
     on_progress: &mut F,
@@ -2600,7 +2608,7 @@ where
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&list_path, list_text).map_err(|err| format!("写入拼接清单失败: {}", err))?;
-    let args = vec![
+    let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
@@ -2625,10 +2633,18 @@ where
         format_seconds(payload.duration),
         "-c".to_string(),
         "copy".to_string(),
+    ];
+    if let Some(filter) = video_mask_timestamp_filter(fps) {
+        // concat 可能保留分段内部错误的包时间戳。按帧序号重建视频时间戳只修改
+        // MP4 封装信息，不重新编码码流，也不影响音频、字幕和章节的直拷贝。
+        args.push("-bsf:v:0".to_string());
+        args.push(filter);
+    }
+    args.extend([
         "-movflags".to_string(),
         "+faststart".to_string(),
         payload.target_path.clone(),
-    ];
+    ]);
     let args = ffmpeg_args_with_progress(args);
     run_ffmpeg_with_progress(
         &args,
@@ -2761,6 +2777,16 @@ fn format_fps(value: f64) -> String {
     } else {
         "30".to_string()
     }
+}
+
+fn video_mask_timestamp_filter(fps: f64) -> Option<String> {
+    if !fps.is_finite() || fps <= 0.0 {
+        return None;
+    }
+    let fps = format_fps(fps);
+    Some(format!(
+        "setts=dts=STARTDTS+N/({fps}*TB):pts=STARTDTS+N/({fps}*TB)+(PTS-DTS):duration=1/({fps}*TB)"
+    ))
 }
 
 fn load_active_auth(state: &State<'_, AppState>) -> Result<AuthInfo, String> {
@@ -4323,6 +4349,45 @@ mod tests {
             .unwrap_or(0.0)
     }
 
+    fn assert_video_packet_timestamps_are_continuous(path: &str, fps: f64) {
+        let value = run_ffprobe_json(&[
+            "-v".to_string(),
+            "quiet".to_string(),
+            "-select_streams".to_string(),
+            "v:0".to_string(),
+            "-show_packets".to_string(),
+            "-show_entries".to_string(),
+            "packet=dts_time".to_string(),
+            "-print_format".to_string(),
+            "json".to_string(),
+            path.to_string(),
+        ])
+        .expect("probe video packet timestamps");
+        let timestamps = value
+            .get("packets")
+            .and_then(|item| item.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|packet| packet.get("dts_time"))
+            .filter_map(|item| item.as_str())
+            .filter_map(|text| text.parse::<f64>().ok())
+            .collect::<Vec<_>>();
+        assert!(timestamps.len() > 1, "输出视频缺少可验证的 DTS");
+
+        let max_delta = 2.0 / fps + 0.001;
+        for (index, pair) in timestamps.windows(2).enumerate() {
+            let delta = pair[1] - pair[0];
+            assert!(
+                delta > 0.0 && delta <= max_delta,
+                "视频包时间戳跳变: packet={} previous={} current={} delta={}",
+                index + 1,
+                pair[0],
+                pair[1],
+                delta
+            );
+        }
+    }
+
     fn test_segment(mask: &Path, id: &str, start: f64, end: f64) -> VideoMaskSegmentPayload {
         VideoMaskSegmentPayload {
             id: id.to_string(),
@@ -4668,6 +4733,18 @@ mod tests {
     }
 
     #[test]
+    fn video_mask_timestamp_filter_rebuilds_cfr_timestamps_without_reencoding() {
+        assert_eq!(
+            video_mask_timestamp_filter(60.0).as_deref(),
+            Some(
+                "setts=dts=STARTDTS+N/(60.000*TB):pts=STARTDTS+N/(60.000*TB)+(PTS-DTS):duration=1/(60.000*TB)"
+            )
+        );
+        assert_eq!(video_mask_timestamp_filter(0.0), None);
+        assert_eq!(video_mask_timestamp_filter(f64::NAN), None);
+    }
+
+    #[test]
     fn videotoolbox_uses_resolution_aware_bitrate() {
         let high_quality = videotoolbox_bitrate_kbps(1920, 1080, 30.0, 16);
         let lower_quality = videotoolbox_bitrate_kbps(1920, 1080, 30.0, 30);
@@ -4738,6 +4815,7 @@ mod tests {
         assert!(output_probe.audio_streams >= 1);
         assert!(result.encode_duration > 0.0);
         assert!(result.copy_duration > 0.0);
+        assert_video_packet_timestamps_are_continuous(&result.output_path, probe.fps);
 
         // 视频流本身不能被中途截断：输出视频流时长须与源视频流时长基本一致。
         // 时间基不一致导致的 Non-monotonic DTS 截断只体现在视频流时长上，format 时长会被完整音频掩盖。
@@ -4841,6 +4919,7 @@ mod tests {
         assert!((output_probe.duration - probe.duration).abs() < 0.5);
         assert!(result.encode_duration >= 5.0);
         assert!(result.copy_duration > 0.0);
+        assert_video_packet_timestamps_are_continuous(&result.output_path, probe.fps);
 
         let source_video_duration = video_stream_duration(&source.to_string_lossy());
         let output_video_duration = video_stream_duration(&result.output_path);
