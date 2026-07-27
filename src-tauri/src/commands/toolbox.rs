@@ -719,6 +719,14 @@ pub async fn toolbox_video_mask_render(
     if !Path::new(source).is_file() {
         return Ok(ApiResponse::error("视频文件不存在"));
     }
+    let source_path = Path::new(source);
+    let target_path = Path::new(target);
+    if target_path.is_dir() {
+        return Ok(ApiResponse::error("输出路径不能是目录"));
+    }
+    if paths_point_to_same_file(source_path, target_path) {
+        return Ok(ApiResponse::error("输出路径不能和源视频相同"));
+    }
     for segment in payload.segments.iter().filter(|item| item.enabled) {
         if !Path::new(segment.image_path.trim()).is_file() {
             return Ok(ApiResponse::error(format!(
@@ -727,7 +735,7 @@ pub async fn toolbox_video_mask_render(
             )));
         }
     }
-    if let Some(parent) = Path::new(target).parent() {
+    if let Some(parent) = target_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
             return Ok(ApiResponse::error(format!("创建输出目录失败: {}", err)));
         }
@@ -1360,7 +1368,8 @@ fn probe_video_mask_source(source: &str) -> Result<VideoMaskProbeResult, String>
         "-show_chapters".to_string(),
         source.to_string(),
     ];
-    let value = run_ffprobe_json(&args)?;
+    let value =
+        run_ffprobe_json(&args).map_err(|err| video_mask_source_probe_error(source, &err))?;
     let base = parse_video_probe(&value);
     let mut fps = 0.0;
     let mut video_codec = String::new();
@@ -1414,6 +1423,17 @@ fn probe_video_mask_source(source: &str) -> Result<VideoMaskProbeResult, String>
         color_primaries,
         keyframes: Vec::new(),
     })
+}
+
+fn video_mask_source_probe_error(source: &str, err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("moov atom not found") || lower.contains("invalid data found") {
+        return format!(
+            "当前源视频不可读取，可能是上次导出失败留下的不完整 MP4，请重新选择原始源视频: {}",
+            source
+        );
+    }
+    format!("读取源视频信息失败: {}", err)
 }
 
 /// 读取源视频第一路视频流的 timescale（time_base 分母，如 16000）。
@@ -2557,6 +2577,8 @@ fn concat_video_mask_parts<F>(
 where
     F: FnMut(VideoMaskRenderProgress),
 {
+    let target_path = Path::new(&payload.target_path);
+    let final_output_path = temp_dir.join("final_output.mp4");
     if plan.parts.len() == 1 && plan.parts[0].kind == "copy" {
         emit_video_mask_render_progress(
             &payload.render_id,
@@ -2569,7 +2591,7 @@ where
         );
         let args = ffmpeg_args_with_progress(copy_part_args(
             &payload.source_path,
-            Path::new(&payload.target_path),
+            &final_output_path,
             0.0,
             plan.parts[0].duration,
         ));
@@ -2588,7 +2610,7 @@ where
                 );
             },
         )?;
-        let size = output_size(&payload.target_path)?;
+        let size = replace_file_with_rendered_output(&final_output_path, target_path)?;
         emit_video_mask_render_progress(
             &payload.render_id,
             100,
@@ -2643,7 +2665,7 @@ where
     args.extend([
         "-movflags".to_string(),
         "+faststart".to_string(),
-        payload.target_path.clone(),
+        final_output_path.to_string_lossy().into_owned(),
     ]);
     let args = ffmpeg_args_with_progress(args);
     run_ffmpeg_with_progress(
@@ -2661,7 +2683,7 @@ where
             );
         },
     )?;
-    let size = output_size(&payload.target_path)?;
+    let size = replace_file_with_rendered_output(&final_output_path, target_path)?;
     emit_video_mask_render_progress(
         &payload.render_id,
         100,
@@ -2674,10 +2696,57 @@ where
     Ok(size)
 }
 
-fn output_size(path: &str) -> Result<u64, String> {
-    fs::metadata(path)
+fn paths_point_to_same_file(source: &Path, target: &Path) -> bool {
+    if let (Ok(source), Ok(target)) = (fs::canonicalize(source), fs::canonicalize(target)) {
+        return source == target;
+    }
+    source == target
+}
+
+fn replace_file_with_rendered_output(
+    rendered_path: &Path,
+    target_path: &Path,
+) -> Result<u64, String> {
+    let size = fs::metadata(rendered_path)
         .map(|item| item.len())
-        .map_err(|err| format!("读取输出文件失败: {}", err))
+        .map_err(|err| format!("读取临时输出文件失败: {}", err))?;
+    if size == 0 {
+        return Err("临时输出文件为空".to_string());
+    }
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("创建输出目录失败: {}", err))?;
+    }
+
+    if !target_path.exists() {
+        fs::rename(rendered_path, target_path)
+            .map_err(|err| format!("写入输出文件失败: {}", err))?;
+        return Ok(size);
+    }
+    if target_path.is_dir() {
+        return Err("输出路径不能是目录".to_string());
+    }
+
+    let file_name = target_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output.mp4");
+    let backup_path = target_path.with_file_name(format!(
+        ".{}.bili-mask-replace-{}",
+        file_name,
+        Uuid::new_v4()
+    ));
+    fs::rename(target_path, &backup_path)
+        .map_err(|err| format!("准备替换旧输出文件失败: {}", err))?;
+    match fs::rename(rendered_path, target_path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup_path);
+            Ok(size)
+        }
+        Err(err) => {
+            let _ = fs::rename(&backup_path, target_path);
+            Err(format!("替换输出文件失败: {}", err))
+        }
+    }
 }
 
 fn normalized_render_id(value: &str) -> String {
@@ -4742,6 +4811,34 @@ mod tests {
         );
         assert_eq!(video_mask_timestamp_filter(0.0), None);
         assert_eq!(video_mask_timestamp_filter(f64::NAN), None);
+    }
+
+    #[test]
+    fn rendered_output_replaces_existing_target_after_success() {
+        let dir = test_dir();
+        let target = dir.join("masked.mp4");
+        let rendered = dir.join("rendered.tmp.mp4");
+        fs::write(&target, b"broken-old-output").expect("write old target");
+        fs::write(&rendered, b"valid-new-output").expect("write rendered output");
+
+        let size =
+            replace_file_with_rendered_output(&rendered, &target).expect("replace rendered output");
+
+        assert_eq!(size, 16);
+        assert_eq!(fs::read(&target).expect("read target"), b"valid-new-output");
+        assert!(!rendered.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn video_mask_probe_moov_error_mentions_source_reselection() {
+        let message = video_mask_source_probe_error(
+            "/tmp/broken_masked.mp4",
+            "FFmpeg failed: moov atom not found Invalid data found when processing input",
+        );
+
+        assert!(message.contains("当前源视频不可读取"));
+        assert!(message.contains("重新选择原始源视频"));
     }
 
     #[test]

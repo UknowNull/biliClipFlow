@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../../lib/tauri";
 import VideoMaskTool from "./VideoMaskTool";
 
@@ -40,6 +41,18 @@ const formatDuration = (seconds) => {
 const projectSourceName = (path) => {
   const normalized = String(path || "").replace(/\\/g, "/");
   return normalized.split("/").filter(Boolean).pop() || "尚未导入视频";
+};
+
+const sanitizeProjectFileName = (name) => {
+  const cleaned = String(name || "视频遮罩项目")
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .trim();
+  return cleaned || "视频遮罩项目";
+};
+
+const ensureZipExtension = (path) => {
+  const value = String(path || "").trim();
+  return value.toLowerCase().endsWith(".zip") ? value : `${value}.zip`;
 };
 
 export default function VideoMaskProjectTool() {
@@ -166,6 +179,63 @@ export default function VideoMaskProjectTool() {
     }
   };
 
+  const handleExportProject = async (project) => {
+    setMessage("");
+    setOperatingId(`export-${project.id}`);
+    try {
+      const selected = await save({
+        title: "导出视频遮罩项目包",
+        filters: [{ name: "视频遮罩项目包", extensions: ["zip"] }],
+        defaultPath: `${sanitizeProjectFileName(project.name)}.mask-project.zip`,
+      });
+      if (typeof selected !== "string") {
+        return;
+      }
+      const targetPath = ensureZipExtension(selected);
+      const result = await invokeCommand("toolbox_video_mask_project_export", {
+        payload: {
+          projectId: project.id,
+          targetPath,
+        },
+      });
+      setMessage(
+        `已导出项目包：${result?.path || targetPath}；图片 ${result?.imageCount ?? 0} 个${
+          result?.outputIncluded ? "，已包含导出视频" : ""
+        }`,
+      );
+    } catch (error) {
+      setMessage(error?.message || "导出项目失败");
+    } finally {
+      setOperatingId("");
+    }
+  };
+
+  const handleImportProject = async () => {
+    setMessage("");
+    setOperatingId("import");
+    try {
+      const selected = await open({
+        multiple: false,
+        directory: false,
+        title: "导入视频遮罩项目包",
+        filters: [{ name: "视频遮罩项目包", extensions: ["zip"] }],
+      });
+      if (typeof selected !== "string") {
+        return;
+      }
+      const project = await invokeCommand("toolbox_video_mask_project_import", {
+        payload: { archivePath: selected },
+      });
+      await loadProjects();
+      setActiveProject(project);
+      rememberActiveProjectId(project.id);
+    } catch (error) {
+      setMessage(error?.message || "导入项目失败");
+    } finally {
+      setOperatingId("");
+    }
+  };
+
   const handleProjectSaved = useCallback((saved) => {
     setActiveProject((prev) => (prev ? { ...prev, revision: saved.revision, updatedAt: saved.updatedAt } : prev));
   }, []);
@@ -216,8 +286,15 @@ export default function VideoMaskProjectTool() {
           <button className="h-9 rounded-lg px-4" onClick={handleCreate} disabled={Boolean(operatingId)}>
             {operatingId === "create" ? "创建中..." : "新建项目"}
           </button>
+          <button
+            className="h-9 rounded-lg border border-[var(--split-color)] bg-[var(--card-bg)] px-4"
+            onClick={() => void handleImportProject()}
+            disabled={Boolean(operatingId)}
+          >
+            {operatingId === "import" ? "导入中..." : "导入项目"}
+          </button>
         </div>
-        {message ? <div className="text-xs text-red-500">{message}</div> : null}
+        {message ? <div className="text-xs text-[var(--desc-color)]">{message}</div> : null}
       </div>
 
       <div className="panel p-4 space-y-3">
@@ -284,6 +361,13 @@ export default function VideoMaskProjectTool() {
                       重命名
                     </button>
                   )}
+                  <button
+                    className="h-8 rounded-lg border border-[var(--split-color)] bg-[var(--card-bg)] px-3"
+                    onClick={() => void handleExportProject(project)}
+                    disabled={Boolean(operatingId)}
+                  >
+                    {operatingId === `export-${project.id}` ? "导出中..." : "导出"}
+                  </button>
                   <button className="h-8 rounded-lg bg-red-500 px-3 text-white hover:bg-red-600 disabled:opacity-60" onClick={() => void handleDelete(project)} disabled={Boolean(operatingId)}>
                     {operatingId === `delete-${project.id}` ? "删除中..." : "删除"}
                   </button>

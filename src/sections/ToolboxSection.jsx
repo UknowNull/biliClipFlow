@@ -82,6 +82,25 @@ const backupPublishedAtCount = (backup) => {
   return episodes.filter((episode) => Number.isFinite(Number(episode?.publishedAt))).length;
 };
 
+const backupSectionsForPreview = (backup) => {
+  const sections = Array.isArray(backup?.sections) ? backup.sections : [];
+  if (sections.length > 0) {
+    return sections
+      .map((section, index) => ({ section, index }))
+      .sort((left, right) => {
+        const leftOrder = Number(left.section?.order) || left.index + 1;
+        const rightOrder = Number(right.section?.order) || right.index + 1;
+        return leftOrder - rightOrder || left.index - right.index;
+      })
+      .map(({ section }) => section);
+  }
+  const episodes = Array.isArray(backup?.episodes) ? backup.episodes : [];
+  return episodes.length > 0 ? [{ sectionId: backup?.sectionId, title: "正片", order: 1, episodes }] : [];
+};
+
+const backupEpisodeTitle = (episode, index) =>
+  episode?.title || episode?.archiveTitle || episode?.videoTitle || episode?.bvid || `视频 ${index + 1}`;
+
 const seasonStructureText = (sectionCount, episodeCount) =>
   `${Number(sectionCount) || 0} 个子合集 / ${Number(episodeCount) || 0} 个视频`;
 
@@ -211,6 +230,7 @@ function BilibiliSeasonBackupTool() {
   const [operatingId, setOperatingId] = useState("");
   const [restoreDialog, setRestoreDialog] = useState(null);
   const [restoreSortMode, setRestoreSortMode] = useState("backup");
+  const [previewDialog, setPreviewDialog] = useState(null);
 
   const loadSeasons = async () => {
     setMessage("");
@@ -460,6 +480,96 @@ function BilibiliSeasonBackupTool() {
     return map;
   }, [schedules]);
 
+  useEffect(() => {
+    if (!previewDialog) {
+      return undefined;
+    }
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setPreviewDialog(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [previewDialog]);
+
+  const previewSections = useMemo(() => backupSectionsForPreview(previewDialog), [previewDialog]);
+
+  const previewModal = previewDialog ? createPortal(
+    <div
+      className="fixed inset-0 z-[220] flex items-center justify-center bg-black/35 p-4"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          setPreviewDialog(null);
+        }
+      }}
+    >
+      <div
+        className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-[var(--split-color)] bg-[var(--solid-block-color)] text-[var(--content-color)] shadow-xl"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="season-backup-preview-title"
+      >
+        <div className="flex shrink-0 items-start justify-between gap-3 border-b border-[var(--split-color)] px-4 py-3">
+          <div className="min-w-0">
+            <div id="season-backup-preview-title" className="text-base font-semibold">备份预览</div>
+            <div className="mt-1 text-xs text-[var(--desc-color)]">
+              {seasonStructureText(previewSections.length, backupEpisodeCount(previewDialog))} · {formatDateTime(previewDialog.createdAt)}
+            </div>
+          </div>
+          <button
+            className="h-8 w-8 shrink-0 rounded-lg border border-[var(--split-color)] bg-[var(--solid-button-color)] text-lg leading-none"
+            onClick={() => setPreviewDialog(null)}
+            aria-label="关闭备份预览"
+            title="关闭"
+          >
+            ×
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          <details open className="border-l-2 border-[var(--primary-color)] pl-3">
+            <summary className="cursor-pointer select-none py-1 font-semibold">
+              合集：{previewDialog.title || "未命名合集"}
+            </summary>
+            <div className="mt-2 space-y-2 pl-3">
+              {previewSections.length > 0 ? previewSections.map((section, sectionIndex) => {
+                const episodes = Array.isArray(section?.episodes) ? section.episodes : [];
+                return (
+                  <details key={`${section?.sectionId || "section"}-${sectionIndex}`} open className="border-l border-[var(--split-color)] pl-3">
+                    <summary className="cursor-pointer select-none py-1 text-sm font-medium">
+                      子合集：{section?.title || `子合集 ${sectionIndex + 1}`}
+                      <span className="ml-2 text-xs font-normal text-[var(--desc-color)]">{episodes.length} 个视频</span>
+                    </summary>
+                    <div className="ml-1 mt-1 border-l border-[var(--split-color)] py-1 pl-4">
+                      {episodes.length > 0 ? episodes.map((episode, episodeIndex) => (
+                        <div
+                          key={`${episode?.episodeId || episode?.aid || "episode"}-${episodeIndex}`}
+                          className="relative py-1.5 pl-3 text-sm before:absolute before:left-[-1rem] before:top-1/2 before:w-3 before:border-t before:border-[var(--split-color)]"
+                          title={backupEpisodeTitle(episode, episodeIndex)}
+                        >
+                          <span className="mr-2 text-xs text-[var(--desc-color)]">{episodeIndex + 1}.</span>
+                          {backupEpisodeTitle(episode, episodeIndex)}
+                        </div>
+                      )) : (
+                        <div className="py-2 text-xs text-[var(--desc-color)]">暂无绑定视频</div>
+                      )}
+                    </div>
+                  </details>
+                );
+              }) : (
+                <div className="py-3 text-sm text-[var(--desc-color)]">该备份没有子合集或绑定视频</div>
+              )}
+            </div>
+          </details>
+        </div>
+        <div className="flex shrink-0 justify-end border-t border-[var(--split-color)] px-4 py-3">
+          <button className="h-8 rounded-lg px-3" onClick={() => setPreviewDialog(null)}>关闭</button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  ) : null;
+
   const restoreModal = restoreDialog ? createPortal(
     <div className="fixed inset-0 z-[220] flex items-center justify-center bg-black/35 p-4">
       <div className="w-full max-w-md rounded-lg border border-[var(--split-color)] bg-[var(--solid-block-color)] p-4 text-[var(--content-color)] shadow-xl">
@@ -612,7 +722,10 @@ function BilibiliSeasonBackupTool() {
                     原合集ID {backup.sourceSeasonId} · {seasonStructureText(backupSectionCount(backup), backupEpisodeCount(backup))} · {backup.complete ? "完整" : "不完整"} · {formatDateTime(backup.createdAt)}
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <button className="h-8 rounded-lg border border-[var(--split-color)] bg-[var(--solid-button-color)] px-3" onClick={() => setPreviewDialog(backup)} disabled={Boolean(operatingId)}>
+                    预览
+                  </button>
                   <button className="h-8 px-3 rounded-lg" onClick={() => openRestoreDialog(backup)} disabled={Boolean(operatingId) || !backup.complete}>
                     {operatingId === `restore-${backup.backupId}` ? "恢复中..." : "恢复"}
                   </button>
@@ -630,6 +743,7 @@ function BilibiliSeasonBackupTool() {
           )}
         </div>
       </div>
+      {previewModal}
       {restoreModal}
     </div>
   );

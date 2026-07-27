@@ -272,6 +272,8 @@ pub fn run() {
             commands::video_mask_project::toolbox_video_mask_project_rename,
             commands::video_mask_project::toolbox_video_mask_project_delete,
             commands::video_mask_project::toolbox_video_mask_project_asset_import,
+            commands::video_mask_project::toolbox_video_mask_project_export,
+            commands::video_mask_project::toolbox_video_mask_project_import,
             commands::toolbox::toolbox_bilibili_season_list,
             commands::toolbox::toolbox_bilibili_season_backups,
             commands::toolbox::toolbox_bilibili_season_backup_schedules,
