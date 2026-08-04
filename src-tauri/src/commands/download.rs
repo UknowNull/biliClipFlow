@@ -176,6 +176,7 @@ pub struct SubmissionRequest {
     pub activity_title: Option<String>,
     pub video_type: String,
     pub collection_id: Option<i64>,
+    pub collection_section_id: Option<i64>,
     pub segment_prefix: Option<String>,
     pub priority: Option<bool>,
     pub baidu_sync_enabled: Option<bool>,
@@ -1489,8 +1490,8 @@ async fn handle_integration_download(
       None
     };
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, priority, priority_at, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+      "INSERT INTO submission_task (task_id, status, priority, priority_at, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, collection_section_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
       params![
         &submission_id,
         if immediate_submit { "PENDING" } else { "PENDING_SUBMIT" },
@@ -1505,6 +1506,7 @@ async fn handle_integration_download(
         submission.activity_title.as_deref(),
         submission.video_type,
         submission.collection_id,
+        submission.collection_section_id,
         &now,
         &now,
         bilibili_uid,

@@ -32,6 +32,28 @@ const defaultWorkflowConfig = {
 const buildMergeGroupId = () =>
   `group_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
 
+const buildCollectionTreeValue = (collectionId, sectionId) => {
+  const normalizedCollectionId = String(collectionId || "").trim();
+  if (!normalizedCollectionId) {
+    return "";
+  }
+  const normalizedSectionId = String(sectionId || "").trim();
+  return normalizedSectionId
+    ? `section:${normalizedCollectionId}:${normalizedSectionId}`
+    : `collection:${normalizedCollectionId}`;
+};
+
+const parseCollectionTreeValue = (rawValue) => {
+  const [type, collectionId = "", sectionId = ""] = String(rawValue || "").split(":");
+  if (!collectionId || !["collection", "section"].includes(type)) {
+    return { collectionId: "", collectionSectionId: "" };
+  }
+  return {
+    collectionId,
+    collectionSectionId: type === "section" ? sectionId : "",
+  };
+};
+
 // 提交时的上传分P标题:仅 CUSTOM 且非空才下发,AUTO 交后端按最终顺序生成 P{index}。
 const resolveSubmittedUploadPartTitle = (item) => {
   if ((item?.uploadPartTitleMode || "AUTO") !== "CUSTOM") {
@@ -262,6 +284,7 @@ export default function DownloadSection({
     partitionId: "",
     videoType: "ORIGINAL",
     collectionId: "",
+    collectionSectionId: "",
     activityTopicId: "",
     activityMissionId: "",
     activityTitle: "",
@@ -531,6 +554,17 @@ export default function DownloadSection({
   const partitionSelectValue = resolvePartitionSelectValue(
     submissionConfig.partitionId,
   );
+  const collectionTreeValue = buildCollectionTreeValue(
+    submissionConfig.collectionId,
+    submissionConfig.collectionSectionId,
+  );
+  const handleCollectionTreeChange = (rawValue) => {
+    const selection = parseCollectionTreeValue(rawValue);
+    setSubmissionConfig((prev) => ({
+      ...prev,
+      ...selection,
+    }));
+  };
   const activitySelectOptions = (() => {
     const currentId = Number(submissionConfig.activityTopicId || 0);
     if (!currentId) {
@@ -667,6 +701,44 @@ export default function DownloadSection({
 
   useEffect(() => {
     if (!integrationEnabled) {
+      return;
+    }
+    const currentCollectionId = String(submissionConfig.collectionId || "").trim();
+    if (!currentCollectionId) {
+      if (submissionConfig.collectionSectionId) {
+        setSubmissionConfig((prev) => ({ ...prev, collectionSectionId: "" }));
+      }
+      return;
+    }
+    const collection = collections.find(
+      (item) => String(item.seasonId) === currentCollectionId,
+    );
+    if (!collection) {
+      setSubmissionConfig((prev) => ({
+        ...prev,
+        collectionId: "",
+        collectionSectionId: "",
+      }));
+      return;
+    }
+    const currentSectionId = String(submissionConfig.collectionSectionId || "").trim();
+    if (
+      currentSectionId &&
+      !(collection.sections || []).some(
+        (section) => String(section.sectionId) === currentSectionId,
+      )
+    ) {
+      setSubmissionConfig((prev) => ({ ...prev, collectionSectionId: "" }));
+    }
+  }, [
+    integrationEnabled,
+    collections,
+    submissionConfig.collectionId,
+    submissionConfig.collectionSectionId,
+  ]);
+
+  useEffect(() => {
+    if (!integrationEnabled) {
       setActivityOptions([]);
       setActivityMessage("");
       return;
@@ -773,6 +845,10 @@ export default function DownloadSection({
       const mapped = (data || []).map((item) => ({
         ...item,
         seasonId: item.season_id ?? item.seasonId,
+        sections: (Array.isArray(item.sections) ? item.sections : []).map((section) => ({
+          ...section,
+          sectionId: section.section_id ?? section.sectionId,
+        })),
       }));
       setCollections(mapped);
     } catch (error) {
@@ -1483,6 +1559,9 @@ export default function DownloadSection({
       description: task.description || "",
       partitionId: task.partitionId ? String(task.partitionId) : prev.partitionId,
       collectionId: task.collectionId ? String(task.collectionId) : "",
+      collectionSectionId: task.collectionSectionId
+        ? String(task.collectionSectionId)
+        : "",
       activityTopicId: task.topicId ? String(task.topicId) : "",
       activityMissionId: task.missionId ? String(task.missionId) : "",
       activityTitle: task.activityTitle || "",
@@ -2379,6 +2458,9 @@ export default function DownloadSection({
           collectionId: submissionConfig.collectionId
             ? Number(submissionConfig.collectionId)
             : null,
+          collectionSectionId: submissionConfig.collectionSectionId
+            ? Number(submissionConfig.collectionSectionId)
+            : null,
           segmentPrefix: submissionConfig.segmentPrefix || null,
           immediateSubmit: Boolean(submissionConfig.immediateSubmit),
           priority: Boolean(submissionConfig.priority),
@@ -3072,21 +3154,30 @@ export default function DownloadSection({
                         ))}
                       </select>
                       <select
-                        value={submissionConfig.collectionId}
-                        onChange={(event) =>
-                          setSubmissionConfig((prev) => ({
-                            ...prev,
-                            collectionId: event.target.value,
-                          }))
-                        }
+                        value={collectionTreeValue}
+                        onChange={(event) => handleCollectionTreeChange(event.target.value)}
                         className="w-full"
                       >
                         <option value="">合集（可选）</option>
-                        {collections.map((collection) => (
-                          <option key={collection.seasonId} value={collection.seasonId}>
+                        {collections.flatMap((collection) => [
+                          <option
+                            key={`collection-${collection.seasonId}`}
+                            value={buildCollectionTreeValue(collection.seasonId)}
+                          >
                             {collection.name}
-                          </option>
-                        ))}
+                          </option>,
+                          ...(collection.sections || []).map((section) => (
+                            <option
+                              key={`section-${collection.seasonId}-${section.sectionId}`}
+                              value={buildCollectionTreeValue(
+                                collection.seasonId,
+                                section.sectionId,
+                              )}
+                            >
+                              {`　└ ${section.title || `子合集${section.sectionId}`}`}
+                            </option>
+                          )),
+                        ])}
                       </select>
                       <select
                         value={submissionConfig.videoType}

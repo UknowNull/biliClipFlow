@@ -5,7 +5,7 @@
   "identifier": "com.tbw.biliclipflow",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:5176",
+    "devUrl": "http://127.0.0.1:5176",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },

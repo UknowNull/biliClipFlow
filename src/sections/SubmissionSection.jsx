@@ -33,10 +33,42 @@ const statusFilters = [
   { value: "RUNNING", label: "处理中" },
   { value: "WAITING_UPLOAD", label: "投稿队列中" },
   { value: "UPLOADING", label: "投稿中" },
+  { value: "VERIFY_PENDING", label: "待远端校验" },
+  { value: "SUBMIT_UNKNOWN", label: "提交结果待确认" },
   { value: "COMPLETED", label: "已完成" },
   { value: "FAILED", label: "失败" },
   { value: "CANCELLED", label: "已取消" },
 ];
+
+const submissionNeedsRemoteVerification = (task) => {
+  const status = String(task?.status || "").trim();
+  if (["VERIFY_PENDING", "SUBMIT_UNKNOWN"].includes(status)) {
+    return true;
+  }
+  if (status !== "FAILED") {
+    return false;
+  }
+  const error = String(task?.workflowStatus?.errorMessage || "");
+  if (error.includes("SUBMIT_RESULT_UNKNOWN:") || error.includes("SUBMISSION_CREATED:")) {
+    return true;
+  }
+  return (
+    Boolean(String(task?.bvid || "").trim()) &&
+    (error.includes("code: -702") ||
+      error.includes("请求频率过高") ||
+      error.includes("请求过于频繁") ||
+      error.includes("远程分P数量与本地不一致"))
+  );
+};
+
+const canConfirmRemoteMissing = (task) => {
+  if (!submissionNeedsRemoteVerification(task) || String(task?.bvid || "").trim()) {
+    return false;
+  }
+  const status = String(task?.status || "").trim();
+  const error = String(task?.workflowStatus?.errorMessage || "");
+  return status === "SUBMIT_UNKNOWN" || error.includes("SUBMIT_RESULT_UNKNOWN:");
+};
 
 const sourceFilters = [
   { value: "NORMAL", label: "其他投稿" },
@@ -47,6 +79,28 @@ const buildSourceId = () =>
   `source_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
 const buildMergeGroupId = () =>
   `group_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+
+const buildCollectionTreeValue = (collectionId, sectionId) => {
+  const normalizedCollectionId = String(collectionId || "").trim();
+  if (!normalizedCollectionId) {
+    return "";
+  }
+  const normalizedSectionId = String(sectionId || "").trim();
+  return normalizedSectionId
+    ? `section:${normalizedCollectionId}:${normalizedSectionId}`
+    : `collection:${normalizedCollectionId}`;
+};
+
+const parseCollectionTreeValue = (rawValue) => {
+  const [type, collectionId = "", sectionId = ""] = String(rawValue || "").split(":");
+  if (!collectionId || !["collection", "section"].includes(type)) {
+    return { collectionId: "", collectionSectionId: "" };
+  }
+  return {
+    collectionId,
+    collectionSectionId: type === "section" ? sectionId : "",
+  };
+};
 
 const emptySource = (index) => ({
   localId: buildSourceId(),
@@ -275,6 +329,7 @@ export default function SubmissionSection({
     coverDataUrl: "",
     partitionId: "",
     collectionId: "",
+    collectionSectionId: "",
     activityTopicId: "",
     activityMissionId: "",
     activityTitle: "",
@@ -327,6 +382,7 @@ export default function SubmissionSection({
   const [sourceFilter, setSourceFilter] = useState("NORMAL");
   const [message, setMessage] = useState("");
   const [refreshingRemote, setRefreshingRemote] = useState(false);
+  const [verifyingRemoteTaskId, setVerifyingRemoteTaskId] = useState("");
   const [submissionView, setSubmissionView] = useState("list");
   const [remoteImportDialogOpen, setRemoteImportDialogOpen] = useState(false);
   const [remoteImportInput, setRemoteImportInput] = useState("");
@@ -675,6 +731,7 @@ export default function SubmissionSection({
       coverDataUrl: "",
       partitionId: "",
       collectionId: "",
+      collectionSectionId: "",
       activityTopicId: "",
       activityMissionId: "",
       activityTitle: "",
@@ -1126,6 +1183,10 @@ export default function SubmissionSection({
     if (!targetId) {
       return;
     }
+    if (submissionNeedsRemoteVerification(task)) {
+      setMessage("远端提交结果尚未确认，请先校验远端状态，避免重复投稿");
+      return;
+    }
     const hasBvid = Boolean(String(task?.bvid || "").trim());
     setMessage("");
     setRepostOpen(true);
@@ -1171,6 +1232,10 @@ export default function SubmissionSection({
   const openTranscodeRepostModal = (task) => {
     const targetId = String(task?.taskId || "").trim();
     if (!targetId) {
+      return;
+    }
+    if (submissionNeedsRemoteVerification(task)) {
+      setMessage("远端提交结果尚未确认，请先校验远端状态，避免重复投稿");
       return;
     }
     const hasBvid = Boolean(String(task?.bvid || "").trim());
@@ -1312,6 +1377,10 @@ export default function SubmissionSection({
       const mapped = (data || []).map((item) => ({
         ...item,
         seasonId: item.season_id ?? item.seasonId,
+        sections: (Array.isArray(item.sections) ? item.sections : []).map((section) => ({
+          ...section,
+          sectionId: section.section_id ?? section.sectionId,
+        })),
       }));
       setCollections(mapped);
       await invokeCommand("auth_client_log", {
@@ -1617,16 +1686,35 @@ export default function SubmissionSection({
     }
     const currentCollectionId = String(taskForm.collectionId || "").trim();
     if (!currentCollectionId) {
+      if (taskForm.collectionSectionId) {
+        setTaskForm((prev) => ({ ...prev, collectionSectionId: "" }));
+      }
       return;
     }
     const exists = collections.some(
       (collection) => String(collection.seasonId) === currentCollectionId,
     );
     if (exists) {
-      return;
+      const currentSectionId = String(taskForm.collectionSectionId || "").trim();
+      if (!currentSectionId) {
+        return;
+      }
+      const collection = collections.find(
+        (item) => String(item.seasonId) === currentCollectionId,
+      );
+      const sectionExists = (collection?.sections || []).some(
+        (section) => String(section.sectionId) === currentSectionId,
+      );
+      if (sectionExists) {
+        return;
+      }
     }
-    setTaskForm((prev) => ({ ...prev, collectionId: "" }));
-  }, [isCreateView, collections, taskForm.collectionId]);
+    setTaskForm((prev) => ({
+      ...prev,
+      collectionId: exists ? prev.collectionId : "",
+      collectionSectionId: "",
+    }));
+  }, [isCreateView, collections, taskForm.collectionId, taskForm.collectionSectionId]);
 
   const loadTasks = async (
     filter = statusFilter,
@@ -3681,6 +3769,26 @@ export default function SubmissionSection({
         const parsed = Number(raw);
         return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
       })();
+      const selectedCollectionSectionId = (() => {
+        if (!selectedCollectionId) {
+          return null;
+        }
+        const raw = String(taskForm.collectionSectionId || "").trim();
+        if (!raw) {
+          return null;
+        }
+        const collection = collections.find(
+          (item) => Number(item.seasonId) === selectedCollectionId,
+        );
+        const exists = (collection?.sections || []).some(
+          (section) => String(section.sectionId) === raw,
+        );
+        if (!exists) {
+          return null;
+        }
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+      })();
       const mergeGroups = buildMergeGroupsPayload(validSources);
       const payload = {
         request: {
@@ -3691,6 +3799,7 @@ export default function SubmissionSection({
             coverDataUrl: taskForm.coverDataUrl || null,
             partitionId: Number(taskForm.partitionId),
             collectionId: selectedCollectionId,
+            collectionSectionId: selectedCollectionSectionId,
             tags: uniqueTags.join(","),
             topicId: taskForm.activityTopicId ? Number(taskForm.activityTopicId) : null,
             missionId: taskForm.activityMissionId ? Number(taskForm.activityMissionId) : null,
@@ -4112,6 +4221,7 @@ export default function SubmissionSection({
     }
     const partitionId = task.partitionId ?? task.partition_id;
     const collectionId = task.collectionId ?? task.collection_id;
+    const collectionSectionId = task.collectionSectionId ?? task.collection_section_id;
     const topicId = task.topicId ?? task.topic_id;
     const missionId = task.missionId ?? task.mission_id;
     const activityTitle = task.activityTitle ?? task.activity_title;
@@ -4133,6 +4243,7 @@ export default function SubmissionSection({
       coverDataUrl: "",
       partitionId: partitionId ? String(partitionId) : "",
       collectionId: collectionId ? String(collectionId) : "",
+      collectionSectionId: collectionSectionId ? String(collectionSectionId) : "",
       activityTopicId: topicId ? String(topicId) : "",
       activityMissionId: missionId ? String(missionId) : "",
       activityTitle: activityTitle || "",
@@ -4172,6 +4283,7 @@ export default function SubmissionSection({
     const task = detail?.task || {};
     const partitionId = task.partitionId ?? task.partition_id;
     const collectionId = task.collectionId ?? task.collection_id;
+    const collectionSectionId = task.collectionSectionId ?? task.collection_section_id;
     const topicId = task.topicId ?? task.topic_id;
     const missionId = task.missionId ?? task.mission_id;
     const activityTitle = task.activityTitle ?? task.activity_title;
@@ -4194,6 +4306,7 @@ export default function SubmissionSection({
       coverDataUrl: "",
       partitionId: partitionId ? String(partitionId) : "",
       collectionId: collectionId ? String(collectionId) : "",
+      collectionSectionId: collectionSectionId ? String(collectionSectionId) : "",
       activityTopicId: topicId ? String(topicId) : "",
       activityMissionId: missionId ? String(missionId) : "",
       activityTitle: activityTitle || "",
@@ -4769,6 +4882,17 @@ export default function SubmissionSection({
       const parsed = Number(raw);
       return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
     })();
+    const selectedCollectionSectionId = (() => {
+      if (!selectedCollectionId) {
+        return null;
+      }
+      const raw = String(taskForm.collectionSectionId ?? "").trim();
+      if (!raw) {
+        return null;
+      }
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    })();
     const taskPayload = needEditSubmit
       ? {
           title: taskForm.title,
@@ -4777,6 +4901,7 @@ export default function SubmissionSection({
           coverDataUrl: taskForm.coverDataUrl || null,
           partitionId: Number(taskForm.partitionId),
           collectionId: selectedCollectionId,
+          collectionSectionId: selectedCollectionSectionId,
           tags: uniqueTags.join(","),
           topicId: taskForm.activityTopicId ? Number(taskForm.activityTopicId) : null,
           missionId: taskForm.activityMissionId ? Number(taskForm.activityMissionId) : null,
@@ -5260,7 +5385,8 @@ export default function SubmissionSection({
       return next;
     });
     try {
-      await invokeCommand("submission_retry_segment_upload", { segmentId: targetId });
+      const result = await invokeCommand("submission_retry_segment_upload", { segmentId: targetId });
+      setMessage(result || "任务已加入投稿队列");
       if (selectedTask?.task?.taskId) {
         const detail = await fetchTaskDetail(selectedTask.task.taskId, { log: false });
         setSelectedTask(detail);
@@ -5737,6 +5863,49 @@ export default function SubmissionSection({
     }
   };
 
+  const handleTaskRemoteVerification = async (task) => {
+    const taskId = String(task?.taskId || "").trim();
+    if (!taskId || verifyingRemoteTaskId) {
+      return;
+    }
+    setVerifyingRemoteTaskId(taskId);
+    setMessage("正在校验当前任务的远端稿件...");
+    try {
+      const result = await invokeCommand("submission_verify_remote", { taskId });
+      setMessage(result || "远端校验完成");
+    } catch (error) {
+      setMessage(`远端校验失败：${error.message}`);
+    } finally {
+      await loadTasks(statusFilter, currentPage, pageSize);
+      setVerifyingRemoteTaskId("");
+    }
+  };
+
+  const handleConfirmRemoteMissing = async (task) => {
+    const taskId = String(task?.taskId || "").trim();
+    if (!taskId || !canConfirmRemoteMissing(task)) {
+      return;
+    }
+    const confirmed = await dialogConfirm(
+      "请先在B站创作中心确认该稿件确实不存在。继续后会清空本次分P上传结果，并立即重新加入投稿队列上传全部分P。",
+      {
+        title: "确认远端未生成",
+        kind: "warning",
+      },
+    );
+    if (!confirmed) {
+      return;
+    }
+    setMessage("");
+    try {
+      const result = await invokeCommand("submission_confirm_remote_missing", { taskId });
+      setMessage(result || "已重新加入投稿队列");
+      await loadTasks(statusFilter, currentPage, pageSize);
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
   const formatTaskStatus = (status) => {
     switch (status) {
       case "PENDING_SUBMIT":
@@ -5757,6 +5926,12 @@ export default function SubmissionSection({
         return "投稿队列中";
       case "UPLOADING":
         return "投稿中";
+      case "VERIFY_PENDING":
+        return "待远端校验";
+      case "SUBMIT_UNKNOWN":
+        return "提交结果待确认";
+      case "REUPLOAD_PENDING":
+        return "待重新上传";
       case "FAILED":
         return "失败";
       case "CANCELLED":
@@ -5774,6 +5949,12 @@ export default function SubmissionSection({
         return "运行中";
       case "VIDEO_DOWNLOADING":
         return "视频下载中";
+      case "VERIFY_PENDING":
+        return "待远端校验";
+      case "SUBMIT_UNKNOWN":
+        return "提交结果待确认";
+      case "REUPLOAD_PENDING":
+        return "待重新上传";
       case "PAUSED":
         return "已暂停";
       case "COMPLETED":
@@ -5791,7 +5972,16 @@ export default function SubmissionSection({
     if (status === "COMPLETED") return "bg-emerald-500/10 text-emerald-600";
     if (status === "FAILED" || status === "CANCELLED")
       return "bg-rose-500/10 text-rose-600";
-    if (["UPLOADING", "WAITING_UPLOAD", "RUNNING"].includes(status)) {
+    if (
+      [
+        "UPLOADING",
+        "WAITING_UPLOAD",
+        "RUNNING",
+        "VERIFY_PENDING",
+        "SUBMIT_UNKNOWN",
+        "REUPLOAD_PENDING",
+      ].includes(status)
+    ) {
       return "bg-amber-500/10 text-amber-600";
     }
     if (["CLIPPING", "MERGING", "SEGMENTING", "PENDING", "PENDING_SUBMIT"].includes(status)) {
@@ -5811,7 +6001,15 @@ export default function SubmissionSection({
     if (status === "COMPLETED") return "bg-emerald-500/10 text-emerald-600";
     if (status === "FAILED" || status === "CANCELLED")
       return "bg-rose-500/10 text-rose-600";
-    if (status === "RUNNING" || status === "VIDEO_DOWNLOADING")
+    if (
+      [
+        "RUNNING",
+        "VIDEO_DOWNLOADING",
+        "VERIFY_PENDING",
+        "SUBMIT_UNKNOWN",
+        "REUPLOAD_PENDING",
+      ].includes(status)
+    )
       return "bg-amber-500/10 text-amber-600";
     if (status === "PAUSED") return "bg-slate-500/10 text-slate-600";
     return "bg-slate-500/10 text-slate-600";
@@ -5902,7 +6100,7 @@ export default function SubmissionSection({
   };
 
   const resolveTaskFailureReason = (task) => {
-    if (task?.status !== "FAILED") {
+    if (!["FAILED", "VERIFY_PENDING", "SUBMIT_UNKNOWN"].includes(task?.status)) {
       return "-";
     }
     const message = String(task?.workflowStatus?.errorMessage || "").trim();
@@ -6149,10 +6347,6 @@ export default function SubmissionSection({
     const fallback = partitions.find((item) => String(item.tid) === String(taskForm.partitionId));
     return fallback?.name || taskForm.partitionId || "-";
   })();
-  const collectionLabel =
-    collections.find((item) => String(item.seasonId) === String(taskForm.collectionId))
-      ?.name ||
-    (taskForm.collectionId ? taskForm.collectionId : "-");
   const videoTypeLabel =
     taskForm.videoType === "REPOST" ? "转载" : taskForm.videoType ? "原创" : "-";
   const detailEstimatedSegments = segmentationEnabled
@@ -6188,6 +6382,51 @@ export default function SubmissionSection({
           },
         ]
       : collections;
+  const selectedCollectionOption = collectionOptions.find(
+    (item) => String(item.seasonId) === String(taskForm.collectionId),
+  );
+  const baseCollectionSectionOptions = selectedCollectionOption?.sections || [];
+  const hasCollectionSectionOption = baseCollectionSectionOptions.some(
+    (section) => String(section.sectionId) === String(taskForm.collectionSectionId),
+  );
+  const collectionSectionOptions =
+    canModifySelectedTask &&
+    taskForm.collectionSectionId &&
+    !hasCollectionSectionOption &&
+    taskForm.collectionId
+      ? [
+          ...baseCollectionSectionOptions,
+          {
+            sectionId: taskForm.collectionSectionId,
+            title: `当前子合集(${taskForm.collectionSectionId})`,
+          },
+        ]
+      : baseCollectionSectionOptions;
+  const selectedCollectionSectionOption = collectionSectionOptions.find(
+    (section) => String(section.sectionId) === String(taskForm.collectionSectionId),
+  );
+  const collectionLabel = selectedCollectionOption?.name
+    ? selectedCollectionSectionOption?.title
+      ? `${selectedCollectionOption.name} / ${selectedCollectionSectionOption.title}`
+      : selectedCollectionOption.name
+    : taskForm.collectionId || "-";
+  const collectionTreeValue = buildCollectionTreeValue(
+    taskForm.collectionId,
+    taskForm.collectionSectionId,
+  );
+  const handleCollectionTreeChange = (rawValue) => {
+    const selection = parseCollectionTreeValue(rawValue);
+    setTaskForm((prev) => ({
+      ...prev,
+      ...selection,
+    }));
+  };
+  const collectionTreeSections = (collection) =>
+    String(collection.seasonId) === String(taskForm.collectionId)
+      ? collectionSectionOptions
+      : Array.isArray(collection.sections)
+        ? collection.sections
+        : [];
   const editChangedModules = isEditView
     ? resolveEditChangedModules({
         baseline: editBaseline,
@@ -6679,7 +6918,7 @@ export default function SubmissionSection({
 	                  裁剪比例固定 16:10，建议最小尺寸 960x600
 	                </div>
 	              </div>
-	          <div className="grid gap-2 lg:grid-cols-3">
+			          <div className="grid gap-2 lg:grid-cols-3">
             <div className="space-y-1">
               <div className="text-xs text-[var(--muted)]">
                 B站分区<span className="ml-1 text-rose-500">必填</span>
@@ -6704,19 +6943,28 @@ export default function SubmissionSection({
             <div className="space-y-1">
               <div className="text-xs text-[var(--muted)]">合集（可选）</div>
               <select
-                value={taskForm.collectionId}
-                onChange={(event) =>
-                  setTaskForm((prev) => ({ ...prev, collectionId: event.target.value }))
-                }
+                value={collectionTreeValue}
+                onChange={(event) => handleCollectionTreeChange(event.target.value)}
                 disabled={isReadOnly}
                 className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
               >
                 <option value="">请选择合集</option>
-                {collectionOptions.map((collection) => (
-                  <option key={collection.seasonId} value={collection.seasonId}>
+                {collectionOptions.flatMap((collection) => [
+                  <option
+                    key={`collection-${collection.seasonId}`}
+                    value={buildCollectionTreeValue(collection.seasonId)}
+                  >
                     {collection.name}
-                  </option>
-                ))}
+                  </option>,
+                  ...collectionTreeSections(collection).map((section) => (
+                    <option
+                      key={`section-${collection.seasonId}-${section.sectionId}`}
+                      value={buildCollectionTreeValue(collection.seasonId, section.sectionId)}
+                    >
+                      {`　└ ${section.title || `子合集${section.sectionId}`}`}
+                    </option>
+                  )),
+                ])}
               </select>
             </div>
             <div className="space-y-1">
@@ -7976,7 +8224,9 @@ export default function SubmissionSection({
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
                       {(() => {
                         const reason = resolveTaskFailureReason(task);
-                        const showTooltip = task?.status === "FAILED" && reason !== "-";
+                        const showTooltip =
+                          ["FAILED", "VERIFY_PENDING", "SUBMIT_UNKNOWN"].includes(task?.status) &&
+                          reason !== "-";
                         return (
                           <div className="group relative inline-block">
                             <span
@@ -8164,15 +8414,44 @@ export default function SubmissionSection({
                             忽略投稿
                           </button>
                         ) : null}
+                        {submissionNeedsRemoteVerification(task) ? (
+                          <button
+                            className="rounded-full border border-amber-200 bg-white px-2 py-1 text-xs font-semibold text-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
+                            onClick={() => handleTaskRemoteVerification(task)}
+                            disabled={Boolean(verifyingRemoteTaskId) || refreshingRemote}
+                          >
+                            {verifyingRemoteTaskId === task.taskId ? "校验中" : "校验远端"}
+                          </button>
+                        ) : null}
+                        {canConfirmRemoteMissing(task) ? (
+                          <button
+                            className="rounded-full border border-rose-200 bg-white px-2 py-1 text-xs font-semibold text-rose-600"
+                            onClick={() => handleConfirmRemoteMissing(task)}
+                          >
+                            确认未生成
+                          </button>
+                        ) : null}
                         <button
-                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() => openRepostModal(task)}
+                          disabled={submissionNeedsRemoteVerification(task)}
+                          title={
+                            submissionNeedsRemoteVerification(task)
+                              ? "请先校验远端状态，避免重复投稿"
+                              : undefined
+                          }
                         >
                           重新投稿
                         </button>
                         <button
-                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() => openTranscodeRepostModal(task)}
+                          disabled={submissionNeedsRemoteVerification(task)}
+                          title={
+                            submissionNeedsRemoteVerification(task)
+                              ? "请先校验远端状态，避免重复投稿"
+                              : undefined
+                          }
                         >
                           转码投稿
                         </button>
@@ -9110,21 +9389,30 @@ export default function SubmissionSection({
                       <div className="space-y-1">
                         <div className="text-xs text-[var(--muted)]">合集</div>
                         <select
-                          value={taskForm.collectionId}
-                          onChange={(event) =>
-                            setTaskForm((prev) => ({
-                              ...prev,
-                              collectionId: event.target.value,
-                            }))
-                          }
+                          value={collectionTreeValue}
+                          onChange={(event) => handleCollectionTreeChange(event.target.value)}
                           className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
                         >
                           <option value="">请选择合集</option>
-                          {collectionOptions.map((collection) => (
-                            <option key={collection.seasonId} value={collection.seasonId}>
+                          {collectionOptions.flatMap((collection) => [
+                            <option
+                              key={`collection-${collection.seasonId}`}
+                              value={buildCollectionTreeValue(collection.seasonId)}
+                            >
                               {collection.name}
-                            </option>
-                          ))}
+                            </option>,
+                            ...collectionTreeSections(collection).map((section) => (
+                              <option
+                                key={`section-${collection.seasonId}-${section.sectionId}`}
+                                value={buildCollectionTreeValue(
+                                  collection.seasonId,
+                                  section.sectionId,
+                                )}
+                              >
+                                {`　└ ${section.title || `子合集${section.sectionId}`}`}
+                              </option>
+                            )),
+                          ])}
                         </select>
                       </div>
                     </div>

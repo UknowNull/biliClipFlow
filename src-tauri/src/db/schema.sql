@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS submission_task (
   activity_title TEXT,
   video_type TEXT NOT NULL,
   collection_id INTEGER,
+  collection_section_id INTEGER,
   bvid TEXT,
   aid INTEGER,
   remote_state INTEGER,

@@ -29,6 +29,7 @@ export function buildBasicSnapshot(form, tagList) {
     coverDataReady: normalizeText(form.coverDataUrl) ? "1" : "0",
     partitionId: normalizeText(form.partitionId),
     collectionId: normalizeText(form.collectionId),
+    collectionSectionId: normalizeText(form.collectionSectionId),
     activityTopicId: normalizeText(form.activityTopicId),
     activityMissionId: normalizeText(form.activityMissionId),
     activityTitle: normalizeText(form.activityTitle),
@@ -79,6 +80,8 @@ export function buildEditBaselineFromDetail(detail) {
         coverUrl: task.coverUrl ?? task.cover_url ?? "",
         partitionId: task.partitionId ?? task.partition_id ?? "",
         collectionId: task.collectionId ?? task.collection_id ?? "",
+        collectionSectionId:
+          task.collectionSectionId ?? task.collection_section_id ?? "",
         activityTopicId: task.topicId ?? task.topic_id ?? "",
         activityMissionId: task.missionId ?? task.mission_id ?? "",
         activityTitle: task.activityTitle ?? task.activity_title ?? "",

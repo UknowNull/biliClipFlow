@@ -25,6 +25,14 @@ pub struct Collection {
     pub name: String,
     pub cover: Option<String>,
     pub description: Option<String>,
+    pub sections: Vec<CollectionSection>,
+}
+
+#[derive(Serialize)]
+pub struct CollectionSection {
+    pub section_id: i64,
+    pub title: String,
+    pub order: i64,
 }
 
 #[derive(Serialize)]
@@ -612,6 +620,35 @@ pub async fn bilibili_collections(
                             .get("desc")
                             .and_then(|value| value.as_str())
                             .map(|value| value.to_string()),
+                        sections: item
+                            .get("sections")
+                            .and_then(|value| value.get("sections"))
+                            .and_then(|value| value.as_array())
+                            .map(|sections| {
+                                sections
+                                    .iter()
+                                    .filter_map(|section| {
+                                        let section_id =
+                                            section.get("id").and_then(|value| value.as_i64())?;
+                                        if section_id <= 0 {
+                                            return None;
+                                        }
+                                        Some(CollectionSection {
+                                            section_id,
+                                            title: section
+                                                .get("title")
+                                                .and_then(|value| value.as_str())
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                            order: section
+                                                .get("order")
+                                                .and_then(|value| value.as_i64())
+                                                .unwrap_or(0),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     });
                 }
             }

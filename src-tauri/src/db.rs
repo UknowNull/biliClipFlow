@@ -275,6 +275,10 @@ impl Db {
             "ALTER TABLE submission_task ADD COLUMN source_type TEXT DEFAULT 'NORMAL'",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE submission_task ADD COLUMN collection_section_id INTEGER",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE baidu_sync_task ADD COLUMN baidu_uid TEXT", []);
         conn.execute_batch(include_str!("db/schema.sql"))?;
         let _ = conn.execute(
@@ -487,5 +491,26 @@ impl Db {
     ) -> Result<T, DbError> {
         let mut conn = self.conn.lock().map_err(|_| DbError::Lock)?;
         Ok(f(&mut conn)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submission_schema_contains_collection_section_id() {
+        let db = Db::new(PathBuf::from(":memory:")).expect("initialize in-memory database");
+        let columns = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(submission_task)")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .expect("read submission_task columns");
+
+        assert!(columns
+            .iter()
+            .any(|column| column == "collection_section_id"));
     }
 }

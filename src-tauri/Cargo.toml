@@ -24,7 +24,6 @@ tauri-plugin-dialog = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 base64 = "0.22"
 md5 = "0.7"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1"
 tokio = { version = "1", features = ["time", "net", "io-util", "macros", "rt-multi-thread"] }
@@ -40,3 +39,9 @@ rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.10"
 rand = "0.8"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "blocking"] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
