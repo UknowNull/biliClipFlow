@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -10,12 +10,15 @@ use chrono::{Duration as ChronoDuration, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 use crate::api::ApiResponse;
+use crate::bilibili::client::is_bilibili_risk_control_error;
 use crate::ffmpeg::{run_ffmpeg, run_ffmpeg_with_progress, run_ffprobe_json};
 use crate::login_store::AuthInfo;
+use crate::processing::probe_duration_seconds;
 use crate::utils;
 use crate::AppState;
 
@@ -25,7 +28,10 @@ const BILIBILI_ARCHIVE_STATUS_PUBLISHED: &str = "pubed";
 const VIDEO_MASK_COPY_SEEK_EPSILON: f64 = 0.001;
 const VIDEO_MASK_RENDER_PROGRESS_EVENT: &str = "toolbox://video-mask-render-progress";
 const SEASON_BACKUP_TASK_INTERVAL_SECONDS: u64 = 3;
+const SEASON_BACKUP_ARCHIVE_PAGE_WAIT_MILLIS: u64 = 1500;
 const VIDEO_MASK_DEFAULT_CRF: i64 = 16;
+const TOOLBOX_MEDIA_TASK_HISTORY_LIMIT: usize = 200;
+const TOOLBOX_MEDIA_MAX_CONCURRENT_TASKS: usize = 2;
 
 struct RemoteRefreshPauseGuard {
     counter: Arc<AtomicUsize>,
@@ -44,18 +50,147 @@ impl Drop for RemoteRefreshPauseGuard {
     }
 }
 
+fn should_stop_scheduled_backup_batch(error: &str) -> bool {
+    is_bilibili_risk_control_error(error)
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolboxMediaTaskRecord {
+    pub task_id: String,
+    pub task_type: String,
+    pub title: String,
+    pub status: String,
+    pub stage: String,
+    pub progress: i64,
+    pub source_path: String,
+    pub audio_path: Option<String>,
+    pub target_path: String,
+    pub output_format: String,
+    pub speed_mode: String,
+    pub encoder: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub struct ToolboxMediaTaskRuntime {
+    tasks: Mutex<Vec<ToolboxMediaTaskRecord>>,
+    storage_path: PathBuf,
+    worker_slots: Arc<Semaphore>,
+}
+
+impl ToolboxMediaTaskRuntime {
+    pub fn new(storage_path: PathBuf) -> Self {
+        let mut tasks = fs::read_to_string(&storage_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Vec<ToolboxMediaTaskRecord>>(&text).ok())
+            .unwrap_or_default();
+        let now = utils::now_rfc3339();
+        let mut recovered = false;
+        for task in &mut tasks {
+            if matches!(task.status.as_str(), "QUEUED" | "RUNNING") {
+                task.status = "FAILED".to_string();
+                task.stage = "已中断".to_string();
+                task.error_message = Some("应用已重启，原任务无法继续执行".to_string());
+                task.updated_at = now.clone();
+                recovered = true;
+            }
+        }
+        tasks.truncate(TOOLBOX_MEDIA_TASK_HISTORY_LIMIT);
+        let runtime = Self {
+            tasks: Mutex::new(tasks),
+            storage_path,
+            worker_slots: Arc::new(Semaphore::new(TOOLBOX_MEDIA_MAX_CONCURRENT_TASKS)),
+        };
+        if recovered {
+            let _ = runtime.persist();
+        }
+        runtime
+    }
+
+    fn persist_tasks(&self, tasks: &[ToolboxMediaTaskRecord]) -> Result<(), String> {
+        if let Some(parent) = self.storage_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("创建工具箱任务记录目录失败: {}", err))?;
+        }
+        let text = serde_json::to_string_pretty(tasks)
+            .map_err(|err| format!("序列化工具箱任务记录失败: {}", err))?;
+        fs::write(&self.storage_path, text)
+            .map_err(|err| format!("写入工具箱任务记录失败: {}", err))
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        let tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| "工具箱任务记录锁已损坏".to_string())?;
+        self.persist_tasks(&tasks)
+    }
+
+    fn insert(&self, task: ToolboxMediaTaskRecord) -> Result<(), String> {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| "工具箱任务记录锁已损坏".to_string())?;
+        if tasks.iter().any(|existing| {
+            matches!(existing.status.as_str(), "QUEUED" | "RUNNING")
+                && toolbox_media_target_paths_equal(&existing.target_path, &task.target_path)
+        }) {
+            return Err("相同输出路径已有等待或运行中的任务".to_string());
+        }
+        tasks.insert(0, task);
+        tasks.truncate(TOOLBOX_MEDIA_TASK_HISTORY_LIMIT);
+        self.persist_tasks(&tasks)
+    }
+
+    fn update<F>(&self, task_id: &str, update: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut ToolboxMediaTaskRecord),
+    {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| "工具箱任务记录锁已损坏".to_string())?;
+        let task = tasks
+            .iter_mut()
+            .find(|task| task.task_id == task_id)
+            .ok_or_else(|| "未找到工具箱任务记录".to_string())?;
+        update(task);
+        task.updated_at = utils::now_rfc3339();
+        self.persist_tasks(&tasks)
+    }
+
+    fn list(&self) -> Result<Vec<ToolboxMediaTaskRecord>, String> {
+        self.tasks
+            .lock()
+            .map(|tasks| tasks.clone())
+            .map_err(|_| "工具箱任务记录锁已损坏".to_string())
+    }
+}
+
+fn toolbox_media_target_paths_equal(left: &str, right: &str) -> bool {
+    if cfg!(target_os = "windows") {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemuxPayload {
     pub source_path: String,
     pub target_path: String,
+    #[serde(default)]
+    pub output_format: Option<String>,
 }
 
 #[tauri::command]
 pub async fn toolbox_remux(
     state: State<'_, AppState>,
     payload: RemuxPayload,
-) -> Result<ApiResponse<bool>, String> {
+) -> Result<ApiResponse<ToolboxMediaTaskRecord>, String> {
     let source = payload.source_path.trim();
     if source.is_empty() {
         return Ok(ApiResponse::error("请选择源文件"));
@@ -75,46 +210,555 @@ pub async fn toolbox_remux(
     }
 
     let target_path = Path::new(target);
+    if source_path == target_path {
+        return Ok(ApiResponse::error("源文件和输出文件不能相同"));
+    }
+    let source_extension = path_extension(source_path);
+    let target_extension = path_extension(target_path);
+    let output_format = payload
+        .output_format
+        .as_deref()
+        .unwrap_or(target_extension.as_deref().unwrap_or(""))
+        .to_ascii_lowercase();
+    if !matches!(output_format.as_str(), "mp4" | "flv") {
+        return Ok(ApiResponse::error("输出格式仅支持 MP4 或 FLV"));
+    }
+    if target_extension.as_deref() != Some(output_format.as_str()) {
+        return Ok(ApiResponse::error(format!(
+            "输出文件扩展名必须为 .{}",
+            output_format.to_uppercase()
+        )));
+    }
+    let mode = match (source_extension.as_deref(), output_format.as_str()) {
+        (Some("flv"), "mp4") => RemuxMode::FlvToMp4,
+        (Some("mp4" | "mov"), "flv") => RemuxMode::Mp4MovToFlv,
+        _ => {
+            return Ok(ApiResponse::error("当前支持 FLV 转 MP4，或 MP4/MOV 转 FLV"));
+        }
+    };
     if let Some(parent) = target_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
             return Ok(ApiResponse::error(format!("创建输出目录失败: {}", err)));
         }
     }
 
-    let log_path = state.app_log_path.clone();
-    utils::append_log(
-        log_path.as_ref(),
-        &format!("toolbox_remux_start source={} target={}", source, target),
+    let speed_mode = if matches!(mode, RemuxMode::FlvToMp4) {
+        ToolboxMediaSpeedMode::Copy
+    } else {
+        ToolboxMediaSpeedMode::Hardware
+    };
+    let task = new_toolbox_media_task(
+        "FORMAT_CONVERT",
+        format!(
+            "{} → {}",
+            file_name(source_path),
+            output_format.to_uppercase()
+        ),
+        source,
+        None,
+        target,
+        &output_format,
+        speed_mode,
     );
+    let job = ToolboxMediaJob::Remux {
+        source: source.to_string(),
+        target: target.to_string(),
+        mode,
+        speed_mode,
+    };
+    if let Err(err) = start_toolbox_media_task(&state, task.clone(), job) {
+        return Ok(ApiResponse::error(err));
+    }
+    Ok(ApiResponse::success(task))
+}
 
-    let args = vec![
+#[derive(Clone, Copy)]
+enum RemuxMode {
+    FlvToMp4,
+    Mp4MovToFlv,
+}
+
+#[derive(Clone, Copy)]
+enum ToolboxMediaSpeedMode {
+    Copy,
+    Hardware,
+    Software,
+}
+
+impl ToolboxMediaSpeedMode {
+    fn value(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Hardware => "hardware",
+            Self::Software => "software",
+        }
+    }
+}
+
+enum ToolboxMediaJob {
+    Remux {
+        source: String,
+        target: String,
+        mode: RemuxMode,
+        speed_mode: ToolboxMediaSpeedMode,
+    },
+    Merge {
+        video: String,
+        audio: String,
+        target: String,
+        speed_mode: ToolboxMediaSpeedMode,
+    },
+}
+
+fn path_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn build_remux_args(
+    source: &str,
+    target: &str,
+    mode: RemuxMode,
+    encoder: &VideoMaskEncoder,
+) -> Vec<String> {
+    let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
         "-y".to_string(),
         "-i".to_string(),
         source.to_string(),
-        "-c".to_string(),
-        "copy".to_string(),
-        target.to_string(),
     ];
+    let transcode = encoder.name != "copy";
+    if matches!(mode, RemuxMode::Mp4MovToFlv) || transcode {
+        args.extend([
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-map".to_string(),
+            "0:a?".to_string(),
+        ]);
+    }
+    if transcode {
+        args.extend(["-c:v".to_string(), encoder.name.clone()]);
+        args.extend(encoder.options.clone());
+        args.extend([
+            "-pix_fmt".to_string(),
+            "yuv420p".to_string(),
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-b:a".to_string(),
+            "192k".to_string(),
+        ]);
+    } else {
+        args.extend(["-c".to_string(), "copy".to_string()]);
+    }
+    if matches!(mode, RemuxMode::Mp4MovToFlv) {
+        args.extend(["-f".to_string(), "flv".to_string()]);
+    }
+    args.push(target.to_string());
+    args
+}
 
-    let result = tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&args))
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioVideoMergePayload {
+    pub video_path: String,
+    pub audio_path: String,
+    pub target_path: String,
+}
+
+#[tauri::command]
+pub async fn toolbox_merge_audio_video(
+    state: State<'_, AppState>,
+    payload: AudioVideoMergePayload,
+) -> Result<ApiResponse<ToolboxMediaTaskRecord>, String> {
+    let video = payload.video_path.trim();
+    let audio = payload.audio_path.trim();
+    let target = payload.target_path.trim();
+    if video.is_empty() || audio.is_empty() || target.is_empty() {
+        return Ok(ApiResponse::error("请选择视频、音频和输出文件"));
+    }
+
+    let video_path = Path::new(video);
+    let audio_path = Path::new(audio);
+    let target_path = Path::new(target);
+    for (label, path) in [("视频文件", video_path), ("音频文件", audio_path)] {
+        if !path.exists() {
+            return Ok(ApiResponse::error(format!("{}不存在", label)));
+        }
+        if !path.is_file() {
+            return Ok(ApiResponse::error(format!("{}不是文件", label)));
+        }
+    }
+    if video_path == target_path || audio_path == target_path {
+        return Ok(ApiResponse::error("输入文件和输出文件不能相同"));
+    }
+    if path_extension(target_path).as_deref() != Some("mp4") {
+        return Ok(ApiResponse::error("音视频合并输出文件必须为 MP4"));
+    }
+    if let Some(parent) = target_path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return Ok(ApiResponse::error(format!("创建输出目录失败: {}", err)));
+        }
+    }
+
+    let speed_mode = ToolboxMediaSpeedMode::Hardware;
+    let task = new_toolbox_media_task(
+        "AUDIO_VIDEO_MERGE",
+        format!("{} + {}", file_name(video_path), file_name(audio_path)),
+        video,
+        Some(audio.to_string()),
+        target,
+        "mp4",
+        speed_mode,
+    );
+    let job = ToolboxMediaJob::Merge {
+        video: video.to_string(),
+        audio: audio.to_string(),
+        target: target.to_string(),
+        speed_mode,
+    };
+    if let Err(err) = start_toolbox_media_task(&state, task.clone(), job) {
+        return Ok(ApiResponse::error(err));
+    }
+    Ok(ApiResponse::success(task))
+}
+
+fn build_merge_audio_video_args(
+    video: &str,
+    audio: &str,
+    target: &str,
+    encoder: &VideoMaskEncoder,
+) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-y".to_string(),
+        "-i".to_string(),
+        video.to_string(),
+        "-i".to_string(),
+        audio.to_string(),
+        "-map".to_string(),
+        "0:v:0".to_string(),
+        "-map".to_string(),
+        "1:a:0".to_string(),
+    ];
+    if encoder.name == "copy" {
+        args.extend(["-c:v".to_string(), "copy".to_string()]);
+    } else {
+        args.extend(["-c:v".to_string(), encoder.name.clone()]);
+        args.extend(encoder.options.clone());
+        args.extend(["-pix_fmt".to_string(), "yuv420p".to_string()]);
+    }
+    args.extend([
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "192k".to_string(),
+        "-shortest".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        target.to_string(),
+    ]);
+    args
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("未命名文件")
+        .to_string()
+}
+
+fn new_toolbox_media_task(
+    task_type: &str,
+    title: String,
+    source_path: &str,
+    audio_path: Option<String>,
+    target_path: &str,
+    output_format: &str,
+    speed_mode: ToolboxMediaSpeedMode,
+) -> ToolboxMediaTaskRecord {
+    let now = utils::now_rfc3339();
+    ToolboxMediaTaskRecord {
+        task_id: Uuid::new_v4().to_string(),
+        task_type: task_type.to_string(),
+        title,
+        status: "QUEUED".to_string(),
+        stage: "等待执行".to_string(),
+        progress: 0,
+        source_path: source_path.to_string(),
+        audio_path,
+        target_path: target_path.to_string(),
+        output_format: output_format.to_string(),
+        speed_mode: speed_mode.value().to_string(),
+        encoder: None,
+        error_message: None,
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn resolve_toolbox_media_encoder(
+    source_path: &str,
+    speed_mode: ToolboxMediaSpeedMode,
+) -> VideoMaskEncoder {
+    if matches!(speed_mode, ToolboxMediaSpeedMode::Copy) {
+        return VideoMaskEncoder {
+            name: "copy".to_string(),
+            options: Vec::new(),
+            hardware: false,
+            fallback_note: None,
+        };
+    }
+    if matches!(speed_mode, ToolboxMediaSpeedMode::Software) {
+        return software_video_encoder("h264", 20, "veryfast");
+    }
+
+    let probe = probe_video_mask_source(source_path).ok();
+    let width = probe.as_ref().map(|value| value.width).unwrap_or(1920);
+    let height = probe.as_ref().map(|value| value.height).unwrap_or(1080);
+    let fps = probe.as_ref().map(|value| value.fps).unwrap_or(30.0);
+    let mut failures = Vec::new();
+    for candidate in hardware_encoder_candidates("h264") {
+        let encoder = VideoMaskEncoder {
+            name: candidate.to_string(),
+            options: build_encoder_options(candidate, 20, "veryfast", width, height, fps),
+            hardware: true,
+            fallback_note: None,
+        };
+        match probe_hardware_encoder(source_path, &encoder) {
+            Ok(()) => return encoder,
+            Err(error) => failures.push(format!("{}: {}", candidate, compact_ffmpeg_error(&error))),
+        }
+    }
+
+    let mut encoder = software_video_encoder("h264", 20, "veryfast");
+    encoder.fallback_note = Some(if failures.is_empty() {
+        "当前平台没有可用硬件编码器，已回退软件编码".to_string()
+    } else {
+        format!("硬件编码不可用，已回退软件编码：{}", failures.join("；"))
+    });
+    encoder
+}
+
+fn toolbox_media_duration_ms(job: &ToolboxMediaJob) -> Option<i64> {
+    let duration = match job {
+        ToolboxMediaJob::Remux { source, .. } => probe_duration_seconds(Path::new(source)).ok(),
+        ToolboxMediaJob::Merge { video, audio, .. } => {
+            match (
+                probe_duration_seconds(Path::new(video)).ok(),
+                probe_duration_seconds(Path::new(audio)).ok(),
+            ) {
+                (Some(video_duration), Some(audio_duration)) => {
+                    Some(video_duration.min(audio_duration))
+                }
+                (Some(duration), None) | (None, Some(duration)) => Some(duration),
+                (None, None) => None,
+            }
+        }
+    };
+    duration.and_then(duration_to_millis)
+}
+
+fn run_toolbox_media_ffmpeg(
+    runtime: &ToolboxMediaTaskRuntime,
+    task_id: &str,
+    args: &[String],
+    duration_ms: Option<i64>,
+) -> Result<(), String> {
+    let args = ffmpeg_args_with_progress(args.to_vec());
+    run_ffmpeg_with_progress(&args, duration_ms, |progress| {
+        let _ = runtime.update(task_id, |task| {
+            task.progress = progress.clamp(0, 99);
+        });
+    })
+}
+
+fn run_toolbox_media_job(
+    runtime: &ToolboxMediaTaskRuntime,
+    task_id: &str,
+    job: &ToolboxMediaJob,
+) -> Result<String, String> {
+    let duration_ms = toolbox_media_duration_ms(job);
+    let (encoder, args) = match job {
+        ToolboxMediaJob::Remux {
+            source,
+            target,
+            mode,
+            speed_mode,
+        } => {
+            let encoder = if matches!(mode, RemuxMode::FlvToMp4) {
+                resolve_toolbox_media_encoder(source, ToolboxMediaSpeedMode::Copy)
+            } else {
+                resolve_toolbox_media_encoder(source, *speed_mode)
+            };
+            let args = build_remux_args(source, target, *mode, &encoder);
+            (encoder, args)
+        }
+        ToolboxMediaJob::Merge {
+            video,
+            audio,
+            target,
+            speed_mode,
+        } => {
+            let encoder = resolve_toolbox_media_encoder(video, *speed_mode);
+            let args = build_merge_audio_video_args(video, audio, target, &encoder);
+            (encoder, args)
+        }
+    };
+    runtime.update(task_id, |task| {
+        task.status = "RUNNING".to_string();
+        task.stage = encoder
+            .fallback_note
+            .clone()
+            .unwrap_or_else(|| "处理中".to_string());
+        task.encoder = Some(encoder.name.clone());
+    })?;
+
+    let first_result = run_toolbox_media_ffmpeg(runtime, task_id, &args, duration_ms);
+    if let Err(primary_error) = first_result {
+        if let ToolboxMediaJob::Remux {
+            source,
+            target,
+            mode: RemuxMode::FlvToMp4,
+            ..
+        } = job
+        {
+            if encoder.name == "copy" {
+                let fallback_encoder =
+                    resolve_toolbox_media_encoder(source, ToolboxMediaSpeedMode::Hardware);
+                let fallback_stage = fallback_encoder
+                    .fallback_note
+                    .clone()
+                    .map(|note| format!("直拷贝失败，{}", note))
+                    .unwrap_or_else(|| "直拷贝失败，自动转码处理中".to_string());
+                runtime.update(task_id, |task| {
+                    task.stage = fallback_stage.clone();
+                    task.progress = 0;
+                    task.speed_mode = if fallback_encoder.hardware {
+                        "hardware"
+                    } else {
+                        "software"
+                    }
+                    .to_string();
+                    task.encoder = Some(fallback_encoder.name.clone());
+                })?;
+                let fallback_args =
+                    build_remux_args(source, target, RemuxMode::FlvToMp4, &fallback_encoder);
+                return run_toolbox_media_ffmpeg(runtime, task_id, &fallback_args, duration_ms)
+                    .map(|_| fallback_encoder.name)
+                    .map_err(|fallback_error| {
+                        format!(
+                            "直拷贝失败: {}; 自动转码失败: {}",
+                            primary_error, fallback_error
+                        )
+                    });
+            }
+        }
+        return Err(primary_error);
+    }
+    Ok(encoder.name)
+}
+
+fn start_toolbox_media_task(
+    state: &State<'_, AppState>,
+    task: ToolboxMediaTaskRecord,
+    job: ToolboxMediaJob,
+) -> Result<(), String> {
+    state.toolbox_media_runtime.insert(task.clone())?;
+    let runtime = Arc::clone(&state.toolbox_media_runtime);
+    let worker_slots = Arc::clone(&runtime.worker_slots);
+    let log_path = Arc::clone(&state.app_log_path);
+    let task_id = task.task_id.clone();
+    let task_type = task.task_type.clone();
+    utils::append_log(
+        log_path.as_ref(),
+        &format!(
+            "toolbox_media_task_queued task_id={} type={} speed_mode={} source={} target={}",
+            task.task_id, task.task_type, task.speed_mode, task.source_path, task.target_path
+        ),
+    );
+    tauri::async_runtime::spawn(async move {
+        let _permit = match worker_slots.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                let error = "媒体处理任务队列已关闭".to_string();
+                let _ = runtime.update(&task_id, |task| {
+                    task.status = "FAILED".to_string();
+                    task.stage = "处理失败".to_string();
+                    task.error_message = Some(error.clone());
+                });
+                utils::append_log(
+                    log_path.as_ref(),
+                    &format!(
+                        "toolbox_media_task_done task_id={} type={} status=err err={}",
+                        task_id, task_type, error
+                    ),
+                );
+                return;
+            }
+        };
+        utils::append_log(
+            log_path.as_ref(),
+            &format!(
+                "toolbox_media_task_start task_id={} type={}",
+                task_id, task_type
+            ),
+        );
+        let run_runtime = Arc::clone(&runtime);
+        let run_task_id = task_id.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            run_toolbox_media_job(run_runtime.as_ref(), &run_task_id, &job)
+        })
         .await
-        .map_err(|_| "转封装执行失败".to_string())?;
+        .map_err(|_| "媒体处理任务执行线程异常".to_string())
+        .and_then(|result| result);
+        match result {
+            Ok(encoder) => {
+                let _ = runtime.update(&task_id, |task| {
+                    task.status = "COMPLETED".to_string();
+                    task.stage = "已完成".to_string();
+                    task.progress = 100;
+                    task.encoder = Some(encoder);
+                    task.error_message = None;
+                });
+                utils::append_log(
+                    log_path.as_ref(),
+                    &format!(
+                        "toolbox_media_task_done task_id={} type={} status=ok",
+                        task_id, task_type
+                    ),
+                );
+            }
+            Err(error) => {
+                let _ = runtime.update(&task_id, |task| {
+                    task.status = "FAILED".to_string();
+                    task.stage = "处理失败".to_string();
+                    task.error_message = Some(error.clone());
+                });
+                utils::append_log(
+                    log_path.as_ref(),
+                    &format!(
+                        "toolbox_media_task_done task_id={} type={} status=err err={}",
+                        task_id, task_type, error
+                    ),
+                );
+            }
+        }
+    });
+    Ok(())
+}
 
-    match result {
-        Ok(()) => {
-            utils::append_log(log_path.as_ref(), "toolbox_remux_done status=ok");
-            Ok(ApiResponse::success(true))
-        }
-        Err(err) => {
-            utils::append_log(
-                log_path.as_ref(),
-                &format!("toolbox_remux_done status=err err={}", err),
-            );
-            Ok(ApiResponse::error(err))
-        }
+#[tauri::command]
+pub fn toolbox_media_task_list(
+    state: State<'_, AppState>,
+) -> ApiResponse<Vec<ToolboxMediaTaskRecord>> {
+    match state.toolbox_media_runtime.list() {
+        Ok(tasks) => ApiResponse::success(tasks),
+        Err(error) => ApiResponse::error(error),
     }
 }
 
@@ -1205,16 +1849,19 @@ pub async fn toolbox_bilibili_season_backup(
         Ok(auth) => auth,
         Err(err) => return Ok(ApiResponse::error(err)),
     };
+    let _remote_refresh_pause_guard =
+        RemoteRefreshPauseGuard::new(Arc::clone(&state.submission_remote_refresh_pause_count));
     let detail = match fetch_season_detail(&state, &auth, payload.season_id).await {
-        Ok(item) => item,
-        Err(err) => return Ok(ApiResponse::error(err)),
-    };
-    let backup = match build_season_backup(&state, &auth, &detail).await {
         Ok(item) => item,
         Err(err) => return Ok(ApiResponse::error(err)),
     };
     let mut backups = match read_season_backups(&app) {
         Ok(items) => items,
+        Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    let existing_publish_times = cached_publish_times_for_season(&backups, payload.season_id);
+    let backup = match build_season_backup(&state, &auth, &detail, &existing_publish_times).await {
+        Ok(item) => item,
         Err(err) => return Ok(ApiResponse::error(err)),
     };
     upsert_season_backup(&mut backups, backup.clone(), false);
@@ -2957,6 +3604,7 @@ async fn build_season_backup(
     state: &State<'_, AppState>,
     auth: &AuthInfo,
     raw: &Value,
+    cached_publish_times: &HashMap<i64, i64>,
 ) -> Result<SeasonBackup, String> {
     let season = raw.get("season").unwrap_or(&Value::Null);
     let mut sections = Vec::new();
@@ -3000,16 +3648,20 @@ async fn build_season_backup(
     }
 
     sections.sort_by_key(|item| item.order);
+    let reused_publish_time_count =
+        fill_section_episode_publish_times(&mut sections, cached_publish_times);
     let publish_times = fetch_archive_publish_times_for_backup(state, auth, &sections).await?;
-    let filled_publish_time_count =
+    let fetched_publish_time_count =
         fill_section_episode_publish_times(&mut sections, &publish_times);
     append_toolbox_log(
         state,
         &format!(
-            "toolbox_bilibili_season_backup_publish_times source_season_id={} found={} filled={}",
+            "toolbox_bilibili_season_backup_publish_times source_season_id={} cached={} reused={} found={} filled={}",
             season.get("id").and_then(|item| item.as_i64()).unwrap_or(0),
+            cached_publish_times.len(),
+            reused_publish_time_count,
             publish_times.len(),
-            filled_publish_time_count
+            fetched_publish_time_count
         ),
     );
     let flattened_episodes = sections
@@ -3134,12 +3786,7 @@ async fn fetch_archive_publish_times_for_backup(
     auth: &AuthInfo,
     sections: &[SeasonSectionBackup],
 ) -> Result<HashMap<i64, i64>, String> {
-    let mut target_aids = sections
-        .iter()
-        .flat_map(|section| section.episodes.iter())
-        .filter(|episode| episode.aid > 0 && episode.published_at.is_none())
-        .map(|episode| episode.aid)
-        .collect::<HashSet<_>>();
+    let mut target_aids = missing_publish_time_aids(sections);
     if target_aids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -3160,6 +3807,15 @@ async fn fetch_archive_publish_times_for_backup(
     Ok(result)
 }
 
+fn missing_publish_time_aids(sections: &[SeasonSectionBackup]) -> HashSet<i64> {
+    sections
+        .iter()
+        .flat_map(|section| section.episodes.iter())
+        .filter(|episode| episode.aid > 0 && episode.published_at.is_none())
+        .map(|episode| episode.aid)
+        .collect()
+}
+
 async fn fetch_archive_publish_times_by_status(
     state: &State<'_, AppState>,
     auth: &AuthInfo,
@@ -3172,6 +3828,12 @@ async fn fetch_archive_publish_times_by_status(
     let mut page = 1_i64;
 
     loop {
+        if page > 1 {
+            sleep(Duration::from_millis(
+                SEASON_BACKUP_ARCHIVE_PAGE_WAIT_MILLIS,
+            ))
+            .await;
+        }
         let params = vec![
             ("status".to_string(), status.to_string()),
             ("pn".to_string(), page.to_string()),
@@ -4141,6 +4803,26 @@ fn read_season_backups(app: &AppHandle) -> Result<Vec<SeasonBackup>, String> {
     serde_json::from_str(&text).map_err(|err| format!("解析备份失败: {}", err))
 }
 
+fn cached_publish_times_for_season(backups: &[SeasonBackup], season_id: i64) -> HashMap<i64, i64> {
+    let Some(backup) = backups
+        .iter()
+        .find(|backup| backup.source_season_id == season_id)
+    else {
+        return HashMap::new();
+    };
+
+    backup_sections_for_restore(backup)
+        .into_iter()
+        .flat_map(|section| section.episodes)
+        .filter_map(|episode| {
+            episode
+                .published_at
+                .map(|published_at| (episode.aid, published_at))
+        })
+        .filter(|(aid, _)| *aid > 0)
+        .collect()
+}
+
 fn write_season_backups(app: &AppHandle, backups: &[SeasonBackup]) -> Result<(), String> {
     let path = season_backups_path(app)?;
     let text =
@@ -4258,6 +4940,8 @@ async fn run_scheduled_season_backups(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    let _remote_refresh_pause_guard =
+        RemoteRefreshPauseGuard::new(Arc::clone(&state.submission_remote_refresh_pause_count));
     let auth = load_active_auth(&state)?;
     let seasons = fetch_all_seasons(&state, &auth).await?;
     let mut seasons_by_id = HashMap::new();
@@ -4296,9 +4980,10 @@ async fn run_scheduled_season_backups(app: &AppHandle) -> Result<(), String> {
             );
             continue;
         };
-        match build_season_backup(&state, &auth, raw).await {
+        let mut backups = read_season_backups(app)?;
+        let existing_publish_times = cached_publish_times_for_season(&backups, *season_id);
+        match build_season_backup(&state, &auth, raw, &existing_publish_times).await {
             Ok(backup) => {
-                let mut backups = read_season_backups(app)?;
                 upsert_season_backup(&mut backups, backup.clone(), true);
                 write_season_backups(app, &backups)?;
                 update_schedule_status(&mut schedules, *season_id, None);
@@ -4321,6 +5006,16 @@ async fn run_scheduled_season_backups(app: &AppHandle) -> Result<(), String> {
                         season_id, error
                     ),
                 );
+                if should_stop_scheduled_backup_batch(&error) {
+                    append_toolbox_log(
+                        &state,
+                        &format!(
+                            "toolbox_bilibili_season_schedule_stop reason=risk_control season_id={} err={}",
+                            season_id, error
+                        ),
+                    );
+                    break;
+                }
             }
         }
     }
@@ -4331,6 +5026,190 @@ async fn run_scheduled_season_backups(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_backup_stops_batch_after_risk_control() {
+        assert!(should_stop_scheduled_backup_batch(
+            "request was banned (code: -412)"
+        ));
+        assert!(should_stop_scheduled_backup_batch("系统限流 (code: -509)"));
+        assert!(!should_stop_scheduled_backup_batch(
+            "网络繁忙 (code: 69800)"
+        ));
+    }
+
+    #[test]
+    fn remux_modes_keep_copy_conversion_and_flv_transcode_distinct() {
+        let copy_encoder = VideoMaskEncoder {
+            name: "copy".to_string(),
+            options: Vec::new(),
+            hardware: false,
+            fallback_note: None,
+        };
+        let software_encoder = software_video_encoder("h264", 20, "veryfast");
+        let copy_args = build_remux_args(
+            "input.flv",
+            "output.mp4",
+            RemuxMode::FlvToMp4,
+            &copy_encoder,
+        );
+        assert!(copy_args
+            .windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1] == "copy"));
+        assert!(!copy_args.iter().any(|arg| arg == "libx264"));
+
+        let fallback_args = build_remux_args(
+            "input.flv",
+            "output.mp4",
+            RemuxMode::FlvToMp4,
+            &software_encoder,
+        );
+        assert!(fallback_args.iter().any(|arg| arg == "libx264"));
+        assert!(fallback_args.iter().any(|arg| arg == "aac"));
+        assert!(!fallback_args
+            .windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1] == "copy"));
+
+        let transcode_args = build_remux_args(
+            "input.mov",
+            "output.flv",
+            RemuxMode::Mp4MovToFlv,
+            &software_encoder,
+        );
+        assert!(transcode_args.iter().any(|arg| arg == "libx264"));
+        assert!(transcode_args.iter().any(|arg| arg == "aac"));
+        assert!(transcode_args
+            .windows(2)
+            .any(|pair| pair[0] == "-f" && pair[1] == "flv"));
+    }
+
+    #[test]
+    fn merge_audio_video_keeps_expected_stream_mapping_for_each_speed_mode() {
+        let copy_encoder = VideoMaskEncoder {
+            name: "copy".to_string(),
+            options: Vec::new(),
+            hardware: false,
+            fallback_note: None,
+        };
+        let software_encoder = software_video_encoder("h264", 20, "veryfast");
+
+        for encoder in [&copy_encoder, &software_encoder] {
+            let args =
+                build_merge_audio_video_args("video.mov", "audio.mp3", "output.mp4", encoder);
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == "-map" && pair[1] == "0:v:0"));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == "-map" && pair[1] == "1:a:0"));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == "-c:a" && pair[1] == "aac"));
+        }
+
+        assert!(build_merge_audio_video_args(
+            "video.mov",
+            "audio.mp3",
+            "output.mp4",
+            &copy_encoder,
+        )
+        .windows(2)
+        .any(|pair| pair[0] == "-c:v" && pair[1] == "copy"));
+        assert!(build_merge_audio_video_args(
+            "video.mov",
+            "audio.mp3",
+            "output.mp4",
+            &software_encoder,
+        )
+        .windows(2)
+        .any(|pair| pair[0] == "-c:v" && pair[1] == "libx264"));
+    }
+
+    #[test]
+    fn media_task_runtime_persists_records_and_recovers_interrupted_tasks() {
+        let dir = test_dir();
+        let storage_path = dir.join("media-tasks.json");
+        let runtime = ToolboxMediaTaskRuntime::new(storage_path.clone());
+        let task = new_toolbox_media_task(
+            "FORMAT_CONVERT",
+            "test task".to_string(),
+            "input.mov",
+            None,
+            "output.flv",
+            "flv",
+            ToolboxMediaSpeedMode::Software,
+        );
+        let task_id = task.task_id.clone();
+        runtime.insert(task).expect("insert task");
+        runtime
+            .update(&task_id, |record| {
+                record.status = "RUNNING".to_string();
+                record.stage = "处理中".to_string();
+                record.progress = 42;
+            })
+            .expect("update task");
+        drop(runtime);
+
+        let restored = ToolboxMediaTaskRuntime::new(storage_path);
+        let records = restored.list().expect("list restored tasks");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].task_id, task_id);
+        assert_eq!(records[0].status, "FAILED");
+        assert_eq!(records[0].stage, "已中断");
+        assert_eq!(records[0].progress, 42);
+        assert_eq!(
+            records[0].error_message.as_deref(),
+            Some("应用已重启，原任务无法继续执行")
+        );
+    }
+
+    #[test]
+    fn media_task_runtime_rejects_duplicate_active_target() {
+        let dir = test_dir();
+        let runtime = ToolboxMediaTaskRuntime::new(dir.join("media-tasks.json"));
+        let first = new_toolbox_media_task(
+            "FORMAT_CONVERT",
+            "first".to_string(),
+            "input-a.mov",
+            None,
+            "same-output.flv",
+            "flv",
+            ToolboxMediaSpeedMode::Hardware,
+        );
+        let first_id = first.task_id.clone();
+        runtime.insert(first).expect("insert first task");
+
+        let duplicate = new_toolbox_media_task(
+            "FORMAT_CONVERT",
+            "duplicate".to_string(),
+            "input-b.mov",
+            None,
+            "same-output.flv",
+            "flv",
+            ToolboxMediaSpeedMode::Software,
+        );
+        assert_eq!(
+            runtime.insert(duplicate).unwrap_err(),
+            "相同输出路径已有等待或运行中的任务"
+        );
+
+        runtime
+            .update(&first_id, |record| {
+                record.status = "COMPLETED".to_string();
+            })
+            .expect("complete first task");
+        let next = new_toolbox_media_task(
+            "FORMAT_CONVERT",
+            "next".to_string(),
+            "input-b.mov",
+            None,
+            "same-output.flv",
+            "flv",
+            ToolboxMediaSpeedMode::Software,
+        );
+        runtime.insert(next).expect("reuse target after completion");
+        assert_eq!(runtime.list().expect("list tasks").len(), 2);
+    }
 
     fn test_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bili_clip_flow_mask_{}", Uuid::new_v4()));
@@ -4742,6 +5621,45 @@ mod tests {
         assert_eq!(sections[0].episodes[0].published_at, Some(1000));
         assert_eq!(sections[0].episodes[1].published_at, Some(2000));
         assert_eq!(sections[0].episodes[2].published_at, Some(3000));
+    }
+
+    #[test]
+    fn repeated_season_backup_reuses_all_existing_publish_times() {
+        let mut previous = test_season_backup("backup-id", 861, "测试合集");
+        previous.sections = vec![test_season_section(vec![
+            test_season_episode(10, Some(1000), 1),
+            test_season_episode(20, Some(2000), 2),
+        ])];
+        let cached = cached_publish_times_for_season(&[previous], 861);
+        let mut current_sections = vec![test_season_section(vec![
+            test_season_episode(10, None, 1),
+            test_season_episode(20, None, 2),
+        ])];
+
+        let reused = fill_section_episode_publish_times(&mut current_sections, &cached);
+
+        assert_eq!(reused, 2);
+        assert!(missing_publish_time_aids(&current_sections).is_empty());
+    }
+
+    #[test]
+    fn repeated_season_backup_queries_only_new_or_uncached_episodes() {
+        let mut previous = test_season_backup("backup-id", 861, "测试合集");
+        previous.sections = vec![test_season_section(vec![
+            test_season_episode(10, Some(1000), 1),
+            test_season_episode(20, None, 2),
+        ])];
+        let cached = cached_publish_times_for_season(&[previous], 861);
+        let mut current_sections = vec![test_season_section(vec![
+            test_season_episode(10, None, 1),
+            test_season_episode(20, None, 2),
+            test_season_episode(30, None, 3),
+        ])];
+
+        fill_section_episode_publish_times(&mut current_sections, &cached);
+        let missing = missing_publish_time_aids(&current_sections);
+
+        assert_eq!(missing, HashSet::from([20, 30]));
     }
 
     #[test]

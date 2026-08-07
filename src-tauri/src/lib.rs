@@ -33,6 +33,7 @@ struct AppState {
     live_runtime: Arc<live_recorder::LiveRuntime>,
     edit_upload_state: Arc<Mutex<commands::submission::EditUploadState>>,
     submission_remote_refresh_pause_count: Arc<AtomicUsize>,
+    toolbox_media_runtime: Arc<commands::toolbox::ToolboxMediaTaskRuntime>,
     baidu_sync_runtime: Arc<baidu_sync::BaiduSyncRuntime>,
     baidu_login_runtime: Arc<Mutex<commands::baidu_sync::BaiduLoginRuntime>>,
 }
@@ -104,6 +105,7 @@ pub fn run() {
             let log_path = log_dir.join("auth_debug.log");
             let app_log_path = log_dir.join("app_debug.log");
             let panic_log_path = log_dir.join("panic_debug.log");
+            let toolbox_media_task_path = app_dir.join("toolbox").join("media-tasks.json");
             utils::append_log(&app_log_path, "app_start");
             if let Some(resource_dir) = config::resolve_resource_bin_dir(&app.handle()) {
                 utils::append_log(
@@ -147,6 +149,9 @@ pub fn run() {
                     commands::submission::EditUploadState::default(),
                 )),
                 submission_remote_refresh_pause_count: Arc::new(AtomicUsize::new(0)),
+                toolbox_media_runtime: Arc::new(commands::toolbox::ToolboxMediaTaskRuntime::new(
+                    toolbox_media_task_path,
+                )),
                 baidu_sync_runtime: Arc::new(baidu_sync::BaiduSyncRuntime::new()),
                 baidu_login_runtime: Arc::new(Mutex::new(
                     commands::baidu_sync::BaiduLoginRuntime::default(),
@@ -256,6 +261,8 @@ pub fn run() {
             commands::process::process_create,
             commands::process::process_status,
             commands::toolbox::toolbox_remux,
+            commands::toolbox::toolbox_merge_audio_video,
+            commands::toolbox::toolbox_media_task_list,
             commands::toolbox::toolbox_video_probe,
             commands::toolbox::toolbox_video_mask_probe,
             commands::toolbox::toolbox_video_mask_keyframes,

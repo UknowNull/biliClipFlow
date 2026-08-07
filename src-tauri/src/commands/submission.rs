@@ -28,7 +28,7 @@ use url::form_urlencoded;
 
 use crate::api::ApiResponse;
 use crate::baidu_sync;
-use crate::bilibili::client::BilibiliClient;
+use crate::bilibili::client::{is_bilibili_risk_control_error, BilibiliClient};
 use crate::commands::settings::{
     load_download_settings_from_db, DEFAULT_SUBMISSION_REMOTE_REFRESH_MINUTES,
     DEFAULT_UPLOAD_CONCURRENCY,
@@ -14234,14 +14234,17 @@ impl Default for TaskUploadRateLimitState {
 }
 
 fn is_rate_limit_error(err: &str) -> bool {
-    err.contains("21540")
-        || err.contains("code: -702")
-        || err.contains("请求过于频繁")
-        || err.contains("请求频率过高")
+    err.contains("21540") || is_bilibili_risk_control_error(err)
 }
 
 fn is_remote_part_count_mismatch_error(err: &str) -> bool {
     err.contains("远程分P数量与本地不一致")
+}
+
+fn should_retry_remote_part_verification(error: Option<&str>) -> bool {
+    error
+        .map(|error| !is_bilibili_risk_control_error(error))
+        .unwrap_or(true)
 }
 
 fn is_submission_reconciliation_status(status: &str) -> bool {
@@ -15007,7 +15010,9 @@ async fn verify_remote_part_count(
                 last_error = Some(err);
             }
         }
-        if attempt < REMOTE_PART_VERIFY_RETRY_LIMIT {
+        if attempt < REMOTE_PART_VERIFY_RETRY_LIMIT
+            && should_retry_remote_part_verification(last_error.as_deref())
+        {
             append_log(
                 &context.app_log_path,
                 &format!(
@@ -16306,7 +16311,7 @@ async fn submission_remote_refresh_loop(context: SubmissionQueueContext) {
             append_log(
                 &context.app_log_path,
                 &format!(
-                    "submission_remote_refresh_skip reason=toolbox_bilibili_season_restore_active count={}",
+                    "submission_remote_refresh_skip reason=toolbox_bilibili_season_operation_active count={}",
                     pause_count
                 ),
             );
@@ -16666,7 +16671,7 @@ fn load_remote_tasks_by_owner(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE COALESCE(st.remote_status_ignored, 0) = 0 AND ((st.bvid IS NOT NULL AND TRIM(st.bvid) != '') OR st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED'))",
+                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE COALESCE(st.remote_status_ignored, 0) = 0 AND st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED')",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -16687,7 +16692,9 @@ fn load_remote_tasks_by_owner(
             let mut groups = HashMap::<Option<i64>, Vec<RemoteTrackedTask>>::new();
             for row in rows {
                 let (task, owner_uid) = row?;
-                groups.entry(owner_uid).or_default().push(task);
+                if task.needs_reconciliation() {
+                    groups.entry(owner_uid).or_default().push(task);
+                }
             }
             Ok(groups)
         })
@@ -16819,9 +16826,7 @@ async fn fetch_remote_audit_map_by_status(
             break;
         }
         page += 1;
-        if status == REMOTE_AUDIT_STATUS_PUBLISHED {
-            sleep(Duration::from_secs(REMOTE_PUBLISHED_PAGE_WAIT_SECS)).await;
-        }
+        sleep(Duration::from_secs(REMOTE_PUBLISHED_PAGE_WAIT_SECS)).await;
     }
 
     append_log(
@@ -23336,8 +23341,22 @@ mod tests {
     #[test]
     fn rate_limit_detection_includes_submission_code_minus_702() {
         assert!(is_rate_limit_error("请求频率过高，请稍后再试 (code: -702)"));
+        assert!(is_rate_limit_error("request was banned (code: -412)"));
         assert!(is_rate_limit_error("请求过于频繁"));
         assert!(!is_rate_limit_error("网络繁忙 (code: 69800)"));
+    }
+
+    #[test]
+    fn remote_part_verification_stops_retrying_after_risk_control() {
+        assert!(!should_retry_remote_part_verification(Some(
+            "request was banned (code: -412)"
+        )));
+        assert!(!should_retry_remote_part_verification(Some(
+            "系统限流 (code: -509)"
+        )));
+        assert!(should_retry_remote_part_verification(Some(
+            "暂未读取到远程稿件分P信息"
+        )));
     }
 
     #[test]

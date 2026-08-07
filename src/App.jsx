@@ -21,6 +21,7 @@ const sections = [
     short: "工",
     children: [
       { id: "toolbox.remux", label: "格式转码" },
+      { id: "toolbox.audio_video_merge", label: "音视频合并" },
       { id: "toolbox.video_mask", label: "视频遮罩" },
       { id: "toolbox.bilibili_season_backup", label: "合集备份" },
     ],
@@ -37,6 +38,7 @@ const sectionLabels = {
   submission_sync: "视频同步",
   toolbox: "工具箱",
   "toolbox.remux": "格式转码",
+  "toolbox.audio_video_merge": "音视频合并",
   "toolbox.video_mask": "视频遮罩",
   "toolbox.bilibili_season_backup": "合集备份",
   settings: "设置",

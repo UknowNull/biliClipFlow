@@ -6,11 +6,33 @@ import VideoMaskWorkspace from "./toolbox/VideoMaskProjectTool";
 
 const toolboxTabs = [
   { key: "remux", label: "格式转码" },
+  { key: "audio_video_merge", label: "音视频合并" },
   { key: "video_mask", label: "视频遮罩" },
   { key: "bilibili_season_backup", label: "合集备份" },
 ];
 
+const mediaSpeedLabel = (value) => {
+  if (value === "copy") return "自动直拷贝";
+  if (value === "hardware") return "自动硬件加速";
+  if (value === "software") return "软件兜底";
+  return value || "-";
+};
+
+const mediaTaskStatusLabel = (status) => {
+  if (status === "QUEUED") return "等待执行";
+  if (status === "RUNNING") return "处理中";
+  if (status === "COMPLETED") return "已完成";
+  if (status === "FAILED") return "失败";
+  return status || "未知";
+};
+
 const normalizePath = (path) => String(path || "").replace(/\\/g, "/");
+
+const parentDirectory = (path) => {
+  const normalized = normalizePath(path).replace(/\/+$/, "");
+  const separatorIndex = normalized.lastIndexOf("/");
+  return separatorIndex >= 0 ? normalized.slice(0, separatorIndex + 1) : "";
+};
 
 const buildDefaultTarget = (sourcePath, suffix = "", extension = "mp4") => {
   const normalized = normalizePath(sourcePath);
@@ -132,21 +154,27 @@ const formatRestoreMessage = (result) => {
 function RemuxTool() {
   const [sourcePath, setSourcePath] = useState("");
   const [targetPath, setTargetPath] = useState("");
+  const [outputFormat, setOutputFormat] = useState("mp4");
   const [message, setMessage] = useState("");
   const [running, setRunning] = useState(false);
+  const [taskRefreshKey, setTaskRefreshKey] = useState(0);
 
-  const defaultTarget = useMemo(() => buildDefaultTarget(sourcePath), [sourcePath]);
+  const defaultTarget = useMemo(() => buildDefaultTarget(sourcePath, "", outputFormat), [sourcePath, outputFormat]);
+  const sourceFilters = outputFormat === "flv"
+    ? [{ name: "MP4 / MOV", extensions: ["mp4", "mov"] }]
+    : [{ name: "FLV", extensions: ["flv"] }];
+  const sourcePlaceholder = outputFormat === "flv" ? "请选择 MP4 或 MOV 文件" : "请选择 FLV 文件";
 
   const handlePickSource = async () => {
     setMessage("");
     const selected = await open({
       multiple: false,
       directory: false,
-      title: "选择 FLV 文件",
-      filters: [{ name: "FLV", extensions: ["flv"] }],
+      title: sourcePlaceholder,
+      filters: sourceFilters,
     });
     if (typeof selected === "string") {
-      const nextDefault = buildDefaultTarget(selected);
+      const nextDefault = buildDefaultTarget(selected, "", outputFormat);
       setSourcePath(selected);
       setTargetPath((prev) => (!prev || prev === defaultTarget ? nextDefault : prev));
     }
@@ -155,19 +183,19 @@ function RemuxTool() {
   const handlePickTarget = async () => {
     setMessage("");
     const selected = await save({
-      title: "保存 MP4 文件",
-      filters: [{ name: "MP4", extensions: ["mp4"] }],
+      title: `保存 ${outputFormat.toUpperCase()} 文件`,
+      filters: [{ name: outputFormat.toUpperCase(), extensions: [outputFormat] }],
       defaultPath: defaultTarget || undefined,
     });
     if (typeof selected === "string") {
-      setTargetPath(ensureExtension(selected, "mp4"));
+      setTargetPath(ensureExtension(selected, outputFormat));
     }
   };
 
   const handleRemux = async () => {
     setMessage("");
     if (!sourcePath.trim()) {
-      setMessage("请选择 FLV 文件");
+      setMessage(sourcePlaceholder);
       return;
     }
     if (!targetPath.trim()) {
@@ -180,9 +208,11 @@ function RemuxTool() {
         payload: {
           sourcePath,
           targetPath,
+          outputFormat,
         },
       });
-      setMessage("转封装完成");
+      setTaskRefreshKey((value) => value + 1);
+      setMessage("任务已创建，可继续添加其他任务");
     } catch (error) {
       setMessage(error?.message || "转封装失败");
     } finally {
@@ -195,26 +225,150 @@ function RemuxTool() {
       <div className="panel p-4 space-y-3">
         <div className="space-y-1">
           <div className="text-lg font-semibold">格式转码</div>
-          <div className="desc">基于 FFmpeg 转封装，仅支持 FLV 转 MP4，不进行重新编码。</div>
+          <div className="desc">基于 FFmpeg 自动处理：优先使用最快方案，失败时自动回退兼容编码。</div>
         </div>
         <div className="space-y-2">
-          <PathPicker value={sourcePath} placeholder="请选择 FLV 文件" buttonText="选择文件" onPick={handlePickSource} />
-          <PathPicker value={targetPath} placeholder="请选择输出 MP4 路径" buttonText="保存到" onPick={handlePickTarget} />
+          <label className="flex items-center gap-2 text-sm">
+            <span className="shrink-0">转换方向</span>
+            <select
+              className="h-8 min-w-0 flex-1 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-2"
+              value={outputFormat}
+              onChange={(event) => {
+                setOutputFormat(event.target.value);
+                setTargetPath("");
+                setSourcePath("");
+                setMessage("");
+              }}
+              disabled={running}
+            >
+              <option value="mp4">FLV → MP4（转封装）</option>
+              <option value="flv">MP4 / MOV → FLV（转码）</option>
+            </select>
+          </label>
+          <PathPicker value={sourcePath} placeholder={sourcePlaceholder} buttonText="选择文件" onPick={handlePickSource} />
+          <PathPicker value={targetPath} placeholder={`请选择输出 ${outputFormat.toUpperCase()} 路径`} buttonText="保存到" onPick={handlePickTarget} />
           <ActionLine message={message}>
             <button className="h-8 px-3 rounded-lg" onClick={handleRemux} disabled={running}>
-              {running ? "转封装中..." : "开始转封装"}
+              {running ? "创建中..." : "创建转换任务"}
             </button>
           </ActionLine>
         </div>
       </div>
 
       <div className="panel p-4 space-y-1 text-xs text-[var(--desc-color)]">
-        <div>1. 选择需要转封装的 FLV 文件。</div>
-        <div>2. 选择 MP4 保存位置。</div>
-        <div>3. 转封装会占用磁盘 IO，可能影响正在进行的录制。</div>
+        <div>1. FLV → MP4 优先转封装，异常源自动回退转码；MP4/MOV → FLV 自动优先硬件编码。</div>
+        <div>2. 选择源文件和对应输出格式。</div>
+        <div>3. 多任务按创建顺序排队，最多同时处理 2 个；转码会占用 CPU/GPU 和磁盘 IO。</div>
         <div>4. 如果录制文件存在问题，请先修复后再转封装。</div>
-        <div>5. 转封装后无法再进行修复，请确认文件正常。</div>
+        <div>5. 硬件编码不可用时自动回退软件兼容编码。</div>
       </div>
+      <MediaTaskRecords taskType="FORMAT_CONVERT" refreshKey={taskRefreshKey} />
+    </>
+  );
+}
+
+function MergeAudioVideoTool() {
+  const [videoPath, setVideoPath] = useState("");
+  const [audioPath, setAudioPath] = useState("");
+  const [targetPath, setTargetPath] = useState("");
+  const [message, setMessage] = useState("");
+  const [running, setRunning] = useState(false);
+  const [taskRefreshKey, setTaskRefreshKey] = useState(0);
+  const defaultTarget = useMemo(() => buildDefaultTarget(videoPath, "-merged", "mp4"), [videoPath]);
+
+  const handlePickVideo = async () => {
+    setMessage("");
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      title: "选择视频文件",
+      filters: [{ name: "视频", extensions: ["flv", "mp4", "mov", "mkv", "webm", "ts", "m4v"] }],
+    });
+    if (typeof selected === "string") {
+      setVideoPath(selected);
+      const nextDefault = buildDefaultTarget(selected, "-merged", "mp4");
+      setTargetPath((prev) => (!prev || prev === defaultTarget ? nextDefault : prev));
+    }
+  };
+
+  const handlePickAudio = async () => {
+    setMessage("");
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      title: "选择音频文件",
+      filters: [{ name: "音频", extensions: ["mp3", "mp4", "m4a", "aac", "wav", "flac", "ogg"] }],
+    });
+    if (typeof selected === "string") {
+      setAudioPath(selected);
+    }
+  };
+
+  const handlePickTarget = async () => {
+    setMessage("");
+    const selected = await save({
+      title: "保存合并后的视频",
+      filters: [{ name: "MP4", extensions: ["mp4"] }],
+      defaultPath: defaultTarget || undefined,
+    });
+    if (typeof selected === "string") {
+      setTargetPath(ensureExtension(selected, "mp4"));
+    }
+  };
+
+  const handleMerge = async () => {
+    setMessage("");
+    if (!videoPath.trim()) {
+      setMessage("请选择视频文件");
+      return;
+    }
+    if (!audioPath.trim()) {
+      setMessage("请选择音频文件");
+      return;
+    }
+    if (!targetPath.trim()) {
+      setMessage("请选择输出 MP4 路径");
+      return;
+    }
+    setRunning(true);
+    try {
+      await invokeCommand("toolbox_merge_audio_video", {
+        payload: { videoPath, audioPath, targetPath },
+      });
+      setTaskRefreshKey((value) => value + 1);
+      setMessage("任务已创建，可继续添加其他任务");
+    } catch (error) {
+      setMessage(error?.message || "音视频合并失败");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="panel p-4 space-y-3">
+        <div className="space-y-1">
+          <div className="text-lg font-semibold">音视频合并</div>
+          <div className="desc">将视频流与独立音频流合并为 MP4，自动优先硬件编码并在必要时回退。</div>
+        </div>
+        <div className="space-y-2">
+          <PathPicker value={videoPath} placeholder="请选择 FLV、MP4、MOV 等视频文件" buttonText="选择视频" onPick={handlePickVideo} />
+          <PathPicker value={audioPath} placeholder="请选择 MP3、MP4、M4A 等音频文件" buttonText="选择音频" onPick={handlePickAudio} />
+          <PathPicker value={targetPath} placeholder="请选择输出 MP4 路径" buttonText="保存到" onPick={handlePickTarget} />
+          <ActionLine message={message}>
+            <button className="h-8 px-3 rounded-lg" onClick={handleMerge} disabled={running}>
+              {running ? "创建中..." : "创建合并任务"}
+            </button>
+          </ActionLine>
+        </div>
+      </div>
+
+      <div className="panel p-4 space-y-1 text-xs text-[var(--desc-color)]">
+        <div>1. 视频文件只取第一路视频，音频文件只取第一路音频。</div>
+        <div>2. 输出以较短的音视频流为结束点，避免生成无效尾部。</div>
+        <div>3. 视频编码自动选择兼容的硬件方案，硬件不可用时回退 H.264 软件编码；音频统一为 AAC。</div>
+      </div>
+      <MediaTaskRecords taskType="AUDIO_VIDEO_MERGE" refreshKey={taskRefreshKey} />
     </>
   );
 }
@@ -749,6 +903,107 @@ function BilibiliSeasonBackupTool() {
   );
 }
 
+function MediaTaskRecords({ taskType, refreshKey }) {
+  const [tasks, setTasks] = useState([]);
+  const [loadError, setLoadError] = useState("");
+  const [openError, setOpenError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    const loadTasks = async () => {
+      try {
+        const data = await invokeCommand("toolbox_media_task_list");
+        if (!active) return;
+        setTasks((Array.isArray(data) ? data : []).filter((task) => task.taskType === taskType));
+        setLoadError("");
+      } catch (error) {
+        if (active) setLoadError(error?.message || "读取任务记录失败");
+      }
+    };
+    loadTasks();
+    const timer = window.setInterval(loadTasks, 1000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [taskType, refreshKey]);
+
+  const handleOpenTaskFolder = async (task) => {
+    const folderPath = parentDirectory(task?.targetPath);
+    if (!folderPath) {
+      setOpenError("无法打开：任务没有有效输出路径");
+      return;
+    }
+    try {
+      const { openPath } = await import("@tauri-apps/plugin-opener");
+      await openPath(folderPath);
+      setOpenError("");
+    } catch (error) {
+      setOpenError(error?.message || "打开输出文件夹失败");
+    }
+  };
+
+  return (
+    <div className="panel p-4 space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="font-semibold">任务记录</div>
+        <div className="text-xs text-[var(--desc-color)]">{tasks.length} 条</div>
+      </div>
+      {loadError ? <div className="text-xs text-red-500">{loadError}</div> : null}
+      {openError ? <div className="text-xs text-red-500">{openError}</div> : null}
+      {tasks.length === 0 ? (
+        <div className="text-sm text-[var(--desc-color)]">暂无任务记录</div>
+      ) : (
+        <div className="space-y-2">
+          {tasks.map((task) => {
+            const progress = Math.max(0, Math.min(100, Number(task.progress) || 0));
+            const statusClass = task.status === "COMPLETED"
+              ? "text-emerald-600"
+              : task.status === "FAILED"
+                ? "text-red-500"
+                : "text-amber-600";
+            return (
+              <div key={task.taskId} className="rounded-lg border border-[var(--split-color)] p-3 space-y-2">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium" title={task.title}>{task.title}</div>
+                    <div className="truncate text-xs text-[var(--desc-color)]" title={task.targetPath}>
+                      {task.targetPath}
+                    </div>
+                  </div>
+                  <div className={`shrink-0 text-xs font-medium ${statusClass}`}>
+                    {mediaTaskStatusLabel(task.status)}
+                  </div>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-black/5">
+                  <div className="h-full bg-[var(--accent)] transition-[width]" style={{ width: `${progress}%` }} />
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[var(--desc-color)]">
+                  <span>{progress}% · {task.stage || "-"}</span>
+                  <span>{mediaSpeedLabel(task.speedMode)} · {task.encoder || "准备中"}</span>
+                  <span>{formatDateTime(task.createdAt)}</span>
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    className="h-7 px-2 text-xs rounded-lg"
+                    onClick={() => handleOpenTaskFolder(task)}
+                    disabled={!parentDirectory(task.targetPath)}
+                  >
+                    打开所在文件夹
+                  </button>
+                </div>
+                {task.errorMessage ? (
+                  <div className="break-all text-xs text-red-500">{task.errorMessage}</div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PathPicker({ value, placeholder, buttonText, onPick }) {
   return (
     <div className="flex items-center gap-2">
@@ -775,6 +1030,7 @@ export default function ToolboxSection({ activeTool = "remux" }) {
   return (
     <div className="min-w-0 space-y-4 overflow-y-auto pr-1">
       {activeTab === "remux" ? <RemuxTool /> : null}
+      {activeTab === "audio_video_merge" ? <MergeAudioVideoTool /> : null}
       {activeTab === "video_mask" ? <VideoMaskWorkspace /> : null}
       {activeTab === "bilibili_season_backup" ? <BilibiliSeasonBackupTool /> : null}
     </div>
