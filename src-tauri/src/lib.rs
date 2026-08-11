@@ -34,6 +34,7 @@ struct AppState {
     edit_upload_state: Arc<Mutex<commands::submission::EditUploadState>>,
     submission_remote_refresh_pause_count: Arc<AtomicUsize>,
     toolbox_media_runtime: Arc<commands::toolbox::ToolboxMediaTaskRuntime>,
+    toolbox_season_backup_queue: Arc<commands::toolbox::SeasonBackupQueue>,
     baidu_sync_runtime: Arc<baidu_sync::BaiduSyncRuntime>,
     baidu_login_runtime: Arc<Mutex<commands::baidu_sync::BaiduLoginRuntime>>,
 }
@@ -106,6 +107,8 @@ pub fn run() {
             let app_log_path = log_dir.join("app_debug.log");
             let panic_log_path = log_dir.join("panic_debug.log");
             let toolbox_media_task_path = app_dir.join("toolbox").join("media-tasks.json");
+            let (toolbox_season_backup_queue, toolbox_season_backup_receiver) =
+                commands::toolbox::SeasonBackupQueue::new();
             utils::append_log(&app_log_path, "app_start");
             if let Some(resource_dir) = config::resolve_resource_bin_dir(&app.handle()) {
                 utils::append_log(
@@ -152,6 +155,7 @@ pub fn run() {
                 toolbox_media_runtime: Arc::new(commands::toolbox::ToolboxMediaTaskRuntime::new(
                     toolbox_media_task_path,
                 )),
+                toolbox_season_backup_queue: Arc::new(toolbox_season_backup_queue),
                 baidu_sync_runtime: Arc::new(baidu_sync::BaiduSyncRuntime::new()),
                 baidu_login_runtime: Arc::new(Mutex::new(
                     commands::baidu_sync::BaiduLoginRuntime::default(),
@@ -191,6 +195,10 @@ pub fn run() {
             };
             baidu_sync::start_baidu_sync_loop(baidu_context);
             app.manage(state);
+            commands::toolbox::start_bilibili_season_backup_worker(
+                app.handle().clone(),
+                toolbox_season_backup_receiver,
+            );
             commands::toolbox::start_bilibili_season_backup_scheduler(app.handle().clone());
             Ok(())
         })

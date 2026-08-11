@@ -5994,7 +5994,9 @@ export default function SubmissionSection({
     if (status === "已通过") return "bg-emerald-500/10 text-emerald-600";
     if (status === "未通过" || status === "已锁定")
       return "bg-rose-500/10 text-rose-600";
-    return "bg-amber-500/10 text-amber-600";
+    if (status === "审核中" || status === "未同步")
+      return "bg-amber-500/10 text-amber-600";
+    return "bg-slate-500/10 text-slate-600";
   };
 
   const workflowStatusTone = (status) => {
@@ -6049,11 +6051,11 @@ export default function SubmissionSection({
       return "已通过";
     }
     if (!task?.bvid) {
-      return "进行中";
+      return "未生成";
     }
     const state = parseRemoteState(task);
     if (state === null) {
-      return "进行中";
+      return "未同步";
     }
     if (state === -2) {
       return "未通过";
@@ -6065,9 +6067,9 @@ export default function SubmissionSection({
       return "已通过";
     }
     if (state === -30) {
-      return "进行中";
+      return "审核中";
     }
-    return "进行中";
+    return `未知（${state}）`;
   };
 
   const isRemoteRejected = (task) => {

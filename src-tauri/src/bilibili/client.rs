@@ -149,6 +149,12 @@ impl BilibiliClient {
                 HeaderValue::from_static("https://live.bilibili.com"),
             );
         }
+        if is_season_archive_request_url(url) {
+            headers.insert(
+                REFERER,
+                HeaderValue::from_static("https://space.bilibili.com/"),
+            );
+        }
 
         let is_archive_request = is_archive_request_url(url);
         let mut archive_state = if is_archive_request {
@@ -337,7 +343,11 @@ async fn parse_http_response(response: reqwest::Response) -> Result<Value, Strin
 }
 
 fn is_archive_request_url(url: &str) -> bool {
-    url.contains("member.bilibili.com/x/web/archives")
+    url.contains("member.bilibili.com/x/web/archives") || is_season_archive_request_url(url)
+}
+
+fn is_season_archive_request_url(url: &str) -> bool {
+    url.contains("api.bilibili.com/x/polymer/web-space/seasons_archives_list")
 }
 
 pub fn is_bilibili_ban_error(error: &str) -> bool {
@@ -434,6 +444,16 @@ mod tests {
         ));
         assert!(!is_bilibili_risk_control_error(
             "网络繁忙 请稍后再试 (code: 69800)"
+        ));
+    }
+
+    #[test]
+    fn season_archive_requests_share_archive_rate_limit() {
+        assert!(is_archive_request_url(
+            "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list"
+        ));
+        assert!(is_season_archive_request_url(
+            "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list"
         ));
     }
 

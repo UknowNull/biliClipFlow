@@ -16157,6 +16157,8 @@ struct RemoteTrackedTask {
     aid: i64,
     title: String,
     status: String,
+    remote_state: Option<i64>,
+    remote_status_ignored: bool,
     reconciliation_at: String,
     error_message: String,
     expected_parts: usize,
@@ -16164,6 +16166,14 @@ struct RemoteTrackedTask {
 }
 
 impl RemoteTrackedTask {
+    fn needs_remote_refresh(&self) -> bool {
+        !self.remote_status_ignored
+            && (self.needs_reconciliation()
+                || (self.status == "COMPLETED"
+                    && !self.bvid.trim().is_empty()
+                    && matches!(self.remote_state, None | Some(-30))))
+    }
+
     fn needs_reconciliation(&self) -> bool {
         if is_submission_reconciliation_status(&self.status) {
             return true;
@@ -16671,7 +16681,7 @@ fn load_remote_tasks_by_owner(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE COALESCE(st.remote_status_ignored, 0) = 0 AND st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED')",
+                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.remote_state, COALESCE(st.remote_status_ignored, 0), st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED') OR (st.status = 'COMPLETED' AND COALESCE(TRIM(st.bvid), '') <> '' AND (st.remote_state IS NULL OR st.remote_state = -30))",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -16681,18 +16691,20 @@ fn load_remote_tasks_by_owner(
                         aid: row.get(2)?,
                         title: row.get(3)?,
                         status: row.get(4)?,
-                        reconciliation_at: row.get(5)?,
-                        error_message: row.get(6)?,
-                        expected_parts: row.get::<_, i64>(7)?.max(0) as usize,
-                        collection_section_id: row.get(9)?,
+                        remote_state: row.get(5)?,
+                        remote_status_ignored: row.get::<_, i64>(6)? != 0,
+                        reconciliation_at: row.get(7)?,
+                        error_message: row.get(8)?,
+                        expected_parts: row.get::<_, i64>(9)?.max(0) as usize,
+                        collection_section_id: row.get(11)?,
                     },
-                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(10)?,
                 ))
             })?;
             let mut groups = HashMap::<Option<i64>, Vec<RemoteTrackedTask>>::new();
             for row in rows {
                 let (task, owner_uid) = row?;
-                if task.needs_reconciliation() {
+                if task.needs_remote_refresh() {
                     groups.entry(owner_uid).or_default().push(task);
                 }
             }
@@ -23606,6 +23618,8 @@ mod tests {
             aid: 0,
             title: "测试投稿".to_string(),
             status: SUBMISSION_STATUS_SUBMIT_UNKNOWN.to_string(),
+            remote_state: None,
+            remote_status_ignored: false,
             reconciliation_at: "2027-01-15T07:59:00+00:00".to_string(),
             error_message: "SUBMIT_RESULT_UNKNOWN: test".to_string(),
             expected_parts: 3,
@@ -23648,5 +23662,40 @@ mod tests {
             1_800_000_100,
         )
         .is_none());
+    }
+
+    fn build_remote_refresh_task(
+        status: &str,
+        bvid: &str,
+        remote_state: Option<i64>,
+    ) -> RemoteTrackedTask {
+        RemoteTrackedTask {
+            task_id: "task-refresh".to_string(),
+            bvid: bvid.to_string(),
+            aid: 123,
+            title: "测试投稿".to_string(),
+            status: status.to_string(),
+            remote_state,
+            remote_status_ignored: false,
+            reconciliation_at: "2027-01-15T07:59:00+00:00".to_string(),
+            error_message: String::new(),
+            expected_parts: 1,
+            collection_section_id: 0,
+        }
+    }
+
+    #[test]
+    fn completed_task_with_missing_remote_state_requires_refresh() {
+        assert!(build_remote_refresh_task("COMPLETED", "BV1test", None).needs_remote_refresh());
+        assert!(build_remote_refresh_task("COMPLETED", "BV1test", Some(-30)).needs_remote_refresh());
+        assert!(!build_remote_refresh_task("COMPLETED", "BV1test", Some(0)).needs_remote_refresh());
+        assert!(!build_remote_refresh_task("COMPLETED", "", None).needs_remote_refresh());
+    }
+
+    #[test]
+    fn ignored_task_is_not_refreshed_even_when_state_is_missing() {
+        let mut task = build_remote_refresh_task("COMPLETED", "BV1test", None);
+        task.remote_status_ignored = true;
+        assert!(!task.needs_remote_refresh());
     }
 }

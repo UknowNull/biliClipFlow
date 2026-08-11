@@ -10,7 +10,7 @@ use chrono::{Duration as ChronoDuration, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -22,13 +22,11 @@ use crate::processing::probe_duration_seconds;
 use crate::utils;
 use crate::AppState;
 
-const BILIBILI_ARCHIVE_STATUS_REVIEWING: &str = "is_pubing";
-const BILIBILI_ARCHIVE_STATUS_REJECTED: &str = "not_pubed";
-const BILIBILI_ARCHIVE_STATUS_PUBLISHED: &str = "pubed";
 const VIDEO_MASK_COPY_SEEK_EPSILON: f64 = 0.001;
 const VIDEO_MASK_RENDER_PROGRESS_EVENT: &str = "toolbox://video-mask-render-progress";
-const SEASON_BACKUP_TASK_INTERVAL_SECONDS: u64 = 3;
+const SEASON_BACKUP_ARCHIVE_PAGE_SIZE: i64 = 100;
 const SEASON_BACKUP_ARCHIVE_PAGE_WAIT_MILLIS: u64 = 1500;
+const SEASON_BACKUP_QUEUE_CAPACITY: usize = 32;
 const VIDEO_MASK_DEFAULT_CRF: i64 = 16;
 const TOOLBOX_MEDIA_TASK_HISTORY_LIMIT: usize = 200;
 const TOOLBOX_MEDIA_MAX_CONCURRENT_TASKS: usize = 2;
@@ -52,6 +50,61 @@ impl Drop for RemoteRefreshPauseGuard {
 
 fn should_stop_scheduled_backup_batch(error: &str) -> bool {
     is_bilibili_risk_control_error(error)
+}
+
+pub(crate) enum SeasonBackupJobSource {
+    Manual(oneshot::Sender<ApiResponse<SeasonBackup>>),
+    Scheduled {
+        title: String,
+        completion: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+pub(crate) struct SeasonBackupJob {
+    pub(crate) season_id: i64,
+    pub(crate) source: SeasonBackupJobSource,
+}
+
+pub(crate) struct SeasonBackupQueue {
+    sender: mpsc::Sender<SeasonBackupJob>,
+    active_seasons: Mutex<HashSet<i64>>,
+}
+
+impl SeasonBackupQueue {
+    pub(crate) fn new() -> (Self, mpsc::Receiver<SeasonBackupJob>) {
+        let (sender, receiver) = mpsc::channel(SEASON_BACKUP_QUEUE_CAPACITY);
+        (
+            Self {
+                sender,
+                active_seasons: Mutex::new(HashSet::new()),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) async fn enqueue(&self, job: SeasonBackupJob) -> Result<bool, String> {
+        {
+            let mut active = self
+                .active_seasons
+                .lock()
+                .map_err(|_| "合集备份队列锁已损坏".to_string())?;
+            if !active.insert(job.season_id) {
+                return Ok(false);
+            }
+        }
+        let season_id = job.season_id;
+        if self.sender.send(job).await.is_err() {
+            self.finish(season_id);
+            return Err("合集备份队列已停止".to_string());
+        }
+        Ok(true)
+    }
+
+    fn finish(&self, season_id: i64) {
+        if let Ok(mut active) = self.active_seasons.lock() {
+            active.remove(&season_id);
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1518,6 +1571,14 @@ pub struct SeasonBackup {
     pub created_at: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishTimeCacheEntry {
+    owner_uid: i64,
+    aid: i64,
+    published_at: i64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeasonRestoreResult {
@@ -1841,34 +1902,26 @@ pub fn toolbox_bilibili_season_backup_delete(
 
 #[tauri::command]
 pub async fn toolbox_bilibili_season_backup(
-    app: AppHandle,
     state: State<'_, AppState>,
     payload: SeasonBackupPayload,
 ) -> Result<ApiResponse<SeasonBackup>, String> {
-    let auth = match load_active_auth(&state) {
-        Ok(auth) => auth,
+    let (sender, receiver) = oneshot::channel();
+    let queued = state
+        .toolbox_season_backup_queue
+        .enqueue(SeasonBackupJob {
+            season_id: payload.season_id,
+            source: SeasonBackupJobSource::Manual(sender),
+        })
+        .await;
+    match queued {
+        Ok(true) => {}
+        Ok(false) => return Ok(ApiResponse::error("该合集已在备份队列中")),
         Err(err) => return Ok(ApiResponse::error(err)),
-    };
-    let _remote_refresh_pause_guard =
-        RemoteRefreshPauseGuard::new(Arc::clone(&state.submission_remote_refresh_pause_count));
-    let detail = match fetch_season_detail(&state, &auth, payload.season_id).await {
-        Ok(item) => item,
-        Err(err) => return Ok(ApiResponse::error(err)),
-    };
-    let mut backups = match read_season_backups(&app) {
-        Ok(items) => items,
-        Err(err) => return Ok(ApiResponse::error(err)),
-    };
-    let existing_publish_times = cached_publish_times_for_season(&backups, payload.season_id);
-    let backup = match build_season_backup(&state, &auth, &detail, &existing_publish_times).await {
-        Ok(item) => item,
-        Err(err) => return Ok(ApiResponse::error(err)),
-    };
-    upsert_season_backup(&mut backups, backup.clone(), false);
-    if let Err(err) = write_season_backups(&app, &backups) {
-        return Ok(ApiResponse::error(err));
     }
-    Ok(ApiResponse::success(backup))
+    match receiver.await {
+        Ok(result) => Ok(result),
+        Err(_) => Ok(ApiResponse::error("合集备份队列已停止")),
+    }
 }
 
 #[tauri::command]
@@ -3601,6 +3654,7 @@ fn build_season_list_item(raw: &Value) -> SeasonListItem {
 }
 
 async fn build_season_backup(
+    app: &AppHandle,
     state: &State<'_, AppState>,
     auth: &AuthInfo,
     raw: &Value,
@@ -3648,17 +3702,59 @@ async fn build_season_backup(
     }
 
     sections.sort_by_key(|item| item.order);
-    let reused_publish_time_count =
+    let mut persistent_cache = match read_publish_time_cache(app) {
+        Ok(cache) => cache,
+        Err(error) => {
+            append_toolbox_log(
+                state,
+                &format!(
+                    "toolbox_bilibili_season_backup_publish_time_cache_reset err={}",
+                    error
+                ),
+            );
+            HashMap::new()
+        }
+    };
+    let mut reused_publish_time_count =
         fill_section_episode_publish_times(&mut sections, cached_publish_times);
-    let publish_times = fetch_archive_publish_times_for_backup(state, auth, &sections).await?;
+    if let Some(owner_uid) = auth.user_id.filter(|uid| *uid > 0) {
+        let migrated_count =
+            merge_publish_time_cache(&mut persistent_cache, owner_uid, cached_publish_times);
+        if migrated_count > 0 {
+            write_publish_time_cache(app, &persistent_cache)?;
+        }
+        let account_cached_times = publish_times_for_owner(&persistent_cache, owner_uid);
+        reused_publish_time_count +=
+            fill_section_episode_publish_times(&mut sections, &account_cached_times);
+    }
+    let season_id = season.get("id").and_then(|item| item.as_i64()).unwrap_or(0);
+    let publish_times = if missing_publish_time_aids(&sections).is_empty() {
+        HashMap::new()
+    } else {
+        let owner_uid = auth
+            .user_id
+            .filter(|uid| *uid > 0)
+            .ok_or_else(|| "登录信息缺少用户ID，无法查询合集视频投稿时间".to_string())?;
+        fetch_collection_publish_times(
+            app,
+            state,
+            auth,
+            season_id,
+            &sections,
+            owner_uid,
+            &mut persistent_cache,
+        )
+        .await?
+    };
     let fetched_publish_time_count =
         fill_section_episode_publish_times(&mut sections, &publish_times);
     append_toolbox_log(
         state,
         &format!(
-            "toolbox_bilibili_season_backup_publish_times source_season_id={} cached={} reused={} found={} filled={}",
-            season.get("id").and_then(|item| item.as_i64()).unwrap_or(0),
+            "toolbox_bilibili_season_backup_publish_times source_season_id={} previous_backup_cached={} persistent_cached={} reused={} fetched={} filled={}",
+            season_id,
             cached_publish_times.len(),
+            persistent_cache.len(),
             reused_publish_time_count,
             publish_times.len(),
             fetched_publish_time_count
@@ -3781,32 +3877,6 @@ fn episode_publish_time(raw: &Value) -> Option<i64> {
         .or_else(|| raw.get("publishTime").and_then(|item| item.as_i64()))
 }
 
-async fn fetch_archive_publish_times_for_backup(
-    state: &State<'_, AppState>,
-    auth: &AuthInfo,
-    sections: &[SeasonSectionBackup],
-) -> Result<HashMap<i64, i64>, String> {
-    let mut target_aids = missing_publish_time_aids(sections);
-    if target_aids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut result = HashMap::new();
-    for status in [
-        BILIBILI_ARCHIVE_STATUS_PUBLISHED,
-        BILIBILI_ARCHIVE_STATUS_REVIEWING,
-        BILIBILI_ARCHIVE_STATUS_REJECTED,
-    ] {
-        fetch_archive_publish_times_by_status(state, auth, status, &mut target_aids, &mut result)
-            .await?;
-        if target_aids.is_empty() {
-            break;
-        }
-    }
-
-    Ok(result)
-}
-
 fn missing_publish_time_aids(sections: &[SeasonSectionBackup]) -> HashSet<i64> {
     sections
         .iter()
@@ -3816,61 +3886,76 @@ fn missing_publish_time_aids(sections: &[SeasonSectionBackup]) -> HashSet<i64> {
         .collect()
 }
 
-async fn fetch_archive_publish_times_by_status(
+async fn fetch_collection_publish_times(
+    app: &AppHandle,
     state: &State<'_, AppState>,
     auth: &AuthInfo,
-    status: &str,
-    target_aids: &mut HashSet<i64>,
-    result: &mut HashMap<i64, i64>,
-) -> Result<(), String> {
-    let url = "https://member.bilibili.com/x/web/archives";
-    let page_size = 20_i64;
-    let mut page = 1_i64;
+    season_id: i64,
+    sections: &[SeasonSectionBackup],
+    owner_uid: i64,
+    persistent_cache: &mut HashMap<(i64, i64), i64>,
+) -> Result<HashMap<i64, i64>, String> {
+    let mut target_aids = missing_publish_time_aids(sections);
+    let mut result = HashMap::new();
+    if target_aids.is_empty() {
+        return Ok(result);
+    }
 
+    let url = "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list";
+    let mut page_num = 1_i64;
     loop {
-        if page > 1 {
+        if page_num > 1 {
             sleep(Duration::from_millis(
                 SEASON_BACKUP_ARCHIVE_PAGE_WAIT_MILLIS,
             ))
             .await;
         }
         let params = vec![
-            ("status".to_string(), status.to_string()),
-            ("pn".to_string(), page.to_string()),
-            ("ps".to_string(), page_size.to_string()),
-            ("coop".to_string(), "1".to_string()),
-            ("interactive".to_string(), "1".to_string()),
+            ("mid".to_string(), owner_uid.to_string()),
+            ("season_id".to_string(), season_id.to_string()),
+            ("sort_reverse".to_string(), "false".to_string()),
+            ("page_num".to_string(), page_num.to_string()),
+            (
+                "page_size".to_string(),
+                SEASON_BACKUP_ARCHIVE_PAGE_SIZE.to_string(),
+            ),
+            ("web_location".to_string(), "333.999".to_string()),
         ];
         let data = state
             .bilibili
             .get_json(url, &params, Some(auth), false)
             .await?;
-        let arc_audits = data
-            .get("arc_audits")
+        let archives = data
+            .get("archives")
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
 
-        for item in &arc_audits {
-            let Some(aid) = archive_aid_from_audit_item(item) else {
-                continue;
-            };
-            if !target_aids.contains(&aid) {
-                continue;
-            }
-            if let Some(published_at) = archive_publish_time_from_audit_item(item) {
-                target_aids.remove(&aid);
-                result.insert(aid, published_at);
+        for item in &archives {
+            if let Some((aid, published_at)) = collection_archive_publish_time(item) {
+                persistent_cache.insert((owner_uid, aid), published_at);
+                if target_aids.remove(&aid) {
+                    result.insert(aid, published_at);
+                }
             }
         }
+        write_publish_time_cache(app, persistent_cache)?;
 
+        let actual_page_size = data
+            .get("page")
+            .and_then(|value| value.get("page_size"))
+            .and_then(value_i64)
+            .filter(|value| *value > 0)
+            .unwrap_or(archives.len() as i64);
         append_toolbox_log(
             state,
             &format!(
-                "toolbox_bilibili_season_backup_archive_page status={} page={} items={} remaining={}",
-                status,
-                page,
-                arc_audits.len(),
+                "toolbox_bilibili_season_backup_collection_page season_id={} page={} requested_page_size={} actual_page_size={} items={} remaining={}",
+                season_id,
+                page_num,
+                SEASON_BACKUP_ARCHIVE_PAGE_SIZE,
+                actual_page_size,
+                archives.len(),
                 target_aids.len()
             ),
         );
@@ -3880,37 +3965,38 @@ async fn fetch_archive_publish_times_by_status(
         }
         let total_count = data
             .get("page")
-            .and_then(|value| value.get("count"))
-            .and_then(|value| value.as_i64())
+            .and_then(|value| value.get("total"))
+            .and_then(value_i64)
+            .or_else(|| data.get("total").and_then(value_i64))
             .unwrap_or(0);
-        if total_count <= 0 || page * page_size >= total_count || arc_audits.is_empty() {
+        let page_size = actual_page_size.max(1);
+        if total_count <= 0
+            || archives.is_empty()
+            || page_num >= (total_count + page_size - 1) / page_size
+            || archives.len() < page_size as usize
+        {
             break;
         }
-        page += 1;
+        page_num += 1;
     }
 
-    Ok(())
+    Ok(result)
 }
 
-fn archive_aid_from_audit_item(item: &Value) -> Option<i64> {
-    item.get("Archive")
-        .and_then(|value| value.get("aid"))
-        .and_then(|value| value.as_i64())
-        .or_else(|| item.get("aid").and_then(|value| value.as_i64()))
+fn value_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
 }
 
-fn archive_publish_time_from_audit_item(item: &Value) -> Option<i64> {
-    let archive = item.get("Archive").unwrap_or(item);
-    episode_publish_time(archive)
-        .or_else(|| archive.get("ptime").and_then(|value| value.as_i64()))
-        .or_else(|| archive.get("submit_time").and_then(|value| value.as_i64()))
-        .or_else(|| archive.get("submitTime").and_then(|value| value.as_i64()))
-        .or_else(|| archive.get("created_at").and_then(|value| value.as_i64()))
-        .or_else(|| archive.get("createdAt").and_then(|value| value.as_i64()))
-        .or_else(|| archive.get("mtime").and_then(|value| value.as_i64()))
-        .or_else(|| item.get("pubdate").and_then(|value| value.as_i64()))
-        .or_else(|| item.get("ctime").and_then(|value| value.as_i64()))
-        .or_else(|| item.get("mtime").and_then(|value| value.as_i64()))
+fn collection_archive_publish_time(item: &Value) -> Option<(i64, i64)> {
+    let aid = item.get("aid").and_then(value_i64)?;
+    let published_at = item
+        .get("pubdate")
+        .and_then(value_i64)
+        .or_else(|| item.get("ctime").and_then(value_i64))?;
+    Some((aid, published_at))
 }
 
 fn fill_section_episode_publish_times(
@@ -4772,6 +4858,76 @@ fn season_backups_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("bilibili-season-backups.json"))
 }
 
+fn publish_time_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("读取应用数据目录失败: {}", err))?
+        .join("toolbox");
+    fs::create_dir_all(&dir).map_err(|err| format!("创建投稿时间缓存目录失败: {}", err))?;
+    Ok(dir.join("bilibili-publish-time-cache.json"))
+}
+
+fn read_publish_time_cache(app: &AppHandle) -> Result<HashMap<(i64, i64), i64>, String> {
+    let path = publish_time_cache_path(app)?;
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let text = fs::read_to_string(path).map_err(|err| format!("读取投稿时间缓存失败: {}", err))?;
+    let entries = serde_json::from_str::<Vec<PublishTimeCacheEntry>>(&text)
+        .map_err(|err| format!("解析投稿时间缓存失败: {}", err))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.owner_uid > 0 && entry.aid > 0 && entry.published_at > 0)
+        .map(|entry| ((entry.owner_uid, entry.aid), entry.published_at))
+        .collect())
+}
+
+fn write_publish_time_cache(
+    app: &AppHandle,
+    cache: &HashMap<(i64, i64), i64>,
+) -> Result<(), String> {
+    let path = publish_time_cache_path(app)?;
+    let mut entries = cache
+        .iter()
+        .map(|((owner_uid, aid), published_at)| PublishTimeCacheEntry {
+            owner_uid: *owner_uid,
+            aid: *aid,
+            published_at: *published_at,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| (entry.owner_uid, entry.aid));
+    let text = serde_json::to_string_pretty(&entries)
+        .map_err(|err| format!("序列化投稿时间缓存失败: {}", err))?;
+    fs::write(path, text).map_err(|err| format!("写入投稿时间缓存失败: {}", err))
+}
+
+fn publish_times_for_owner(cache: &HashMap<(i64, i64), i64>, owner_uid: i64) -> HashMap<i64, i64> {
+    cache
+        .iter()
+        .filter_map(|((uid, aid), published_at)| {
+            (*uid == owner_uid).then_some((*aid, *published_at))
+        })
+        .collect()
+}
+
+fn merge_publish_time_cache(
+    cache: &mut HashMap<(i64, i64), i64>,
+    owner_uid: i64,
+    publish_times: &HashMap<i64, i64>,
+) -> usize {
+    let mut changed = 0usize;
+    for (aid, published_at) in publish_times {
+        if owner_uid <= 0 || *aid <= 0 || *published_at <= 0 {
+            continue;
+        }
+        if cache.insert((owner_uid, *aid), *published_at) != Some(*published_at) {
+            changed += 1;
+        }
+    }
+    changed
+}
+
 fn video_mask_thumbnail_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -4912,6 +5068,93 @@ fn seconds_until_next_local_midnight() -> u64 {
         .max(1) as u64
 }
 
+async fn execute_season_backup(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    season_id: i64,
+    preserve_backup_id: bool,
+) -> Result<SeasonBackup, String> {
+    let auth = load_active_auth(state)?;
+    let _remote_refresh_pause_guard =
+        RemoteRefreshPauseGuard::new(Arc::clone(&state.submission_remote_refresh_pause_count));
+    let detail = fetch_season_detail(state, &auth, season_id).await?;
+    let mut backups = read_season_backups(app)?;
+    let existing_publish_times = cached_publish_times_for_season(&backups, season_id);
+    let backup = build_season_backup(app, state, &auth, &detail, &existing_publish_times).await?;
+    upsert_season_backup(&mut backups, backup.clone(), preserve_backup_id);
+    write_season_backups(app, &backups)?;
+    Ok(backup)
+}
+
+fn record_scheduled_backup_result(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    season_id: i64,
+    title: &str,
+    result: &Result<SeasonBackup, String>,
+) -> Result<(), String> {
+    let mut schedules = read_season_backup_schedules(app)?;
+    match result {
+        Ok(backup) => {
+            update_schedule_status(&mut schedules, season_id, None);
+            write_season_backup_schedules(app, &schedules)?;
+            append_toolbox_log(
+                state,
+                &format!(
+                    "toolbox_bilibili_season_schedule_item_ok season_id={} title={} sections={} episodes={}",
+                    season_id, backup.title, backup.section_count, backup.captured_episode_count
+                ),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            update_schedule_status(&mut schedules, season_id, Some(error.clone()));
+            write_season_backup_schedules(app, &schedules)?;
+            append_toolbox_log(
+                state,
+                &format!(
+                    "toolbox_bilibili_season_schedule_item_error season_id={} title={} err={}",
+                    season_id, title, error
+                ),
+            );
+            Err(error.clone())
+        }
+    }
+}
+
+pub(crate) fn start_bilibili_season_backup_worker(
+    app: AppHandle,
+    mut receiver: mpsc::Receiver<SeasonBackupJob>,
+) {
+    tauri::async_runtime::spawn(async move {
+        while let Some(job) = receiver.recv().await {
+            let season_id = job.season_id;
+            let preserve_backup_id = matches!(&job.source, SeasonBackupJobSource::Scheduled { .. });
+            let state = app.state::<AppState>();
+            let result = execute_season_backup(&app, &state, season_id, preserve_backup_id).await;
+            state.toolbox_season_backup_queue.finish(season_id);
+            match job.source {
+                SeasonBackupJobSource::Manual(sender) => {
+                    let response = match result {
+                        Ok(backup) => ApiResponse::success(backup),
+                        Err(error) => ApiResponse::error(error),
+                    };
+                    let _ = sender.send(response);
+                }
+                SeasonBackupJobSource::Scheduled { title, completion } => {
+                    let schedule_result =
+                        record_scheduled_backup_result(&app, &state, season_id, &title, &result);
+                    let completion_result = match &result {
+                        Err(error) => Err(error.clone()),
+                        Ok(_) => schedule_result,
+                    };
+                    let _ = completion.send(completion_result);
+                }
+            }
+        }
+    });
+}
+
 pub fn start_bilibili_season_backup_scheduler(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -4930,7 +5173,7 @@ pub fn start_bilibili_season_backup_scheduler(app: AppHandle) {
 
 async fn run_scheduled_season_backups(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut schedules = read_season_backup_schedules(app)?;
+    let schedules = read_season_backup_schedules(app)?;
     let targets = schedules
         .iter()
         .filter(|item| item.enabled)
@@ -4940,72 +5183,38 @@ async fn run_scheduled_season_backups(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let _remote_refresh_pause_guard =
-        RemoteRefreshPauseGuard::new(Arc::clone(&state.submission_remote_refresh_pause_count));
-    let auth = load_active_auth(&state)?;
-    let seasons = fetch_all_seasons(&state, &auth).await?;
-    let mut seasons_by_id = HashMap::new();
-    for item in seasons {
-        if let Some(season_id) = item
-            .get("season")
-            .and_then(|season| season.get("id"))
-            .and_then(Value::as_i64)
-        {
-            seasons_by_id.insert(season_id, item);
-        }
-    }
-
     append_toolbox_log(
         &state,
         &format!(
-            "toolbox_bilibili_season_schedule_start targets={} interval_seconds={}",
-            targets.len(),
-            SEASON_BACKUP_TASK_INTERVAL_SECONDS
+            "toolbox_bilibili_season_schedule_start targets={}",
+            targets.len()
         ),
     );
-    for (index, (season_id, title)) in targets.iter().enumerate() {
-        if index > 0 {
-            sleep(Duration::from_secs(SEASON_BACKUP_TASK_INTERVAL_SECONDS)).await;
-        }
-        let Some(raw) = seasons_by_id.get(season_id) else {
-            let error = format!("合集 {}（{}）未出现在最新合集列表", season_id, title);
-            update_schedule_status(&mut schedules, *season_id, Some(error.clone()));
-            write_season_backup_schedules(app, &schedules)?;
+    for (season_id, title) in targets {
+        let (completion, completed) = oneshot::channel();
+        let queued = state
+            .toolbox_season_backup_queue
+            .enqueue(SeasonBackupJob {
+                season_id,
+                source: SeasonBackupJobSource::Scheduled {
+                    title: title.clone(),
+                    completion,
+                },
+            })
+            .await?;
+        if !queued {
             append_toolbox_log(
                 &state,
                 &format!(
-                    "toolbox_bilibili_season_schedule_item_error season_id={} err={}",
-                    season_id, error
+                    "toolbox_bilibili_season_schedule_item_skipped season_id={} title={} reason=already_queued",
+                    season_id, title
                 ),
             );
             continue;
-        };
-        let mut backups = read_season_backups(app)?;
-        let existing_publish_times = cached_publish_times_for_season(&backups, *season_id);
-        match build_season_backup(&state, &auth, raw, &existing_publish_times).await {
-            Ok(backup) => {
-                upsert_season_backup(&mut backups, backup.clone(), true);
-                write_season_backups(app, &backups)?;
-                update_schedule_status(&mut schedules, *season_id, None);
-                write_season_backup_schedules(app, &schedules)?;
-                append_toolbox_log(
-                    &state,
-                    &format!(
-                        "toolbox_bilibili_season_schedule_item_ok season_id={} title={} sections={} episodes={}",
-                        season_id, backup.title, backup.section_count, backup.captured_episode_count
-                    ),
-                );
-            }
-            Err(error) => {
-                update_schedule_status(&mut schedules, *season_id, Some(error.clone()));
-                write_season_backup_schedules(app, &schedules)?;
-                append_toolbox_log(
-                    &state,
-                    &format!(
-                        "toolbox_bilibili_season_schedule_item_error season_id={} err={}",
-                        season_id, error
-                    ),
-                );
+        }
+        match completed.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
                 if should_stop_scheduled_backup_batch(&error) {
                     append_toolbox_log(
                         &state,
@@ -5017,6 +5226,7 @@ async fn run_scheduled_season_backups(app: &AppHandle) -> Result<(), String> {
                     break;
                 }
             }
+            Err(_) => return Err("合集备份队列已停止".to_string()),
         }
     }
     append_toolbox_log(&state, "toolbox_bilibili_season_schedule_done");
@@ -5036,6 +5246,66 @@ mod tests {
         assert!(!should_stop_scheduled_backup_batch(
             "网络繁忙 (code: 69800)"
         ));
+    }
+
+    #[tokio::test]
+    async fn season_backup_queue_deduplicates_active_season() {
+        let (queue, mut receiver) = SeasonBackupQueue::new();
+        let (first_sender, _first_receiver) = oneshot::channel();
+        assert!(queue
+            .enqueue(SeasonBackupJob {
+                season_id: 7523586,
+                source: SeasonBackupJobSource::Manual(first_sender),
+            })
+            .await
+            .expect("enqueue first job"));
+
+        let (duplicate_sender, _duplicate_receiver) = oneshot::channel();
+        assert!(!queue
+            .enqueue(SeasonBackupJob {
+                season_id: 7523586,
+                source: SeasonBackupJobSource::Manual(duplicate_sender),
+            })
+            .await
+            .expect("deduplicate active season"));
+
+        let queued = receiver.recv().await.expect("receive queued job");
+        assert_eq!(queued.season_id, 7523586);
+        queue.finish(queued.season_id);
+
+        let (next_sender, _next_receiver) = oneshot::channel();
+        assert!(queue
+            .enqueue(SeasonBackupJob {
+                season_id: 7523586,
+                source: SeasonBackupJobSource::Manual(next_sender),
+            })
+            .await
+            .expect("enqueue season after completion"));
+    }
+
+    #[test]
+    fn publish_time_cache_isolated_by_owner_and_deduplicated_by_aid() {
+        let mut cache = HashMap::new();
+        assert_eq!(
+            merge_publish_time_cache(&mut cache, 100, &HashMap::from([(1, 1000), (2, 2000)])),
+            2
+        );
+        assert_eq!(
+            merge_publish_time_cache(&mut cache, 100, &HashMap::from([(2, 2000)])),
+            0
+        );
+        assert_eq!(
+            merge_publish_time_cache(&mut cache, 200, &HashMap::from([(1, 3000)])),
+            1
+        );
+        assert_eq!(
+            publish_times_for_owner(&cache, 100),
+            HashMap::from([(1, 1000), (2, 2000)])
+        );
+        assert_eq!(
+            publish_times_for_owner(&cache, 200),
+            HashMap::from([(1, 3000)])
+        );
     }
 
     #[test]
@@ -5591,18 +5861,17 @@ mod tests {
     }
 
     #[test]
-    fn bilibili_season_backup_extracts_archive_publish_time() {
-        let item = json!({
-            "Archive": {
-                "aid": 1001,
-                "pubdate": 1784460000
-            }
-        });
+    fn bilibili_season_backup_extracts_collection_publish_time() {
+        let item = json!({ "aid": 1001, "pubdate": 1784460000, "ctime": 1784450000 });
+        let ctime_fallback = json!({ "aid": "1002", "ctime": "1784450000" });
 
-        assert_eq!(archive_aid_from_audit_item(&item), Some(1001));
         assert_eq!(
-            archive_publish_time_from_audit_item(&item),
-            Some(1784460000)
+            collection_archive_publish_time(&item),
+            Some((1001, 1784460000))
+        );
+        assert_eq!(
+            collection_archive_publish_time(&ctime_fallback),
+            Some((1002, 1784450000))
         );
     }
 
