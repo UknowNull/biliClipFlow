@@ -328,6 +328,7 @@ pub fn run() {
             commands::submission::submission_ignore_remote_status,
             commands::submission::submission_verify_remote,
             commands::submission::submission_confirm_remote_missing,
+            commands::submission::submission_reupload_all_segments,
             commands::submission::submission_repost,
             commands::submission::submission_repost_transcode,
             commands::submission::submission_resegment,

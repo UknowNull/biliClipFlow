@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS submission_task (
   bvid TEXT,
   aid INTEGER,
   remote_state INTEGER,
+  remote_state_desc TEXT,
   reject_reason TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,

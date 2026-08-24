@@ -373,9 +373,9 @@ function MergeAudioVideoTool() {
   );
 }
 
-function BilibiliSeasonBackupTool() {
+function BilibiliSeasonBackupTool({ activeBilibiliUid = "" }) {
   const [seasons, setSeasons] = useState([]);
-  const [backups, setBackups] = useState([]);
+  const [allBackups, setAllBackups] = useState([]);
   const [schedules, setSchedules] = useState([]);
   const [batchExportMode, setBatchExportMode] = useState(false);
   const [selectedBackupIds, setSelectedBackupIds] = useState([]);
@@ -385,6 +385,18 @@ function BilibiliSeasonBackupTool() {
   const [restoreDialog, setRestoreDialog] = useState(null);
   const [restoreSortMode, setRestoreSortMode] = useState("backup");
   const [previewDialog, setPreviewDialog] = useState(null);
+  const normalizedActiveBilibiliUid = String(activeBilibiliUid || "").trim();
+  const currentSeasonIds = useMemo(
+    () => new Set(seasons.map((season) => Number(season?.seasonId)).filter((seasonId) => seasonId > 0)),
+    [seasons],
+  );
+  const backups = useMemo(() => allBackups.filter((backup) => {
+    const ownerUid = String(backup?.ownerUid || "").trim();
+    if (ownerUid) {
+      return ownerUid === normalizedActiveBilibiliUid;
+    }
+    return currentSeasonIds.has(Number(backup?.sourceSeasonId));
+  }), [allBackups, currentSeasonIds, normalizedActiveBilibiliUid]);
 
   const loadSeasons = async () => {
     setMessage("");
@@ -403,8 +415,7 @@ function BilibiliSeasonBackupTool() {
     try {
       const data = await invokeCommand("toolbox_bilibili_season_backups");
       const nextBackups = Array.isArray(data) ? data : [];
-      setBackups(nextBackups);
-      setSelectedBackupIds((prev) => prev.filter((id) => nextBackups.some((backup) => backup.backupId === id)));
+      setAllBackups(nextBackups);
     } catch (error) {
       setMessage(error?.message || "读取本地备份失败");
     }
@@ -420,10 +431,18 @@ function BilibiliSeasonBackupTool() {
   };
 
   useEffect(() => {
+    setSeasons([]);
+    setAllBackups([]);
+    setSelectedBackupIds([]);
+    setBatchExportMode(false);
     loadSeasons();
     loadBackups();
     loadSchedules();
-  }, []);
+  }, [normalizedActiveBilibiliUid]);
+
+  useEffect(() => {
+    setSelectedBackupIds((prev) => prev.filter((id) => backups.some((backup) => backup.backupId === id)));
+  }, [backups]);
 
   const handleBackup = async (seasonId) => {
     setMessage("");
@@ -1024,7 +1043,7 @@ function ActionLine({ children, message }) {
   );
 }
 
-export default function ToolboxSection({ activeTool = "remux" }) {
+export default function ToolboxSection({ activeTool = "remux", activeBilibiliUid = "" }) {
   const activeTab = toolboxTabs.some((tab) => tab.key === activeTool) ? activeTool : "remux";
 
   return (
@@ -1032,7 +1051,7 @@ export default function ToolboxSection({ activeTool = "remux" }) {
       {activeTab === "remux" ? <RemuxTool /> : null}
       {activeTab === "audio_video_merge" ? <MergeAudioVideoTool /> : null}
       {activeTab === "video_mask" ? <VideoMaskWorkspace /> : null}
-      {activeTab === "bilibili_season_backup" ? <BilibiliSeasonBackupTool /> : null}
+      {activeTab === "bilibili_season_backup" ? <BilibiliSeasonBackupTool activeBilibiliUid={activeBilibiliUid} /> : null}
     </div>
   );
 }

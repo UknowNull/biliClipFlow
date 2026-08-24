@@ -1550,6 +1550,8 @@ pub struct SeasonSectionBackup {
 pub struct SeasonBackup {
     pub backup_id: String,
     #[serde(default)]
+    pub owner_uid: Option<i64>,
+    #[serde(default)]
     pub source_season_id: i64,
     pub title: String,
     pub description: String,
@@ -1704,9 +1706,16 @@ pub async fn toolbox_bilibili_season_list(
 }
 
 #[tauri::command]
-pub fn toolbox_bilibili_season_backups(app: AppHandle) -> ApiResponse<Vec<SeasonBackup>> {
+pub fn toolbox_bilibili_season_backups(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> ApiResponse<Vec<SeasonBackup>> {
+    let owner_uid = match load_active_auth(&state) {
+        Ok(auth) => auth.user_id.filter(|uid| *uid > 0),
+        Err(err) => return ApiResponse::error(err),
+    };
     match read_season_backups(&app) {
-        Ok(items) => ApiResponse::success(items),
+        Ok(items) => ApiResponse::success(season_backups_for_owner(items, owner_uid)),
         Err(err) => ApiResponse::error(err),
     }
 }
@@ -3770,6 +3779,7 @@ async fn build_season_backup(
 
     Ok(SeasonBackup {
         backup_id: Uuid::new_v4().to_string(),
+        owner_uid: auth.user_id.filter(|uid| *uid > 0),
         source_season_id: season.get("id").and_then(|item| item.as_i64()).unwrap_or(0),
         title: value_string(season, "title"),
         description: value_string(season, "desc"),
@@ -4959,6 +4969,16 @@ fn read_season_backups(app: &AppHandle) -> Result<Vec<SeasonBackup>, String> {
     serde_json::from_str(&text).map_err(|err| format!("解析备份失败: {}", err))
 }
 
+fn season_backups_for_owner(
+    backups: Vec<SeasonBackup>,
+    owner_uid: Option<i64>,
+) -> Vec<SeasonBackup> {
+    backups
+        .into_iter()
+        .filter(|backup| backup.owner_uid.is_none() || backup.owner_uid == owner_uid)
+        .collect()
+}
+
 fn cached_publish_times_for_season(backups: &[SeasonBackup], season_id: i64) -> HashMap<i64, i64> {
     let Some(backup) = backups
         .iter()
@@ -5021,9 +5041,11 @@ fn upsert_season_backup(
     preserve_backup_id: bool,
 ) {
     let existing_index = if backup.source_season_id > 0 {
-        backups
-            .iter()
-            .position(|item| item.source_season_id == backup.source_season_id)
+        backups.iter().position(|item| {
+            item.source_season_id == backup.source_season_id
+                && (item.owner_uid == backup.owner_uid
+                    || (backup.owner_uid.is_some() && item.owner_uid.is_none()))
+        })
     } else {
         backups
             .iter()
@@ -5659,6 +5681,7 @@ mod tests {
     fn test_season_backup(backup_id: &str, source_season_id: i64, title: &str) -> SeasonBackup {
         SeasonBackup {
             backup_id: backup_id.to_string(),
+            owner_uid: Some(10001),
             source_season_id,
             title: title.to_string(),
             description: String::new(),
@@ -5686,6 +5709,36 @@ mod tests {
         assert_eq!(backups.len(), 1);
         assert_eq!(backups[0].backup_id, "old-id");
         assert_eq!(backups[0].title, "新标题");
+    }
+
+    #[test]
+    fn season_backup_list_filters_owned_records_and_keeps_legacy_records() {
+        let current = test_season_backup("current", 861, "当前账号");
+        let mut other = test_season_backup("other", 862, "其他账号");
+        other.owner_uid = Some(10002);
+        let mut legacy = test_season_backup("legacy", 863, "历史备份");
+        legacy.owner_uid = None;
+
+        let filtered = season_backups_for_owner(vec![current, other, legacy], Some(10001));
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|backup| backup.backup_id == "current"));
+        assert!(filtered.iter().any(|backup| backup.backup_id == "legacy"));
+        assert!(!filtered.iter().any(|backup| backup.backup_id == "other"));
+    }
+
+    #[test]
+    fn owned_backup_replaces_matching_legacy_backup() {
+        let mut legacy = test_season_backup("legacy", 861, "旧标题");
+        legacy.owner_uid = None;
+        let incoming = test_season_backup("owned", 861, "新标题");
+        let mut backups = vec![legacy];
+
+        upsert_season_backup(&mut backups, incoming, false);
+
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].backup_id, "owned");
+        assert_eq!(backups[0].owner_uid, Some(10001));
     }
 
     #[test]

@@ -67,6 +67,10 @@ impl Db {
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE submission_task ADD COLUMN remote_state_desc TEXT",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE submission_task ADD COLUMN reject_reason TEXT",
             [],
         );
@@ -499,7 +503,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn submission_schema_contains_collection_section_id() {
+    fn submission_schema_contains_remote_status_columns() {
         let db = Db::new(PathBuf::from(":memory:")).expect("initialize in-memory database");
         let columns = db
             .with_conn(|conn| {
@@ -512,5 +516,6 @@ mod tests {
         assert!(columns
             .iter()
             .any(|column| column == "collection_section_id"));
+        assert!(columns.iter().any(|column| column == "remote_state_desc"));
     }
 }

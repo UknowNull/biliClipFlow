@@ -70,6 +70,17 @@ const canConfirmRemoteMissing = (task) => {
   return status === "SUBMIT_UNKNOWN" || error.includes("SUBMIT_RESULT_UNKNOWN:");
 };
 
+const canReuploadAllSegments = (task) => {
+  const status = String(task?.status || "").trim();
+  const error = String(task?.workflowStatus?.errorMessage || "");
+  return (
+    status === "FAILED" &&
+    !String(task?.bvid || "").trim() &&
+    !Number(task?.aid || 0) &&
+    error.includes("REUPLOAD_REQUIRED:")
+  );
+};
+
 const sourceFilters = [
   { value: "NORMAL", label: "其他投稿" },
   { value: "CLIP", label: "切片投稿" },
@@ -383,6 +394,10 @@ export default function SubmissionSection({
   const [message, setMessage] = useState("");
   const [refreshingRemote, setRefreshingRemote] = useState(false);
   const [verifyingRemoteTaskId, setVerifyingRemoteTaskId] = useState("");
+  const [remoteMissingConfirmTask, setRemoteMissingConfirmTask] = useState(null);
+  const [remoteMissingConfirming, setRemoteMissingConfirming] = useState(false);
+  const [reuploadConfirmTask, setReuploadConfirmTask] = useState(null);
+  const [reuploadConfirming, setReuploadConfirming] = useState(false);
   const [submissionView, setSubmissionView] = useState("list");
   const [remoteImportDialogOpen, setRemoteImportDialogOpen] = useState(false);
   const [remoteImportInput, setRemoteImportInput] = useState("");
@@ -5886,23 +5901,53 @@ export default function SubmissionSection({
     if (!taskId || !canConfirmRemoteMissing(task)) {
       return;
     }
-    const confirmed = await dialogConfirm(
-      "请先在B站创作中心确认该稿件确实不存在。继续后会清空本次分P上传结果，并立即重新加入投稿队列上传全部分P。",
-      {
-        title: "确认远端未生成",
-        kind: "warning",
-      },
-    );
-    if (!confirmed) {
+    setRemoteMissingConfirmTask(task);
+  };
+
+  const confirmRemoteMissing = async () => {
+    const task = remoteMissingConfirmTask;
+    const taskId = String(task?.taskId || "").trim();
+    if (!taskId || !canConfirmRemoteMissing(task) || remoteMissingConfirming) {
       return;
     }
+    setRemoteMissingConfirming(true);
     setMessage("");
     try {
       const result = await invokeCommand("submission_confirm_remote_missing", { taskId });
       setMessage(result || "已重新加入投稿队列");
+      setRemoteMissingConfirmTask(null);
       await loadTasks(statusFilter, currentPage, pageSize);
     } catch (error) {
       setMessage(error.message);
+    } finally {
+      setRemoteMissingConfirming(false);
+    }
+  };
+
+  const handleReuploadAllSegments = (task) => {
+    if (!canReuploadAllSegments(task)) {
+      return;
+    }
+    setReuploadConfirmTask(task);
+  };
+
+  const confirmReuploadAllSegments = async () => {
+    const task = reuploadConfirmTask;
+    const taskId = String(task?.taskId || "").trim();
+    if (!taskId || !canReuploadAllSegments(task) || reuploadConfirming) {
+      return;
+    }
+    setReuploadConfirming(true);
+    setMessage("");
+    try {
+      const result = await invokeCommand("submission_reupload_all_segments", { taskId });
+      setMessage(result || "已重新加入分P上传队列");
+      setReuploadConfirmTask(null);
+      await loadTasks(statusFilter, currentPage, pageSize);
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setReuploadConfirming(false);
     }
   };
 
@@ -6052,6 +6097,10 @@ export default function SubmissionSection({
     }
     if (!task?.bvid) {
       return "未生成";
+    }
+    const stateDesc = String(task?.remoteStateDesc || "").trim();
+    if (stateDesc) {
+      return stateDesc;
     }
     const state = parseRemoteState(task);
     if (state === null) {
@@ -8433,6 +8482,14 @@ export default function SubmissionSection({
                             确认未生成
                           </button>
                         ) : null}
+                        {canReuploadAllSegments(task) ? (
+                          <button
+                            className="rounded-full border border-rose-200 bg-white px-2 py-1 text-xs font-semibold text-rose-600"
+                            onClick={() => handleReuploadAllSegments(task)}
+                          >
+                            重新上传分P
+                          </button>
+                        ) : null}
                         <button
                           className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() => openRepostModal(task)}
@@ -8560,6 +8617,96 @@ export default function SubmissionSection({
                     disabled={remoteImportLoading}
                   >
                     {remoteImportLoading ? "校验中" : "确认"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {remoteMissingConfirmTask ? (
+            <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/35 px-4" onMouseDown={(event) => {
+              if (event.target === event.currentTarget && !remoteMissingConfirming) {
+                setRemoteMissingConfirmTask(null);
+              }
+            }}>
+              <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-lg" role="dialog" aria-modal="true" aria-labelledby="remote-missing-confirm-title">
+                <div className="flex items-center justify-between gap-3">
+                  <div id="remote-missing-confirm-title" className="text-sm font-semibold text-[var(--ink)]">确认远端未生成</div>
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => setRemoteMissingConfirmTask(null)}
+                    disabled={remoteMissingConfirming}
+                    aria-label="关闭确认窗口"
+                  >
+                    关闭
+                  </button>
+                </div>
+                <div className="mt-3 text-sm leading-6 text-[var(--muted)]">
+                  请先在 B 站创作中心确认稿件确实不存在。继续后会清空本次分P上传结果，并立即重新加入投稿队列上传全部分P。
+                </div>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => setRemoteMissingConfirmTask(null)}
+                    disabled={remoteMissingConfirming}
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="rounded-full bg-rose-600 px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={confirmRemoteMissing}
+                    disabled={remoteMissingConfirming}
+                  >
+                    {remoteMissingConfirming ? "处理中" : "确认并重新投稿"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {reuploadConfirmTask ? (
+            <div
+              className="fixed inset-0 z-[70] flex items-center justify-center bg-black/35 px-4"
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget && !reuploadConfirming) {
+                  setReuploadConfirmTask(null);
+                }
+              }}
+            >
+              <div
+                className="w-full max-w-lg rounded-lg bg-white p-5 shadow-lg"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="reupload-all-segments-title"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div id="reupload-all-segments-title" className="text-sm font-semibold text-[var(--ink)]">
+                    重新上传全部分P
+                  </div>
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => setReuploadConfirmTask(null)}
+                    disabled={reuploadConfirming}
+                    aria-label="关闭确认窗口"
+                  >
+                    关闭
+                  </button>
+                </div>
+                <div className="mt-3 text-sm leading-6 text-[var(--muted)]">
+                  将清除已被B站判定为重复投稿的旧CID，并重新上传全部本地分P。不会重新剪辑、合并或分段。
+                </div>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => setReuploadConfirmTask(null)}
+                    disabled={reuploadConfirming}
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="rounded-full bg-rose-600 px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={confirmReuploadAllSegments}
+                    disabled={reuploadConfirming}
+                  >
+                    {reuploadConfirming ? "处理中" : "确认重新上传"}
                   </button>
                 </div>
               </div>

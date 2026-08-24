@@ -149,6 +149,16 @@ impl BilibiliClient {
                 HeaderValue::from_static("https://live.bilibili.com"),
             );
         }
+        if url.contains("member.bilibili.com") {
+            headers.insert(
+                REFERER,
+                HeaderValue::from_static("https://member.bilibili.com/"),
+            );
+            headers.insert(
+                "Origin",
+                HeaderValue::from_static("https://member.bilibili.com"),
+            );
+        }
         if is_season_archive_request_url(url) {
             headers.insert(
                 REFERER,
@@ -218,6 +228,16 @@ impl BilibiliClient {
             headers.insert(
                 "Origin",
                 HeaderValue::from_static("https://live.bilibili.com"),
+            );
+        }
+        if url.contains("member.bilibili.com") {
+            headers.insert(
+                REFERER,
+                HeaderValue::from_static("https://member.bilibili.com/"),
+            );
+            headers.insert(
+                "Origin",
+                HeaderValue::from_static("https://member.bilibili.com"),
             );
         }
 

@@ -609,6 +609,7 @@ pub struct SubmissionTaskRecord {
     pub bvid: Option<String>,
     pub aid: Option<i64>,
     pub remote_state: Option<i64>,
+    pub remote_state_desc: Option<String>,
     pub reject_reason: Option<String>,
     pub remote_status_ignored: bool,
     pub created_at: String,
@@ -1712,12 +1713,12 @@ pub async fn submission_repost(
         let update_result = context.db.with_conn(|conn| {
       if integrate_current_bvid {
         conn.execute(
-          "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
           (&now, &task_id),
         )?;
       } else {
         conn.execute(
-          "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
           (&now, &task_id),
         )?;
       }
@@ -3149,12 +3150,12 @@ fn prepare_workflow_for_existing_merged_repost(
         .with_conn(|conn| {
             if clear_bvid {
                 conn.execute(
-                    "UPDATE submission_task SET status = 'PENDING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+                    "UPDATE submission_task SET status = 'PENDING', bvid = NULL, aid = NULL, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
                     (&now, task_id),
                 )?;
             } else {
                 conn.execute(
-                    "UPDATE submission_task SET status = 'PENDING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+                    "UPDATE submission_task SET status = 'PENDING', remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
                     (&now, task_id),
                 )?;
             }
@@ -4207,12 +4208,12 @@ fn prepare_workflow_for_baidu_restore(
     .with_conn(|conn| {
       if clear_bvid {
         conn.execute(
-          "UPDATE submission_task SET status = 'PENDING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          "UPDATE submission_task SET status = 'PENDING', bvid = NULL, aid = NULL, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
           (&now, task_id),
         )?;
       } else {
         conn.execute(
-          "UPDATE submission_task SET status = 'PENDING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          "UPDATE submission_task SET status = 'PENDING', remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
           (&now, task_id),
         )?;
       }
@@ -4386,12 +4387,12 @@ async fn resume_resegment_after_restore(
         }
         if integrate_current_bvid {
           conn.execute(
-            "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+            "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
             (&now, task_id),
           )?;
         } else {
           conn.execute(
-            "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+            "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
             (&now, task_id),
           )?;
         }
@@ -4988,12 +4989,12 @@ async fn resume_repost_after_restore(
     .with_conn(|conn| {
       if integrate_current_bvid {
         conn.execute(
-          "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
           (&now, task_id),
         )?;
       } else {
         conn.execute(
-          "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
           (&now, task_id),
         )?;
       }
@@ -6003,12 +6004,12 @@ fn reset_submission_for_repost(
     let update_result = context.db.with_conn(|conn| {
     if clear_bvid {
       conn.execute(
-        "UPDATE submission_task SET status = 'PENDING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+        "UPDATE submission_task SET status = 'PENDING', bvid = NULL, aid = NULL, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
         (&now, task_id),
       )?;
     } else {
       conn.execute(
-        "UPDATE submission_task SET status = 'PENDING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+        "UPDATE submission_task SET status = 'PENDING', remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
         (&now, task_id),
       )?;
     }
@@ -6117,12 +6118,12 @@ pub async fn submission_resegment(
         let update_result = context.db.with_conn(|conn| {
       if integrate_current_bvid {
         conn.execute(
-          "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
           (&now, &task_id),
         )?;
       } else {
         conn.execute(
-          "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
           (&now, &task_id),
         )?;
       }
@@ -6793,12 +6794,12 @@ pub async fn submission_resegment(
     conn.execute("DELETE FROM task_output_segment WHERE task_id = ?1", [&task_id])?;
     if integrate_current_bvid {
       conn.execute(
-        "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+        "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
         (&now, &task_id),
       )?;
     } else {
       conn.execute(
-        "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+        "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
         (&now, &task_id),
       )?;
     }
@@ -9565,7 +9566,7 @@ pub async fn submission_ignore_remote_status(
             let tx = conn.transaction()?;
             for task_id in task_ids {
                 tx.execute(
-                    "UPDATE submission_task SET remote_state = 0, reject_reason = NULL, remote_status_ignored = 1, updated_at = ?1 WHERE task_id = ?2 AND remote_state IN (-2, -4)",
+                    "UPDATE submission_task SET remote_state = 0, remote_state_desc = NULL, reject_reason = NULL, remote_status_ignored = 1, updated_at = ?1 WHERE task_id = ?2 AND remote_state IN (-2, -4)",
                     (&now, &task_id),
                 )?;
             }
@@ -9601,18 +9602,6 @@ pub async fn submission_verify_remote(
     if !should_reconcile_submission(&detail.task) {
         return Ok(ApiResponse::error("当前任务不需要远端校验"));
     }
-    if detail
-        .task
-        .bvid
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or("")
-        .is_empty()
-    {
-        return Ok(ApiResponse::error(
-            "当前任务没有BVID，无法精确校验。请先在B站创作中心确认稿件是否存在",
-        ));
-    }
     let expected_parts = detail.output_segments.len();
     if expected_parts == 0 {
         return Ok(ApiResponse::error("当前任务没有本地分P记录，无法校验"));
@@ -9632,6 +9621,38 @@ pub async fn submission_verify_remote(
             )))
         }
     };
+
+    if detail
+        .task
+        .bvid
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        let queue_context = build_submission_queue_context(&state);
+        match reconcile_unknown_submission_by_listing(
+            &queue_context,
+            &detail,
+            &auth,
+            expected_parts,
+        )
+        .await
+        {
+            Ok(true) => {
+                return Ok(ApiResponse::success(format!(
+                    "已根据标题匹配远端稿件，确认{}个分P",
+                    expected_parts
+                )));
+            }
+            Ok(false) => {
+                return Ok(ApiResponse::error(
+                    "当前账号的审核中、未通过和已发布列表中未找到唯一匹配稿件，请稍后重试或在B站创作中心确认",
+                ));
+            }
+            Err(err) => return Ok(ApiResponse::error(format!("远端校验失败: {}", err))),
+        }
+    }
 
     append_log(
         &state.app_log_path,
@@ -9699,6 +9720,108 @@ pub async fn submission_verify_remote(
     Ok(ApiResponse::error(format!("远端校验未通过: {}", reason)))
 }
 
+async fn reconcile_unknown_submission_by_listing(
+    context: &SubmissionQueueContext,
+    detail: &SubmissionTaskDetail,
+    auth: &AuthInfo,
+    expected_parts: usize,
+) -> Result<bool, String> {
+    let published_since = DateTime::parse_from_rfc3339(detail.task.created_at.trim())
+        .map_err(|err| format!("任务创建时间格式无效: {}", err))?
+        .timestamp()
+        .saturating_sub(REMOTE_UNKNOWN_MATCH_WINDOW_SECS);
+    let remote_map = fetch_remote_audit_map(context, auth, Some(published_since)).await?;
+    let task = RemoteTrackedTask {
+        task_id: detail.task.task_id.clone(),
+        bvid: String::new(),
+        aid: detail.task.aid.unwrap_or(0),
+        title: detail.task.title.clone(),
+        status: detail.task.status.clone(),
+        remote_state: detail.task.remote_state,
+        remote_status_ignored: detail.task.remote_status_ignored,
+        created_at: detail.task.created_at.clone(),
+        reconciliation_at: detail.task.updated_at.clone(),
+        error_message: detail
+            .task
+            .workflow_status
+            .as_ref()
+            .and_then(|status| status.error_message.clone())
+            .unwrap_or_default(),
+        expected_parts,
+        collection_section_id: detail.task.collection_section_id.unwrap_or(0),
+    };
+    let matched = find_unique_unknown_submission_match(
+        &task,
+        &remote_map,
+        &HashSet::new(),
+        Utc::now().timestamp(),
+    );
+    let Some(info) = matched else {
+        append_log(
+            &context.app_log_path,
+            &format!(
+                "submission_manual_remote_match_missing task_id={} title={} expected_parts={}",
+                detail.task.task_id, detail.task.title, expected_parts
+            ),
+        );
+        return Ok(false);
+    };
+    if info.part_count == 0 {
+        return Ok(false);
+    }
+    if info.part_count != expected_parts {
+        let reason = format!(
+            "远程分P数量与本地不一致（本地={}，远程={}）",
+            expected_parts, info.part_count
+        );
+        update_submission_status_with_reason(
+            &SubmissionContext {
+                db: context.db.clone(),
+                app_log_path: context.app_log_path.clone(),
+                edit_upload_state: context.edit_upload_state.clone(),
+                local_path_prefix: load_local_path_prefix(context.db.as_ref()),
+            },
+            &detail.task.task_id,
+            "FAILED",
+            Some(&reason),
+        )?;
+        return Err(reason);
+    }
+    let now = now_rfc3339();
+    context
+        .db
+        .with_conn_mut(|conn| {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE submission_task SET status = 'COMPLETED', bvid = ?1, aid = ?2, remote_state = ?3, remote_state_desc = ?4, reject_reason = ?5, priority = 0, priority_at = NULL, updated_at = ?6 WHERE task_id = ?7",
+            (
+                info.bvid.as_str(),
+                if info.aid > 0 { info.aid } else { detail.task.aid.unwrap_or(0) },
+                info.state,
+                info.state_desc.as_deref(),
+                info.reject_reason.as_deref(),
+                now.as_str(),
+                detail.task.task_id.as_str(),
+            ),
+        )?;
+        tx.execute(
+            "UPDATE workflow_instances SET status = 'COMPLETED', current_step = NULL, progress = 100, error_message = NULL, completed_at = ?1, updated_at = ?1 WHERE task_id = ?2",
+            (now.as_str(), detail.task.task_id.as_str()),
+        )?;
+        tx.commit()?;
+            Ok(())
+        })
+        .map_err(|err| err.to_string())?;
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "submission_manual_remote_match_ok task_id={} bvid={} aid={} parts={}",
+            detail.task.task_id, info.bvid, info.aid, expected_parts
+        ),
+    );
+    Ok(true)
+}
+
 #[tauri::command]
 pub fn submission_confirm_remote_missing(
     state: State<'_, AppState>,
@@ -9740,11 +9863,11 @@ pub fn submission_confirm_remote_missing(
         .with_conn_mut(|conn| {
             let tx = conn.transaction()?;
             tx.execute(
-                "UPDATE task_output_segment SET upload_status = 'PENDING', cid = NULL, upload_progress = 0, upload_uploaded_bytes = 0, upload_total_bytes = 0, upload_session_id = NULL, upload_biz_id = 0, upload_endpoint = NULL, upload_auth = NULL, upload_uri = NULL, upload_chunk_size = 0, upload_last_part_index = 0 WHERE task_id = ?1",
+                "UPDATE task_output_segment SET upload_status = 'PENDING', cid = NULL, file_name = NULL, upload_progress = 0, upload_uploaded_bytes = 0, upload_total_bytes = 0, upload_session_id = NULL, upload_biz_id = 0, upload_endpoint = NULL, upload_auth = NULL, upload_uri = NULL, upload_chunk_size = 0, upload_last_part_index = 0 WHERE task_id = ?1 AND NOT (upload_status = 'SUCCESS' AND cid IS NOT NULL AND cid > 0 AND file_name IS NOT NULL AND TRIM(file_name) != '')",
                 [task_id.as_str()],
             )?;
             tx.execute(
-                "UPDATE submission_task SET status = ?1, remote_state = NULL, reject_reason = NULL, updated_at = ?2 WHERE task_id = ?3",
+                "UPDATE submission_task SET status = ?1, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?2 WHERE task_id = ?3",
                 (
                     "WAITING_UPLOAD",
                     now.as_str(),
@@ -9766,13 +9889,116 @@ pub fn submission_confirm_remote_missing(
     append_log(
         &context.app_log_path,
         &format!(
-            "submission_confirm_remote_missing task_id={} reset_uploads=true queued=true",
+            "submission_confirm_remote_missing task_id={} reset_uploads=false queued=true",
             task_id
         ),
     );
     Ok(ApiResponse::success(
-        "已确认远端未生成稿件，分P已重置并重新加入投稿队列".to_string(),
+        "已确认远端未生成稿件，已复用成功分P并重新加入投稿队列".to_string(),
     ))
+}
+
+#[tauri::command]
+pub fn submission_reupload_all_segments(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<ApiResponse<String>, String> {
+    let context = SubmissionContext::new(&state);
+    let task_id = task_id.trim().to_string();
+    if task_id.is_empty() {
+        return Ok(ApiResponse::error("任务ID不能为空"));
+    }
+
+    let detail = match load_task_detail(&context, &task_id) {
+        Ok(detail) => detail,
+        Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    if detail.task.status != "FAILED" {
+        return Ok(ApiResponse::error("仅失败任务可以重新上传全部分P"));
+    }
+    let error_message = detail
+        .task
+        .workflow_status
+        .as_ref()
+        .and_then(|status| status.error_message.as_deref())
+        .unwrap_or("");
+    if !is_reupload_required_submission_error(error_message) {
+        return Ok(ApiResponse::error("当前失败原因不需要重新上传全部分P"));
+    }
+    if detail
+        .task
+        .bvid
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || detail.task.aid.unwrap_or(0) > 0
+    {
+        return Ok(ApiResponse::error(
+            "任务已有BVID或AID，请先校验远端稿件，不能直接重新上传",
+        ));
+    }
+    if detail.output_segments.is_empty() {
+        return Ok(ApiResponse::error("当前任务没有本地分P，无法重新上传"));
+    }
+
+    let missing_files = detail
+        .output_segments
+        .iter()
+        .filter(|segment| {
+            let path = segment.segment_file_path.trim();
+            path.is_empty() || !Path::new(path).is_file()
+        })
+        .map(|segment| segment.part_name.as_str())
+        .collect::<Vec<_>>();
+    if !missing_files.is_empty() {
+        let examples = missing_files
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("、");
+        return Ok(ApiResponse::error(format!(
+            "有{}个本地分P文件不存在，无法重新上传：{}",
+            missing_files.len(),
+            examples
+        )));
+    }
+
+    let segment_count = detail.output_segments.len();
+    let now = now_rfc3339();
+    context
+        .db
+        .with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            tx.execute(RESET_ALL_SEGMENT_UPLOAD_SQL, [task_id.as_str()])?;
+            tx.execute(
+                "UPDATE submission_task SET status = 'WAITING_UPLOAD', bvid = NULL, aid = NULL, remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+                (now.as_str(), task_id.as_str()),
+            )?;
+            tx.execute(
+                "UPDATE workflow_instances SET status = ?1, current_step = NULL, progress = 0, error_message = NULL, completed_at = NULL, updated_at = ?2 WHERE task_id = ?3",
+                (
+                    SUBMISSION_STATUS_REUPLOAD_PENDING,
+                    now.as_str(),
+                    task_id.as_str(),
+                ),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .map_err(|err| err.to_string())?;
+
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "submission_reupload_all_segments task_id={} segments={} queued=true",
+            task_id, segment_count
+        ),
+    );
+    Ok(ApiResponse::success(format!(
+        "已清除旧CID，{}个本地分P已重新加入上传队列",
+        segment_count
+    )))
 }
 
 #[tauri::command]
@@ -12090,7 +12316,7 @@ fn load_tasks(
         (Some(_), Some(_), Some(_)) => format!(
           "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id \
+                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
              SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
@@ -12104,7 +12330,7 @@ fn load_tasks(
         (Some(_), Some(_), None) => format!(
           "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id \
+                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
              SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
@@ -12118,7 +12344,7 @@ fn load_tasks(
         (Some(_), None, Some(_)) => format!(
           "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id \
+                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
              SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
@@ -12132,7 +12358,7 @@ fn load_tasks(
         (Some(_), None, None) => format!(
           "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id \
+                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
              SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
@@ -12146,7 +12372,7 @@ fn load_tasks(
         (None, Some(_), Some(_)) => format!(
           "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id \
+                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
              SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
@@ -12160,7 +12386,7 @@ fn load_tasks(
         (None, Some(_), None) => format!(
           "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id \
+                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
              SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
@@ -12174,7 +12400,7 @@ fn load_tasks(
         (None, None, Some(_)) => format!(
           "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id \
+                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
              SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
@@ -12188,7 +12414,7 @@ fn load_tasks(
         (None, None, None) => format!(
           "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id \
+                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
              SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
@@ -12287,6 +12513,7 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
         bvid: row.get(15)?,
         aid: row.get(16)?,
         remote_state: row.get(17)?,
+        remote_state_desc: row.get(35)?,
         reject_reason: row.get(18)?,
         remote_status_ignored,
         created_at: row.get(19)?,
@@ -12314,7 +12541,7 @@ fn load_task_record(
       conn.query_row(
         "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id \
+                wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
          FROM submission_task st \
          LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
            SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
@@ -14131,12 +14358,13 @@ struct SourceRetryBinding {
     remote_part_title: Option<String>,
 }
 
-const MAX_PARTS_PER_SUBMISSION: usize = 100;
+const SUBMISSION_BATCH_PARTS: usize = 50;
 const MAX_PARTS_PER_BVID: usize = 200;
 const SUBMISSION_STATUS_VERIFY_PENDING: &str = "VERIFY_PENDING";
 const SUBMISSION_STATUS_SUBMIT_UNKNOWN: &str = "SUBMIT_UNKNOWN";
 const SUBMISSION_STATUS_REUPLOAD_PENDING: &str = "REUPLOAD_PENDING";
 const SUBMISSION_REMOTE_MISSING_CONFIRMED_REASON: &str = "已人工确认远端未生成稿件";
+const RESET_ALL_SEGMENT_UPLOAD_SQL: &str = "UPDATE task_output_segment SET upload_status = 'PENDING', cid = NULL, file_name = NULL, upload_progress = 0, upload_uploaded_bytes = 0, upload_total_bytes = 0, upload_session_id = NULL, upload_biz_id = 0, upload_endpoint = NULL, upload_auth = NULL, upload_uri = NULL, upload_chunk_size = 0, upload_last_part_index = 0 WHERE task_id = ?1";
 const SUBMISSION_COLLECTION_BIND_PENDING_PREFIX: &str = "COLLECTION_BIND_PENDING:";
 const SUBMISSION_EDIT_BATCH_WAIT_SECS: u64 = 10;
 const SUBMISSION_EDIT_RATE_LIMIT_BASE_WAIT_SECS: u64 = 10;
@@ -14183,6 +14411,19 @@ static TASK_UPLOAD_RATE_LIMITS: OnceLock<AsyncMutex<HashMap<String, TaskUploadRa
 
 struct UploadRateLimiter {
     consecutive_406: u32,
+}
+
+fn submission_batch_end_indexes(total_parts: usize) -> Vec<usize> {
+    let mut indexes = Vec::new();
+    let mut end_index = std::cmp::min(SUBMISSION_BATCH_PARTS, total_parts);
+    while end_index > 0 {
+        indexes.push(end_index);
+        if end_index >= total_parts {
+            break;
+        }
+        end_index = std::cmp::min(end_index + SUBMISSION_BATCH_PARTS, total_parts);
+    }
+    indexes
 }
 
 impl UploadRateLimiter {
@@ -16147,6 +16388,7 @@ struct RemoteAuditInfo {
     part_count: usize,
     ctime: i64,
     state: i64,
+    state_desc: Option<String>,
     reject_reason: Option<String>,
 }
 
@@ -16159,6 +16401,7 @@ struct RemoteTrackedTask {
     status: String,
     remote_state: Option<i64>,
     remote_status_ignored: bool,
+    created_at: String,
     reconciliation_at: String,
     error_message: String,
     expected_parts: usize,
@@ -16171,7 +16414,7 @@ impl RemoteTrackedTask {
             && (self.needs_reconciliation()
                 || (self.status == "COMPLETED"
                     && !self.bvid.trim().is_empty()
-                    && matches!(self.remote_state, None | Some(-30))))
+                    && matches!(self.remote_state, None | Some(-1) | Some(-30) | Some(-60))))
     }
 
     fn needs_reconciliation(&self) -> bool {
@@ -16185,6 +16428,26 @@ impl RemoteTrackedTask {
                     && (is_rate_limit_error(&self.error_message)
                         || is_remote_part_count_mismatch_error(&self.error_message))))
     }
+
+    fn needs_published_lookup(&self) -> bool {
+        self.needs_reconciliation()
+            && (self.bvid.trim().is_empty()
+                || is_collection_bind_pending_error(&self.error_message)
+                || is_submission_created_error(&self.error_message))
+    }
+
+    fn published_lookup_since(&self) -> Option<i64> {
+        if !self.needs_published_lookup() {
+            return None;
+        }
+        DateTime::parse_from_rfc3339(self.created_at.trim())
+            .ok()
+            .map(|value| {
+                value
+                    .timestamp()
+                    .saturating_sub(REMOTE_UNKNOWN_MATCH_WINDOW_SECS)
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -16193,6 +16456,7 @@ struct RemoteReconciliationUpdate {
     bvid: String,
     aid: i64,
     remote_state: i64,
+    remote_state_desc: Option<String>,
     reject_reason: Option<String>,
 }
 
@@ -16202,6 +16466,7 @@ struct RemoteReconciliationFailure {
     bvid: String,
     aid: i64,
     remote_state: i64,
+    remote_state_desc: Option<String>,
     reject_reason: Option<String>,
     reason: String,
 }
@@ -16254,6 +16519,11 @@ fn parse_remote_audit_info(item: &Value) -> Option<RemoteAuditInfo> {
         })
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let state_desc = archive
+        .get("state_desc")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     Some(RemoteAuditInfo {
         aid: archive
             .get("aid")
@@ -16275,6 +16545,7 @@ fn parse_remote_audit_info(item: &Value) -> Option<RemoteAuditInfo> {
             .get("state")
             .and_then(|value| value.as_i64())
             .unwrap_or(0),
+        state_desc,
         reject_reason,
     })
 }
@@ -16288,11 +16559,15 @@ fn find_unique_unknown_submission_match<'a>(
     if task.expected_parts == 0 || task.title.trim().is_empty() {
         return None;
     }
+    let created_timestamp = DateTime::parse_from_rfc3339(task.created_at.trim())
+        .ok()?
+        .timestamp();
     let reconciliation_timestamp = DateTime::parse_from_rfc3339(task.reconciliation_at.trim())
         .ok()?
         .timestamp();
-    let earliest_timestamp =
-        reconciliation_timestamp.saturating_sub(REMOTE_UNKNOWN_MATCH_WINDOW_SECS);
+    let earliest_timestamp = created_timestamp
+        .min(reconciliation_timestamp)
+        .saturating_sub(REMOTE_UNKNOWN_MATCH_WINDOW_SECS);
     let latest_timestamp = reconciliation_timestamp
         .saturating_add(REMOTE_UNKNOWN_MATCH_WINDOW_SECS)
         .min(now_timestamp);
@@ -16300,6 +16575,7 @@ fn find_unique_unknown_submission_match<'a>(
         !bound_bvids.contains(info.bvid.as_str())
             && info.aid > 0
             && info.title.trim() == task.title.trim()
+            && (info.part_count == 0 || info.part_count == task.expected_parts)
             && info.ctime >= earliest_timestamp
             && info.ctime <= latest_timestamp
     });
@@ -16354,7 +16630,7 @@ async fn refresh_submission_remote_state(context: &SubmissionQueueContext) -> Re
         edit_upload_state: context.edit_upload_state.clone(),
     };
 
-    let mut updates: Vec<(String, i64, Option<String>)> = Vec::new();
+    let mut updates: Vec<(String, i64, Option<String>, Option<String>)> = Vec::new();
     let mut reconciled = Vec::<RemoteReconciliationUpdate>::new();
     let mut reconciliation_failures = Vec::<RemoteReconciliationFailure>::new();
     for (owner_uid, tasks) in task_groups {
@@ -16382,13 +16658,11 @@ async fn refresh_submission_remote_state(context: &SubmissionQueueContext) -> Re
                 continue;
             }
         };
-        let include_published = tasks.iter().any(|task| {
-            task.needs_reconciliation()
-                && (task.bvid.trim().is_empty()
-                    || is_collection_bind_pending_error(&task.error_message)
-                    || is_submission_created_error(&task.error_message))
-        });
-        let remote_map = match fetch_remote_audit_map(context, &auth, include_published).await {
+        let published_since = tasks
+            .iter()
+            .filter_map(RemoteTrackedTask::published_lookup_since)
+            .min();
+        let remote_map = match fetch_remote_audit_map(context, &auth, published_since).await {
             Ok(map) => map,
             Err(err) => {
                 append_log(
@@ -16489,9 +16763,14 @@ async fn refresh_submission_remote_state(context: &SubmissionQueueContext) -> Re
                 remote_map.get(bvid)
             };
             if let Some(info) = exact_remote {
-                updates.push((task.task_id.clone(), info.state, info.reject_reason.clone()));
+                updates.push((
+                    task.task_id.clone(),
+                    info.state,
+                    info.state_desc.clone(),
+                    info.reject_reason.clone(),
+                ));
             } else if !bvid.is_empty() {
-                updates.push((task.task_id.clone(), 0_i64, None));
+                updates.push((task.task_id.clone(), 0_i64, None, None));
             }
 
             if !task.needs_reconciliation() {
@@ -16579,6 +16858,7 @@ async fn refresh_submission_remote_state(context: &SubmissionQueueContext) -> Re
                     bvid: info.bvid.clone(),
                     aid: if info.aid > 0 { info.aid } else { task.aid },
                     remote_state: info.state,
+                    remote_state_desc: info.state_desc.clone(),
                     reject_reason: info.reject_reason.clone(),
                     reason: format!(
                         "远程分P数量与本地不一致（本地={}，远程={}）",
@@ -16592,6 +16872,7 @@ async fn refresh_submission_remote_state(context: &SubmissionQueueContext) -> Re
                 bvid: info.bvid.clone(),
                 aid: if info.aid > 0 { info.aid } else { task.aid },
                 remote_state: info.state,
+                remote_state_desc: info.state_desc.clone(),
                 reject_reason: info.reject_reason.clone(),
             });
         }
@@ -16602,26 +16883,27 @@ async fn refresh_submission_remote_state(context: &SubmissionQueueContext) -> Re
         .db
         .with_conn_mut(|conn| {
             let tx = conn.transaction()?;
-            for (task_id, state, reject_reason) in updates {
+            for (task_id, state, state_desc, reject_reason) in updates {
                 if let Some(reason) = reject_reason.as_deref() {
                     tx.execute(
-                        "UPDATE submission_task SET remote_state = ?1, reject_reason = ?2 WHERE task_id = ?3",
-                        (state, reason, &task_id),
+                        "UPDATE submission_task SET remote_state = ?1, remote_state_desc = ?2, reject_reason = ?3 WHERE task_id = ?4",
+                        (state, state_desc.as_deref(), reason, &task_id),
                     )?;
                 } else {
                     tx.execute(
-                        "UPDATE submission_task SET remote_state = ?1, reject_reason = NULL WHERE task_id = ?2",
-                        (state, &task_id),
+                        "UPDATE submission_task SET remote_state = ?1, remote_state_desc = ?2, reject_reason = NULL WHERE task_id = ?3",
+                        (state, state_desc.as_deref(), &task_id),
                     )?;
                 }
             }
             for item in &reconciled {
                 tx.execute(
-                    "UPDATE submission_task SET status = 'COMPLETED', bvid = ?1, aid = ?2, remote_state = ?3, reject_reason = ?4, priority = 0, priority_at = NULL, updated_at = ?5 WHERE task_id = ?6",
+                    "UPDATE submission_task SET status = 'COMPLETED', bvid = ?1, aid = ?2, remote_state = ?3, remote_state_desc = ?4, reject_reason = ?5, priority = 0, priority_at = NULL, updated_at = ?6 WHERE task_id = ?7",
                     (
                         item.bvid.as_str(),
                         item.aid,
                         item.remote_state,
+                        item.remote_state_desc.as_deref(),
                         item.reject_reason.as_deref(),
                         now.as_str(),
                         item.task_id.as_str(),
@@ -16634,11 +16916,12 @@ async fn refresh_submission_remote_state(context: &SubmissionQueueContext) -> Re
             }
             for item in &reconciliation_failures {
                 tx.execute(
-                    "UPDATE submission_task SET status = 'FAILED', bvid = ?1, aid = ?2, remote_state = ?3, reject_reason = ?4, updated_at = ?5 WHERE task_id = ?6",
+                    "UPDATE submission_task SET status = 'FAILED', bvid = ?1, aid = ?2, remote_state = ?3, remote_state_desc = ?4, reject_reason = ?5, updated_at = ?6 WHERE task_id = ?7",
                     (
                         item.bvid.as_str(),
                         item.aid,
                         item.remote_state,
+                        item.remote_state_desc.as_deref(),
                         item.reject_reason.as_deref(),
                         now.as_str(),
                         item.task_id.as_str(),
@@ -16681,7 +16964,7 @@ fn load_remote_tasks_by_owner(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.remote_state, COALESCE(st.remote_status_ignored, 0), st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED') OR (st.status = 'COMPLETED' AND COALESCE(TRIM(st.bvid), '') <> '' AND (st.remote_state IS NULL OR st.remote_state = -30))",
+                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.remote_state, COALESCE(st.remote_status_ignored, 0), st.created_at, st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED') OR (st.status = 'COMPLETED' AND COALESCE(TRIM(st.bvid), '') <> '' AND (st.remote_state IS NULL OR st.remote_state IN (-1, -30, -60)))",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -16693,12 +16976,13 @@ fn load_remote_tasks_by_owner(
                         status: row.get(4)?,
                         remote_state: row.get(5)?,
                         remote_status_ignored: row.get::<_, i64>(6)? != 0,
-                        reconciliation_at: row.get(7)?,
-                        error_message: row.get(8)?,
-                        expected_parts: row.get::<_, i64>(9)?.max(0) as usize,
-                        collection_section_id: row.get(11)?,
+                        created_at: row.get(7)?,
+                        reconciliation_at: row.get(8)?,
+                        error_message: row.get(9)?,
+                        expected_parts: row.get::<_, i64>(10)?.max(0) as usize,
+                        collection_section_id: row.get(12)?,
                     },
-                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
                 ))
             })?;
             let mut groups = HashMap::<Option<i64>, Vec<RemoteTrackedTask>>::new();
@@ -16729,22 +17013,28 @@ fn load_remote_refresh_auth(
 async fn fetch_remote_audit_map(
     context: &SubmissionQueueContext,
     auth: &AuthInfo,
-    include_published: bool,
+    published_since: Option<i64>,
 ) -> Result<HashMap<String, RemoteAuditInfo>, String> {
     let mut result =
-        fetch_remote_audit_map_by_status(context, auth, REMOTE_AUDIT_STATUS_REJECTED).await?;
+        fetch_remote_audit_map_by_status(context, auth, REMOTE_AUDIT_STATUS_REJECTED, None).await?;
     let reviewing_map =
-        fetch_remote_audit_map_by_status(context, auth, REMOTE_AUDIT_STATUS_REVIEWING).await?;
+        fetch_remote_audit_map_by_status(context, auth, REMOTE_AUDIT_STATUS_REVIEWING, None)
+            .await?;
     let rejected_count = result.len();
     let reviewing_count = reviewing_map.len();
     for (bvid, info) in reviewing_map {
         result.insert(bvid, info);
     }
     let mut published_count = 0usize;
-    if include_published {
+    if let Some(min_ctime) = published_since {
         sleep(Duration::from_secs(REMOTE_PUBLISHED_PAGE_WAIT_SECS)).await;
-        let published_map =
-            fetch_remote_audit_map_by_status(context, auth, REMOTE_AUDIT_STATUS_PUBLISHED).await?;
+        let published_map = fetch_remote_audit_map_by_status(
+            context,
+            auth,
+            REMOTE_AUDIT_STATUS_PUBLISHED,
+            Some(min_ctime),
+        )
+        .await?;
         published_count = published_map.len();
         for (bvid, info) in published_map {
             result.insert(bvid, info);
@@ -16753,13 +17043,13 @@ async fn fetch_remote_audit_map(
     append_log(
     &context.app_log_path,
     &format!(
-      "submission_remote_fetch_merge_summary auth_uid={} rejected_items={} reviewing_items={} published_items={} merged_items={} include_published={}",
+      "submission_remote_fetch_merge_summary auth_uid={} rejected_items={} reviewing_items={} published_items={} merged_items={} published_since={}",
       upload_owner_label(auth.user_id),
       rejected_count,
       reviewing_count,
       published_count,
       result.len(),
-      include_published
+      published_since.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string())
     ),
   );
     Ok(result)
@@ -16769,6 +17059,7 @@ async fn fetch_remote_audit_map_by_status(
     context: &SubmissionQueueContext,
     auth: &AuthInfo,
     status: &str,
+    min_ctime: Option<i64>,
 ) -> Result<HashMap<String, RemoteAuditInfo>, String> {
     let mut page = 1_i64;
     let page_size = 20_i64;
@@ -16816,12 +17107,22 @@ async fn fetch_remote_audit_map_by_status(
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
+        let mut page_ctimes = Vec::with_capacity(arc_audits.len());
         for item in arc_audits.iter() {
             let Some(info) = parse_remote_audit_info(item) else {
                 continue;
             };
-            result.insert(info.bvid.clone(), info);
+            page_ctimes.push(info.ctime);
+            if min_ctime.map(|cutoff| info.ctime >= cutoff).unwrap_or(true) {
+                result.insert(info.bvid.clone(), info);
+            }
         }
+
+        let reached_older_page = min_ctime
+            .map(|cutoff| {
+                !page_ctimes.is_empty() && page_ctimes.iter().all(|ctime| *ctime < cutoff)
+            })
+            .unwrap_or(false);
 
         let total_count = data
             .get("page")
@@ -16835,6 +17136,19 @@ async fn fetch_remote_audit_map_by_status(
             break;
         }
         if arc_audits.is_empty() {
+            break;
+        }
+        if reached_older_page {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_remote_fetch_cutoff auth_uid={} status={} page={} min_ctime={}",
+                    upload_owner_label(auth.user_id),
+                    status,
+                    page,
+                    min_ctime.unwrap_or_default()
+                ),
+            );
             break;
         }
         page += 1;
@@ -16975,7 +17289,17 @@ fn recover_confirmed_remote_missing_tasks(
                    )
                    AND NOT EXISTS (
                      SELECT 1 FROM task_output_segment seg
-                     WHERE seg.task_id = st.task_id AND seg.upload_status != 'PENDING'
+                     WHERE seg.task_id = st.task_id
+                       AND NOT (
+                         seg.upload_status = 'PENDING'
+                         OR (
+                           seg.upload_status = 'SUCCESS'
+                           AND seg.cid IS NOT NULL
+                           AND seg.cid > 0
+                           AND seg.file_name IS NOT NULL
+                           AND TRIM(seg.file_name) != ''
+                         )
+                       )
                    )",
             )?;
             let task_ids = stmt
@@ -16988,7 +17312,7 @@ fn recover_confirmed_remote_missing_tasks(
             let tx = conn.transaction()?;
             for task_id in &task_ids {
                 tx.execute(
-                    "UPDATE submission_task SET status = 'WAITING_UPLOAD', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+                    "UPDATE submission_task SET status = 'WAITING_UPLOAD', remote_state = NULL, remote_state_desc = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
                     (now.as_str(), task_id.as_str()),
                 )?;
                 tx.execute(
@@ -18513,11 +18837,12 @@ async fn submit_video_in_batches(
     parts: &[UploadedVideoPart],
     csrf: &str,
 ) -> Result<SubmissionSubmitResult, String> {
-    if parts.len() <= MAX_PARTS_PER_SUBMISSION {
+    let batch_end_indexes = submission_batch_end_indexes(parts.len());
+    if batch_end_indexes.len() <= 1 {
         return submit_video_add_with_refresh(context, auth, task, parts, csrf).await;
     }
 
-    let total_batches = (parts.len() + MAX_PARTS_PER_SUBMISSION - 1) / MAX_PARTS_PER_SUBMISSION;
+    let total_batches = batch_end_indexes.len();
     append_log(
         &context.app_log_path,
         &format!(
@@ -18528,7 +18853,8 @@ async fn submit_video_in_batches(
         ),
     );
 
-    let first_parts = &parts[..MAX_PARTS_PER_SUBMISSION];
+    let first_end = batch_end_indexes[0];
+    let first_parts = &parts[..first_end];
     let result = submit_video_add_with_refresh(context, auth, task, first_parts, csrf).await?;
     update_submission_bvid_and_aid(submission_context, task_id, &result.bvid, result.aid)?;
     append_log(
@@ -18541,11 +18867,9 @@ async fn submit_video_in_batches(
             first_parts.len()
         ),
     );
-    let mut end_index = MAX_PARTS_PER_SUBMISSION;
-    let mut batch_index = 2;
-
-    while end_index < parts.len() {
-        let next_end = std::cmp::min(end_index + MAX_PARTS_PER_SUBMISSION, parts.len());
+    let mut completed_end = first_end;
+    for (batch_offset, next_end) in batch_end_indexes.iter().copied().enumerate().skip(1) {
+        let batch_index = batch_offset + 1;
         append_log(
             &context.app_log_path,
             &format!(
@@ -18574,7 +18898,7 @@ async fn submit_video_in_batches(
         {
             return Err(format!(
                 "{} BV已创建但后续分P提交结果待确认，bvid={} aid={} completed_parts={} target_parts={}。原始错误: {}",
-                SUBMISSION_CREATED_PREFIX, result.bvid, result.aid, end_index, next_end, err
+                SUBMISSION_CREATED_PREFIX, result.bvid, result.aid, completed_end, next_end, err
             ));
         }
         append_log(
@@ -18584,8 +18908,7 @@ async fn submit_video_in_batches(
                 result.aid, batch_index, total_batches, next_end
             ),
         );
-        end_index = next_end;
-        batch_index += 1;
+        completed_end = next_end;
     }
 
     Ok(result)
@@ -18599,12 +18922,13 @@ async fn submit_video_update_in_batches(
     aid: i64,
     csrf: &str,
 ) -> Result<(), String> {
-    if parts.len() <= MAX_PARTS_PER_SUBMISSION {
+    let batch_end_indexes = submission_batch_end_indexes(parts.len());
+    if batch_end_indexes.len() <= 1 {
         submit_video_edit_with_refresh(context, auth, task, parts, aid, csrf, true).await?;
         return Ok(());
     }
 
-    let total_batches = (parts.len() + MAX_PARTS_PER_SUBMISSION - 1) / MAX_PARTS_PER_SUBMISSION;
+    let total_batches = batch_end_indexes.len();
     append_log(
         &context.app_log_path,
         &format!(
@@ -18614,11 +18938,8 @@ async fn submit_video_update_in_batches(
             total_batches
         ),
     );
-    let mut end_index = MAX_PARTS_PER_SUBMISSION;
-    let mut batch_index = 1;
-
-    loop {
-        let next_end = std::cmp::min(end_index, parts.len());
+    for (batch_offset, next_end) in batch_end_indexes.iter().copied().enumerate() {
+        let batch_index = batch_offset + 1;
         append_log(
             &context.app_log_path,
             &format!(
@@ -18653,11 +18974,6 @@ async fn submit_video_update_in_batches(
                 aid, batch_index, total_batches, next_end
             ),
         );
-        if next_end >= parts.len() {
-            break;
-        }
-        end_index = next_end + MAX_PARTS_PER_SUBMISSION;
-        batch_index += 1;
     }
     Ok(())
 }
@@ -18670,14 +18986,50 @@ async fn submit_video_add(
     csrf: &str,
 ) -> Result<SubmissionSubmitResult, String> {
     let payload = build_add_payload(task, parts);
+    match context
+        .bilibili
+        .get_json(
+            "https://member.bilibili.com/x/geetest/pre/add",
+            &[],
+            Some(auth),
+            false,
+        )
+        .await
+    {
+        Ok(_) => append_log(
+            &context.app_log_path,
+            &format!(
+                "submission_submit_preflight_ok title={} parts={}",
+                task.title,
+                parts.len()
+            ),
+        ),
+        Err(err) => append_log(
+            &context.app_log_path,
+            &format!(
+                "submission_submit_preflight_skip title={} parts={} err={}",
+                task.title,
+                parts.len(),
+                err
+            ),
+        ),
+    }
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map(|value| value.len())
+        .unwrap_or_default();
+    let first_cid = parts.first().map(|part| part.cid).unwrap_or_default();
+    let last_cid = parts.last().map(|part| part.cid).unwrap_or_default();
     append_log(
         &context.app_log_path,
         &format!(
-            "submission_submit_start title={} season_id={} section_id={} parts={}",
+            "submission_submit_start title={} season_id={} section_id={} parts={} payload_bytes={} first_cid={} last_cid={}",
             task.title,
             task.collection_id.unwrap_or(0),
             task.collection_section_id.unwrap_or(0),
-            parts.len()
+            parts.len(),
+            payload_bytes,
+            first_cid,
+            last_cid
         ),
     );
     let params = vec![
@@ -20749,15 +21101,12 @@ fn clear_upload_session(context: &SubmissionContext, target: &UploadTarget) -> R
 
 fn reset_segments_for_new_bvid(context: &SubmissionContext, task_id: &str) -> Result<(), String> {
     context
-    .db
-    .with_conn(|conn| {
-      conn.execute(
-        "UPDATE task_output_segment SET upload_status = 'PENDING', cid = NULL, upload_progress = 0, upload_uploaded_bytes = 0, upload_total_bytes = 0, upload_session_id = NULL, upload_biz_id = 0, upload_endpoint = NULL, upload_auth = NULL, upload_uri = NULL, upload_chunk_size = 0, upload_last_part_index = 0 WHERE task_id = ?1",
-        [task_id],
-      )?;
-      Ok(())
-    })
-    .map_err(|err| err.to_string())
+        .db
+        .with_conn(|conn| {
+            conn.execute(RESET_ALL_SEGMENT_UPLOAD_SQL, [task_id])?;
+            Ok(())
+        })
+        .map_err(|err| err.to_string())
 }
 
 fn reset_segments_without_upload_session(
@@ -22949,6 +23298,7 @@ mod tests {
             bvid: Some("BV1test".to_string()),
             aid: Some(1),
             remote_state: None,
+            remote_state_desc: None,
             reject_reason: None,
             remote_status_ignored: false,
             created_at: "2026-03-10 09:18:11".to_string(),
@@ -23359,6 +23709,17 @@ mod tests {
     }
 
     #[test]
+    fn submission_batch_indexes_limit_initial_add_to_fifty_parts() {
+        assert_eq!(submission_batch_end_indexes(0), Vec::<usize>::new());
+        assert_eq!(submission_batch_end_indexes(1), vec![1]);
+        assert_eq!(submission_batch_end_indexes(50), vec![50]);
+        assert_eq!(submission_batch_end_indexes(51), vec![50, 51]);
+        assert_eq!(submission_batch_end_indexes(95), vec![50, 95]);
+        assert_eq!(submission_batch_end_indexes(115), vec![50, 100, 115]);
+        assert_eq!(submission_batch_end_indexes(200), vec![50, 100, 150, 200]);
+    }
+
+    #[test]
     fn remote_part_verification_stops_retrying_after_risk_control() {
         assert!(!should_retry_remote_part_verification(Some(
             "request was banned (code: -412)"
@@ -23598,7 +23959,8 @@ mod tests {
                 "bvid": "BV1test",
                 "title": "测试投稿",
                 "ctime": 1_800_000_000_i64,
-                "state": 0
+                "state": -1,
+                "state_desc": "审核中"
             },
             "cid_list": [1, 2, 3]
         }))
@@ -23608,6 +23970,8 @@ mod tests {
         assert_eq!(info.title, "测试投稿");
         assert_eq!(info.part_count, 3);
         assert_eq!(info.ctime, 1_800_000_000);
+        assert_eq!(info.state, -1);
+        assert_eq!(info.state_desc.as_deref(), Some("审核中"));
     }
 
     #[test]
@@ -23620,7 +23984,8 @@ mod tests {
             status: SUBMISSION_STATUS_SUBMIT_UNKNOWN.to_string(),
             remote_state: None,
             remote_status_ignored: false,
-            reconciliation_at: "2027-01-15T07:59:00+00:00".to_string(),
+            created_at: "2027-01-15T07:59:00+00:00".to_string(),
+            reconciliation_at: "2027-01-16T11:00:00+00:00".to_string(),
             error_message: "SUBMIT_RESULT_UNKNOWN: test".to_string(),
             expected_parts: 3,
             collection_section_id: 0,
@@ -23632,6 +23997,7 @@ mod tests {
             part_count: 3,
             ctime: 1_800_000_000,
             state: 0,
+            state_desc: Some("已通过".to_string()),
             reject_reason: None,
         };
         let mut remote_map = HashMap::new();
@@ -23649,7 +24015,9 @@ mod tests {
             &bound_bvids,
             1_800_000_100,
         )
-        .is_some());
+        .is_none());
+
+        remote_map.get_mut("BV1new").expect("candidate").part_count = 3;
 
         let mut duplicate = candidate;
         duplicate.bvid = "BV1duplicate".to_string();
@@ -23677,6 +24045,7 @@ mod tests {
             status: status.to_string(),
             remote_state,
             remote_status_ignored: false,
+            created_at: "2027-01-15T07:59:00+00:00".to_string(),
             reconciliation_at: "2027-01-15T07:59:00+00:00".to_string(),
             error_message: String::new(),
             expected_parts: 1,
@@ -23687,7 +24056,9 @@ mod tests {
     #[test]
     fn completed_task_with_missing_remote_state_requires_refresh() {
         assert!(build_remote_refresh_task("COMPLETED", "BV1test", None).needs_remote_refresh());
+        assert!(build_remote_refresh_task("COMPLETED", "BV1test", Some(-1)).needs_remote_refresh());
         assert!(build_remote_refresh_task("COMPLETED", "BV1test", Some(-30)).needs_remote_refresh());
+        assert!(build_remote_refresh_task("COMPLETED", "BV1test", Some(-60)).needs_remote_refresh());
         assert!(!build_remote_refresh_task("COMPLETED", "BV1test", Some(0)).needs_remote_refresh());
         assert!(!build_remote_refresh_task("COMPLETED", "", None).needs_remote_refresh());
     }

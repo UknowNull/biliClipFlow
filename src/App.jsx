@@ -293,6 +293,7 @@ function App() {
         return (
           <ToolboxSection
             activeTool={active.split(".")[1] || "remux"}
+            activeBilibiliUid={activeBilibiliUid}
             onToolChange={(tool) => setActive(`toolbox.${tool}`)}
           />
         );

@@ -104,36 +104,171 @@ pub fn merge_files_transcode(
     output_path: &Path,
     profile: TranscodeProfile,
 ) -> Result<(), String> {
+    if files.is_empty() {
+        return Err("没有可合并的视频片段".to_string());
+    }
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create output dir: {}", err))?;
     }
 
-    let list_path = output_path.with_extension("txt");
-    let list_content = files
+    let inputs = files
         .iter()
-        .map(|path| format!("file '{}'", path.to_string_lossy()))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|path| probe_merge_input(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let attempts = build_merge_transcode_attempts(files, &inputs, output_path, profile);
+    let mut errors = Vec::new();
+    for args in attempts {
+        if output_path.exists() {
+            let _ = fs::remove_file(output_path);
+        }
+        match run_ffmpeg(&args) {
+            Ok(_) => return Ok(()),
+            Err(err) => errors.push(err),
+        }
+    }
+    Err(format!("merge_transcode_fail: {}", errors.join(" | ")))
+}
 
-    fs::write(&list_path, list_content)
-        .map_err(|err| format!("Failed to write concat file: {}", err))?;
+#[derive(Clone, Copy)]
+struct MergeInputInfo {
+    duration_seconds: f64,
+    has_audio: bool,
+}
 
-    let input_args = vec![
-        "-f".to_string(),
-        "concat".to_string(),
-        "-safe".to_string(),
-        "0".to_string(),
-        "-fflags".to_string(),
-        "+genpts".to_string(),
-        "-i".to_string(),
-        list_path.to_string_lossy().to_string(),
+fn probe_merge_input(path: &Path) -> Result<MergeInputInfo, String> {
+    let args = vec![
+        "-v".to_string(),
+        "error".to_string(),
+        "-show_entries".to_string(),
+        "format=duration:stream=codec_type".to_string(),
+        "-of".to_string(),
+        "json".to_string(),
+        path.to_string_lossy().to_string(),
     ];
+    let data = run_ffprobe_json(&args).map_err(|err| {
+        format!(
+            "合并输入探测失败 path={} err={}",
+            path.to_string_lossy(),
+            err
+        )
+    })?;
+    let duration_seconds = data
+        .get("format")
+        .and_then(|value| value.get("duration"))
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| format!("合并输入时长无效 path={}", path.to_string_lossy()))?;
+    let has_audio = data
+        .get("streams")
+        .and_then(Value::as_array)
+        .map(|streams| {
+            streams.iter().any(|stream| {
+                stream
+                    .get("codec_type")
+                    .and_then(Value::as_str)
+                    .map(|value| value == "audio")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    Ok(MergeInputInfo {
+        duration_seconds,
+        has_audio,
+    })
+}
 
-    let result =
-        run_transcode_with_fallback(&input_args, output_path, profile, "merge_transcode_fail");
-    let _ = fs::remove_file(list_path);
-    result
+fn build_merge_filter_graph(inputs: &[MergeInputInfo]) -> String {
+    let with_audio = inputs.iter().any(|input| input.has_audio);
+    let mut filters = Vec::with_capacity(inputs.len() * 2 + 1);
+    for (index, input) in inputs.iter().enumerate() {
+        filters.push(format!(
+            "[{}:v:0]settb=AVTB,setpts=PTS-STARTPTS[v{}]",
+            index, index
+        ));
+        if with_audio {
+            if input.has_audio {
+                filters.push(format!(
+                    "[{}:a:0]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a{}]",
+                    index, index
+                ));
+            } else {
+                filters.push(format!(
+                    "anullsrc=r=48000:cl=stereo,atrim=duration={:.6},asetpts=PTS-STARTPTS[a{}]",
+                    input.duration_seconds, index
+                ));
+            }
+        }
+    }
+
+    let mut concat_inputs = String::new();
+    for index in 0..inputs.len() {
+        concat_inputs.push_str(&format!("[v{}]", index));
+        if with_audio {
+            concat_inputs.push_str(&format!("[a{}]", index));
+        }
+    }
+    filters.push(format!(
+        "{}concat=n={}:v=1:a={}[vout]{}",
+        concat_inputs,
+        inputs.len(),
+        if with_audio { 1 } else { 0 },
+        if with_audio { "[aout]" } else { "" }
+    ));
+    filters.join(";")
+}
+
+fn build_merge_transcode_attempts(
+    files: &[PathBuf],
+    inputs: &[MergeInputInfo],
+    output_path: &Path,
+    profile: TranscodeProfile,
+) -> [Vec<String>; 2] {
+    let filter_graph = build_merge_filter_graph(inputs);
+    let with_audio = inputs.iter().any(|input| input.has_audio);
+    let build_args = |use_hardware: bool| {
+        let mut args = vec!["-y".to_string()];
+        for path in files {
+            args.extend([
+                "-fflags".to_string(),
+                "+genpts".to_string(),
+                "-i".to_string(),
+                path.to_string_lossy().to_string(),
+            ]);
+        }
+        args.extend([
+            "-filter_complex".to_string(),
+            filter_graph.clone(),
+            "-map".to_string(),
+            "[vout]".to_string(),
+        ]);
+        if with_audio {
+            args.extend(["-map".to_string(), "[aout]".to_string()]);
+        }
+        args.extend(transcode_video_codec_args(profile, use_hardware));
+        if with_audio {
+            args.extend([
+                "-c:a".to_string(),
+                "aac".to_string(),
+                "-ar".to_string(),
+                "48000".to_string(),
+                "-ac".to_string(),
+                "2".to_string(),
+                "-b:a".to_string(),
+                "192k".to_string(),
+            ]);
+        }
+        args.extend([
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+            "-avoid_negative_ts".to_string(),
+            "make_zero".to_string(),
+            output_path.to_string_lossy().to_string(),
+        ]);
+        args
+    };
+    [build_args(true), build_args(false)]
 }
 
 pub fn decide_clip_copy(_sources: &[ClipSource]) -> Result<ClipCopyDecision, String> {
@@ -924,7 +1059,12 @@ fn clip_single(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_ffmpeg_time, last_keyframe_at_or_before};
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        build_merge_filter_graph, build_merge_transcode_attempts, format_ffmpeg_time,
+        last_keyframe_at_or_before, MergeInputInfo, TranscodeProfile,
+    };
     use serde_json::json;
 
     #[test]
@@ -949,5 +1089,58 @@ mod tests {
             Some(2545.833)
         );
         assert_eq!(last_keyframe_at_or_before(&payload, 2539.0), None);
+    }
+
+    #[test]
+    fn merge_filter_graph_resets_each_input_timeline() {
+        let graph = build_merge_filter_graph(&[
+            MergeInputInfo {
+                duration_seconds: 10.0,
+                has_audio: true,
+            },
+            MergeInputInfo {
+                duration_seconds: 20.0,
+                has_audio: true,
+            },
+        ]);
+        assert!(graph.contains("[0:v:0]settb=AVTB,setpts=PTS-STARTPTS[v0]"));
+        assert!(graph.contains("[1:v:0]settb=AVTB,setpts=PTS-STARTPTS[v1]"));
+        assert!(graph.contains("[0:a:0]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a0]"));
+        assert!(graph.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vout][aout]"));
+    }
+
+    #[test]
+    fn merge_filter_graph_adds_silence_for_missing_audio() {
+        let graph = build_merge_filter_graph(&[
+            MergeInputInfo {
+                duration_seconds: 10.5,
+                has_audio: true,
+            },
+            MergeInputInfo {
+                duration_seconds: 4.25,
+                has_audio: false,
+            },
+        ]);
+        assert!(graph.contains("anullsrc=r=48000:cl=stereo,atrim=duration=4.250000"));
+        assert!(graph.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vout][aout]"));
+    }
+
+    #[test]
+    fn merge_transcode_does_not_add_simple_audio_filter_after_complex_mapping() {
+        let inputs = [MergeInputInfo {
+            duration_seconds: 10.0,
+            has_audio: true,
+        }];
+        let attempts = build_merge_transcode_attempts(
+            &[PathBuf::from("input.mp4")],
+            &inputs,
+            Path::new("output.mp4"),
+            TranscodeProfile::ClipAndMergeClean,
+        );
+        for args in attempts {
+            assert!(!args
+                .windows(2)
+                .any(|pair| pair == ["-af", "aresample=async=1:first_pts=0"]));
+        }
     }
 }
