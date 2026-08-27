@@ -186,6 +186,59 @@ const getFileTitle = (path) => {
   return dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
 };
 
+const buildSubmittedVideoPart = (part, localSource) => {
+  const source = localSource || part;
+  const isLocal = Boolean(localSource);
+  return {
+    originalTitle: isLocal
+      ? source.title || getFileTitle(source.sourceFilePath)
+      : part.title,
+    filePath: isLocal ? source.sourceFilePath : part.filePath,
+    startTime: isLocal ? source.startTime || null : part.startTime || null,
+    endTime: isLocal ? source.endTime || null : part.endTime || null,
+    cid: isLocal ? 0 : part.cid,
+    uploadPartTitle: resolveSubmittedUploadPartTitle(source),
+    uploadPartTitleMode: source.uploadPartTitleMode || "AUTO",
+  };
+};
+
+const buildOrderedSubmissionVideoParts = (parts, sourceVideos, mergeItems) => {
+  const partMap = new Map(
+    (parts || [])
+      .filter((part) => part?.key)
+      .map((part) => [part.key, buildSubmittedVideoPart(part)]),
+  );
+  (sourceVideos || []).forEach((source) => {
+    if (source?.localId) {
+      partMap.set(source.localId, buildSubmittedVideoPart(null, source));
+    }
+  });
+
+  const orderedIds = [];
+  const used = new Set();
+  const appendSource = (sourceId) => {
+    if (!sourceId || used.has(sourceId) || !partMap.has(sourceId)) {
+      return;
+    }
+    used.add(sourceId);
+    orderedIds.push(sourceId);
+  };
+
+  for (const item of mergeItems || []) {
+    if (item.type === "GROUP") {
+      (item.sourceIds || []).forEach(appendSource);
+    } else if (item.type === "SOURCE") {
+      appendSource(item.sourceId);
+    }
+  }
+
+  // 提交顺序必须以投稿配置中的拖拽顺序为准，而不是按来源类型重新拼接。
+  // 如果旧状态遗漏了当前源视频，按选中源列表补齐，避免请求丢源。
+  (parts || []).forEach((part) => appendSource(part?.key));
+
+  return orderedIds.map((sourceId) => partMap.get(sourceId)).filter(Boolean);
+};
+
 const insertSubmitMergeItemClone = (items, sourceId, clonedId) => {
   const next = [];
   let inserted = false;
@@ -2428,15 +2481,11 @@ export default function DownloadSection({
           downloadName,
         },
       }));
-      const localVideoParts = sourceVideos.map((source) => ({
-        originalTitle: source.title || getFileTitle(source.sourceFilePath),
-        filePath: source.sourceFilePath,
-        startTime: source.startTime || null,
-        endTime: source.endTime || null,
-        cid: 0,
-        uploadPartTitle: resolveSubmittedUploadPartTitle(source),
-        uploadPartTitleMode: source.uploadPartTitleMode || "AUTO",
-      }));
+      const orderedVideoParts = buildOrderedSubmissionVideoParts(
+        selectedPartsConfig,
+        sourceVideos,
+        submitMergeItems,
+      );
       const mergeGroups = buildSubmitMergeGroupsPayload();
       const payload = {
         enableSubmission: true,
@@ -2467,20 +2516,7 @@ export default function DownloadSection({
           baiduSyncEnabled: Boolean(submissionConfig.baiduSyncEnabled),
           baiduSyncPath: submissionConfig.baiduSyncPath || null,
           baiduSyncFilename: submissionConfig.baiduSyncFilename || null,
-          videoParts: [
-            ...selectedPartsConfig
-              .filter((part) => part.sourceType !== "LOCAL")
-              .map((part) => ({
-            originalTitle: part.title,
-            filePath: part.filePath,
-            startTime: part.startTime || null,
-            endTime: part.endTime || null,
-            cid: part.cid,
-            uploadPartTitle: resolveSubmittedUploadPartTitle(part),
-            uploadPartTitleMode: part.uploadPartTitleMode || "AUTO",
-              })),
-            ...localVideoParts,
-          ],
+          videoParts: orderedVideoParts,
         },
       };
       await invokeCommand("download_video", { payload });
