@@ -3775,7 +3775,7 @@ async fn build_season_backup(
         .collect::<Vec<_>>();
     let episode_count = sections.iter().map(|item| item.ep_count).sum::<i64>();
     let captured_episode_count = flattened_episodes.len() as i64;
-    let complete = episode_count == 0 || captured_episode_count >= episode_count;
+    let complete = episode_count > 0 && captured_episode_count >= episode_count;
 
     Ok(SeasonBackup {
         backup_id: Uuid::new_v4().to_string(),
@@ -4518,7 +4518,7 @@ async fn add_episodes_to_section(
             Ok(_) => {
                 added_count += chunk.len();
             }
-            Err(err) if is_episode_exists_error(&err) => {
+            Err(err) if is_episode_skippable_error(&err) => {
                 added_count += add_episodes_individually(
                     state,
                     auth,
@@ -4729,6 +4729,12 @@ async fn add_episodes_individually(
                     section_title, item.title
                 ));
             }
+            Err(err) if is_episode_unavailable_error(&err) => {
+                warnings.push(format!(
+                    "子合集「{}」视频「{}」已删除或已锁定，已跳过",
+                    section_title, item.title
+                ));
+            }
             Err(err) => return Err(err),
         }
     }
@@ -4791,6 +4797,14 @@ fn is_rate_limited_error(err: &str) -> bool {
 
 fn is_episode_exists_error(err: &str) -> bool {
     err.contains("20080") || err.contains("已存在在合集中")
+}
+
+fn is_episode_unavailable_error(err: &str) -> bool {
+    err.contains("20087") || err.contains("已删除或者已锁定")
+}
+
+fn is_episode_skippable_error(err: &str) -> bool {
+    is_episode_exists_error(err) || is_episode_unavailable_error(err)
 }
 
 fn build_episode_sorts(original: &[SeasonEpisodeBackup], added: &[Value]) -> Vec<Value> {
@@ -5103,6 +5117,9 @@ async fn execute_season_backup(
     let mut backups = read_season_backups(app)?;
     let existing_publish_times = cached_publish_times_for_season(&backups, season_id);
     let backup = build_season_backup(app, state, &auth, &detail, &existing_publish_times).await?;
+    if backup.captured_episode_count == 0 {
+        return Err("合集未返回任何视频，已保留原有备份".to_string());
+    }
     upsert_season_backup(&mut backups, backup.clone(), preserve_backup_id);
     write_season_backups(app, &backups)?;
     Ok(backup)

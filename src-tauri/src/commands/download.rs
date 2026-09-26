@@ -139,6 +139,7 @@ pub struct DownloadPart {
     pub cid: i64,
     pub title: String,
     pub duration: Option<i64>,
+    pub target_path: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -156,6 +157,8 @@ pub struct SubmissionVideoPart {
     #[allow(dead_code)]
     pub original_title: String,
     pub file_path: String,
+    pub source_type: Option<String>,
+    pub remote_path: Option<String>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
     #[allow(dead_code)]
@@ -267,6 +270,24 @@ fn resolve_runtime_local_path(db: &Db, value: &str) -> String {
 
 fn normalize_local_path_key(value: &str) -> String {
     value.replace('\\', "/")
+}
+
+fn download_requests_remote_path(context: &DownloadContext, record_id: i64) -> Option<String> {
+    context
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT download_url FROM video_download WHERE id = ?1 AND source_type = ?2",
+                (record_id, DOWNLOAD_SOURCE_BAIDU),
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+        })
+        .ok()
+        .flatten()
+        .flatten()
+        .map(|value| normalize_local_path_key(value.trim()))
+        .filter(|value| !value.is_empty())
 }
 
 fn format_duration_hms(seconds: i64) -> String {
@@ -767,6 +788,7 @@ pub async fn download_retry(
         cid,
         title: part_title.unwrap_or_else(|| "未命名分P".to_string()),
         duration: None,
+        target_path: None,
     };
     let config = DownloadConfig {
         download_name: None,
@@ -990,6 +1012,7 @@ pub async fn download_resume(
         cid,
         title: part_title.unwrap_or_else(|| "未命名分P".to_string()),
         duration: None,
+        target_path: None,
     };
     let config = DownloadConfig {
         download_name: None,
@@ -1159,6 +1182,7 @@ async fn requeue_download_record(context: &DownloadContext, record_id: i64) -> R
         cid,
         title: part_title.unwrap_or_else(|| "未命名分P".to_string()),
         duration: None,
+        target_path: None,
     };
     let config = DownloadConfig {
         download_name: None,
@@ -1404,21 +1428,39 @@ async fn handle_integration_download(
     }
     let mut record_id_by_actual_path: HashMap<String, i64> = HashMap::new();
     let mut duration_by_actual_path: HashMap<String, i64> = HashMap::new();
+    let mut path_by_remote_path: HashMap<String, String> = HashMap::new();
+    let mut record_id_by_remote_path: HashMap<String, i64> = HashMap::new();
     for record in &download_results {
         let path_key = normalize_local_path_key(&record.actual_path);
         record_id_by_actual_path.insert(path_key.clone(), record.id);
         if let Some(duration) = record.duration.filter(|value| *value > 0) {
             duration_by_actual_path.insert(path_key, duration);
         }
+        if let Some(remote_path) = download_requests_remote_path(&context, record.id) {
+            path_by_remote_path.insert(remote_path.clone(), record.actual_path.clone());
+            record_id_by_remote_path.insert(remote_path, record.id);
+        }
     }
 
     let mut source_remote_meta_by_record_id: HashMap<
         i64,
-        (Option<String>, Option<i64>, Option<String>, Option<String>),
+        (
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            String,
+        ),
     > = HashMap::new();
     let mut source_remote_meta_by_cid: HashMap<
         i64,
-        (Option<String>, Option<i64>, Option<String>, Option<String>),
+        (
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            String,
+        ),
     > = HashMap::new();
     let mut cid_counts: HashMap<i64, usize> = HashMap::new();
     for record in &download_results {
@@ -1463,7 +1505,10 @@ async fn handle_integration_download(
                 let aid = aid.and_then(|value| value.trim().parse::<i64>().ok());
                 let remote_video_url = if source_type
                     .as_deref()
-                    .map(|value| value.eq_ignore_ascii_case(DOWNLOAD_SOURCE_DIRECT))
+                    .map(|value| {
+                        value.eq_ignore_ascii_case(DOWNLOAD_SOURCE_DIRECT)
+                            || value.eq_ignore_ascii_case(DOWNLOAD_SOURCE_BAIDU)
+                    })
                     .unwrap_or(false)
                 {
                     download_url
@@ -1471,7 +1516,15 @@ async fn handle_integration_download(
                     bvid.as_ref()
                         .map(|value| format!("https://www.bilibili.com/video/{}", value))
                 };
-                let remote_meta = (bvid, aid, part_title, remote_video_url);
+                let normalized_source_type =
+                    source_type.unwrap_or_else(|| DOWNLOAD_SOURCE_BILIBILI.to_string());
+                let remote_meta = (
+                    bvid,
+                    aid,
+                    part_title,
+                    remote_video_url,
+                    normalized_source_type,
+                );
                 source_remote_meta_by_record_id.insert(record_id, remote_meta.clone());
                 if let Some(cid) =
                     cid.filter(|value| cid_counts.get(value).copied().unwrap_or(0) == 1)
@@ -1524,10 +1577,17 @@ async fn handle_integration_download(
 
     for (index, part) in submission.video_parts.into_iter().enumerate() {
       let part_id = uuid::Uuid::new_v4().to_string();
-      let stored_file_path =
-        to_stored_local_path_with_prefix(local_path_prefix.as_path(), &part.file_path);
       let file_path_key = normalize_local_path_key(&part.file_path);
-      let record_id = record_id_by_actual_path.get(&file_path_key).copied();
+      let remote_path_key = normalize_local_path_key(part.remote_path.as_deref().unwrap_or(""));
+      let record_id = record_id_by_actual_path
+        .get(&file_path_key)
+        .copied()
+        .or_else(|| record_id_by_remote_path.get(&remote_path_key).copied());
+      let resolved_file_path = path_by_remote_path
+        .get(&remote_path_key)
+        .cloned()
+        .unwrap_or_else(|| part.file_path.clone());
+      let stored_file_path = to_stored_local_path_with_prefix(local_path_prefix.as_path(), &resolved_file_path);
       let fallback_end_time = duration_by_actual_path
         .get(&file_path_key)
         .filter(|duration| **duration > 0 && is_empty_or_zero_time(part.end_time.as_deref()))
@@ -1549,7 +1609,19 @@ async fn handle_integration_download(
             Some(title)
           }
         });
-      let remote_video_url = remote_meta.as_ref().and_then(|value| value.3.clone());
+      let remote_video_url = remote_meta
+        .as_ref()
+        .and_then(|value| value.3.clone());
+      let source_type = remote_meta
+        .as_ref()
+        .map(|value| value.4.as_str())
+        .or_else(|| part.source_type.as_deref())
+        .unwrap_or(DOWNLOAD_SOURCE_BILIBILI);
+      let remote_path = if source_type.eq_ignore_ascii_case(DOWNLOAD_SOURCE_BAIDU) {
+        part.remote_path.clone().or(remote_video_url.clone())
+      } else {
+        None
+      };
       let upload_part_title = part
         .upload_part_title
         .as_deref()
@@ -1561,12 +1633,14 @@ async fn handle_integration_download(
         _ => "AUTO",
       };
       conn.execute(
-        "INSERT INTO task_source_video (id, task_id, source_file_path, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, sort_order, start_time, end_time, upload_part_title, upload_part_title_mode) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO task_source_video (id, task_id, source_file_path, source_type, remote_path, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, sort_order, start_time, end_time, upload_part_title, upload_part_title_mode) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         (
           part_id,
           &submission_id,
           stored_file_path,
+          source_type,
+          remote_path.as_deref(),
           remote_video_url.as_deref(),
           remote_bvid.as_deref(),
           remote_aid,
@@ -1661,6 +1735,9 @@ async fn create_download_tasks_with_start(
     start_immediately: bool,
 ) -> Result<Vec<DownloadTaskCreateResult>, String> {
     let source_type = normalize_download_source_type(request.source_type.as_deref());
+    if source_type == DOWNLOAD_SOURCE_BAIDU {
+        return create_baidu_download_tasks_with_start(context, request, start_immediately).await;
+    }
     if is_direct_download_source(&source_type) {
         return create_direct_download_tasks_with_start(context, request, start_immediately).await;
     }
@@ -1774,6 +1851,92 @@ async fn create_download_tasks_with_start(
         schedule_pending_downloads(context.clone()).await;
     }
     Ok(record_ids)
+}
+
+async fn create_baidu_download_tasks_with_start(
+    context: DownloadContext,
+    request: DownloadRequest,
+    start_immediately: bool,
+) -> Result<Vec<DownloadTaskCreateResult>, String> {
+    let remote_path = baidu_sync::join_baidu_path("/", request.video_url.trim());
+    if remote_path == "/" {
+        return Err("网盘视频路径不能为空".to_string());
+    }
+    let _ = baidu_sync::fetch_baidu_remote_file_size(&context.db, &remote_path)
+        .map_err(|err| format!("网盘文件不可用: {}", err))?;
+    let settings = load_download_settings_from_db(&context.db)
+        .map_err(|err| format!("Failed to load download settings: {}", err))?;
+    let storage_prefix = load_local_path_prefix(&context.db);
+    let base_dir = request
+        .config
+        .download_path
+        .clone()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| settings.download_path.clone());
+    let base_dir = if base_dir.trim().is_empty() {
+        default_download_dir().to_string_lossy().to_string()
+    } else {
+        base_dir
+    };
+    let remote_name = extract_remote_name(&remote_path);
+    let title = Path::new(&remote_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("网盘视频")
+        .to_string();
+    let folder_name = request
+        .config
+        .download_name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| title.clone());
+    let sanitized_folder = sanitize_filename(&folder_name);
+    let part = request.parts.first().cloned().unwrap_or(DownloadPart {
+        cid: 0,
+        title: remote_name.clone(),
+        duration: None,
+        target_path: None,
+    });
+    let default_path = build_output_path(
+        &base_dir,
+        &sanitized_folder,
+        &sanitize_filename(if part.title.trim().is_empty() {
+            &remote_name
+        } else {
+            &part.title
+        }),
+    );
+    let requested_path = part
+        .target_path
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(default_path);
+    let output_path = resolve_unique_output_path(&context, requested_path)?;
+    let expected_path = output_path.to_string_lossy().to_string();
+    let actual_path = expected_path.clone();
+    let stored_actual_path =
+        to_stored_local_path_with_prefix(storage_prefix.as_path(), &actual_path);
+    let now = now_rfc3339();
+    let initial_status = if start_immediately { 0 } else { 5 };
+    let record_id = context.db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, progress_total, progress_done, create_time, update_time, resolution, codec, format, cid, content, source_type) VALUES (NULL, NULL, ?1, ?2, 1, 1, ?3, ?4, ?5, 0, 0, 0, ?6, ?7, NULL, NULL, NULL, 0, NULL, ?8)",
+            (&title, &part.title, &remote_path, &stored_actual_path, initial_status, &now, &now, DOWNLOAD_SOURCE_BAIDU),
+        )?;
+        Ok(conn.last_insert_rowid())
+    }).map_err(|err| format!("Failed to save Baidu download record: {}", err))?;
+    if start_immediately {
+        schedule_pending_downloads(context.clone()).await;
+    }
+    Ok(vec![DownloadTaskCreateResult {
+        id: record_id,
+        cid: 0,
+        expected_path,
+        actual_path,
+        duration: part.duration,
+    }])
 }
 
 async fn create_direct_download_tasks_with_start(
@@ -2204,6 +2367,7 @@ fn start_pending_download(
         cid,
         title: record.part_title.unwrap_or_else(|| "未命名分P".to_string()),
         duration: None,
+        target_path: None,
     };
     let config = DownloadConfig {
         download_name: None,
@@ -2644,6 +2808,7 @@ async fn run_baidu_download_job(
                     record_id
                 ),
             );
+            let _ = refresh_integration_status(&context, record_id).await;
             let _ = handle_baidu_restore_after_download(&context, record_id).await;
         }
         Err(err) => {
@@ -2656,6 +2821,7 @@ async fn run_baidu_download_job(
                     record_id, err
                 ),
             );
+            let _ = refresh_integration_status(&context, record_id).await;
             let _ = handle_baidu_restore_after_download(&context, record_id).await;
         }
     }

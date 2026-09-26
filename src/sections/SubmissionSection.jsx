@@ -40,12 +40,17 @@ const statusFilters = [
   { value: "CANCELLED", label: "已取消" },
 ];
 
+const REMOTE_STATE_TRANSCODE_FAILED = -16;
+
 const submissionNeedsRemoteVerification = (task) => {
   const status = String(task?.status || "").trim();
   if (["VERIFY_PENDING", "SUBMIT_UNKNOWN"].includes(status)) {
     return true;
   }
   if (status !== "FAILED") {
+    return false;
+  }
+  if (Number(task?.remoteState) === REMOTE_STATE_TRANSCODE_FAILED) {
     return false;
   }
   const error = String(task?.workflowStatus?.errorMessage || "");
@@ -115,7 +120,9 @@ const parseCollectionTreeValue = (rawValue) => {
 
 const emptySource = (index) => ({
   localId: buildSourceId(),
+  sourceType: "LOCAL",
   sourceFilePath: "",
+  remotePath: "",
   remoteVideoUrl: "",
   remoteBvid: "",
   remoteAid: 0,
@@ -234,6 +241,8 @@ const buildSourceVideoPayload = (source, index) => {
   const title = mode === "CUSTOM" ? normalizeUploadPartTitle(source.uploadPartTitle) : "";
   return {
     sourceFilePath: source.sourceFilePath,
+    sourceType: source.sourceType || "LOCAL",
+    remotePath: source.remotePath || null,
     remoteVideoUrl: source.remoteVideoUrl || null,
     remoteBvid: source.remoteBvid || null,
     remoteAid: source.remoteAid || null,
@@ -412,6 +421,9 @@ export default function SubmissionSection({
   const [sourcePartPickerAid, setSourcePartPickerAid] = useState(0);
   const [sourcePartPickerPages, setSourcePartPickerPages] = useState([]);
   const [sourcePartPickerError, setSourcePartPickerError] = useState("");
+  const [sourceRemotePickerOpen, setSourceRemotePickerOpen] = useState(false);
+  const [sourceRemotePickerTarget, setSourceRemotePickerTarget] = useState("create");
+  const [sourceRemotePickerIndex, setSourceRemotePickerIndex] = useState(-1);
   const [deleteTargetId, setDeleteTargetId] = useState("");
   const [deleteTargetIds, setDeleteTargetIds] = useState([]);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -2706,6 +2718,46 @@ export default function SubmissionSection({
     setSourceVideos((prev) => [...prev, emptySource(prev.length)]);
   };
 
+  const openSourceRemotePicker = (target, index) => {
+    setSourceRemotePickerTarget(target);
+    setSourceRemotePickerIndex(index);
+    setSourceRemotePickerOpen(true);
+  };
+
+  const closeSourceRemotePicker = () => {
+    setSourceRemotePickerOpen(false);
+    setSourceRemotePickerIndex(-1);
+  };
+
+  const handleConfirmSourceRemoteFile = (remotePath, entry) => {
+    const index = sourceRemotePickerIndex;
+    const setter = sourceRemotePickerTarget === "update" ? setUpdateSourceVideos : setSourceVideos;
+    if (index < 0 || !remotePath) {
+      return;
+    }
+    setter((prev) =>
+      prev.map((item, itemIndex) =>
+        itemIndex === index
+          ? {
+              ...item,
+              sourceType: "BAIDU",
+              sourceFilePath: "",
+              remotePath,
+              remoteVideoUrl: "",
+              remoteBvid: "",
+              remoteAid: 0,
+              remoteCid: 0,
+              remotePartTitle: entry?.name || item.remotePartTitle || "",
+              title: entry?.name ? String(entry.name).replace(/\.[^.]+$/, "") : item.title,
+              endTime: "",
+            }
+          : item,
+      ),
+    );
+    setMessage(`已选择网盘视频：${remotePath}`);
+    closeSourceRemotePicker();
+  };
+
   const duplicateSource = (index) => {
     const target = sourceVideos[index];
     if (!target) {
@@ -2736,7 +2788,9 @@ export default function SubmissionSection({
           if (isDownloadUrlInput(value)) {
             return {
               ...item,
+              sourceType: "DIRECT",
               remoteVideoUrl: value,
+              remotePath: "",
               remoteBvid: "",
               remoteAid: 0,
               remoteCid: 0,
@@ -2745,7 +2799,9 @@ export default function SubmissionSection({
           }
           return {
             ...item,
+            sourceType: "BILIBILI",
             remoteVideoUrl: "",
+            remotePath: "",
             remoteBvid: value,
             remoteAid: 0,
             remoteCid: 0,
@@ -3134,6 +3190,8 @@ export default function SubmissionSection({
           .filter(Boolean)
           .map((source, index) => ({
             sourceFilePath: source.sourceFilePath,
+            sourceType: source.sourceType || "LOCAL",
+            remotePath: source.remotePath || null,
             remoteVideoUrl: source.remoteVideoUrl || null,
             remoteAid: source.remoteAid || null,
             startTime: source.startTime || null,
@@ -3173,6 +3231,8 @@ export default function SubmissionSection({
           sources: [
             {
               sourceFilePath: source.sourceFilePath,
+              sourceType: source.sourceType || "LOCAL",
+              remotePath: source.remotePath || null,
               remoteVideoUrl: source.remoteVideoUrl || null,
               remoteBvid: source.remoteBvid || null,
               remoteAid: source.remoteAid || null,
@@ -3187,6 +3247,8 @@ export default function SubmissionSection({
       } else {
         remainingSources.push({
           sourceFilePath: source.sourceFilePath,
+          sourceType: source.sourceType || "LOCAL",
+          remotePath: source.remotePath || null,
           remoteVideoUrl: source.remoteVideoUrl || null,
           remoteBvid: source.remoteBvid || null,
           remoteAid: source.remoteAid || null,
@@ -3396,12 +3458,21 @@ export default function SubmissionSection({
               className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
             />
             {!isReadOnly ? (
-              <button
-                className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
-                onClick={() => openFileDialog(sourceIndex)}
-              >
-                选择
-              </button>
+              <>
+                <button
+                  className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
+                  onClick={() => openFileDialog(sourceIndex)}
+                >
+                  本地
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
+                  onClick={() => openSourceRemotePicker("create", sourceIndex)}
+                >
+                  网盘
+                </button>
+              </>
             ) : null}
           </div>
         </td>
@@ -3442,7 +3513,9 @@ export default function SubmissionSection({
           </div>
         </td>
         <td className="px-4 py-2 text-[var(--muted)]">
-          {source.remotePartTitle ||
+          {source.sourceType === "BAIDU"
+            ? source.remotePath || "网盘视频"
+            : source.remotePartTitle ||
             (source.remoteBvid
               ? "未指定分P"
               : source.remoteVideoUrl
@@ -3923,7 +3996,9 @@ export default function SubmissionSection({
           const startTime = normalizeTimeValue(item.startTime, durationSeconds) || "00:00:00";
           return {
             ...item,
+            sourceType: "LOCAL",
             sourceFilePath: selected,
+            remotePath: "",
             durationSeconds,
             startTime,
             endTime,
@@ -3964,7 +4039,9 @@ export default function SubmissionSection({
           const startTime = normalizeTimeValue(item.startTime, durationSeconds) || "00:00:00";
           return {
             ...item,
+            sourceType: "LOCAL",
             sourceFilePath: selected,
+            remotePath: "",
             durationSeconds,
             startTime,
             endTime,
@@ -4354,7 +4431,9 @@ export default function SubmissionSection({
     });
     const sources = (detail?.sourceVideos || []).map((item, index) => ({
       localId: buildSourceId(),
+      sourceType: item.sourceType || "LOCAL",
       sourceFilePath: item.sourceFilePath || "",
+      remotePath: item.remotePath || "",
       remoteVideoUrl: item.remoteVideoUrl || "",
       remoteBvid: item.remoteBvid || "",
       remoteAid: Number(item.remoteAid || 0) || 0,
@@ -7286,7 +7365,7 @@ export default function SubmissionSection({
                 <th className="px-4 py-2">序号</th>
                 <th className="px-4 py-2">选择</th>
                 <th className="px-4 py-2">独立分组</th>
-                <th className="px-4 py-2">视频文件（必填）</th>
+                          <th className="px-4 py-2">视频文件/网盘路径</th>
                 <th className="px-4 py-2">BV号或下载链接</th>
                 <th className="px-4 py-2">分P标题</th>
                 <th className="px-4 py-2">上传分P标题</th>
@@ -10688,6 +10767,12 @@ export default function SubmissionSection({
         initialPath={remoteFilePickerPath}
         onClose={closeRemoteFilePicker}
         onConfirm={handleConfirmRemoteFileBinding}
+      />
+      <BaiduRemoteFilePicker
+        open={sourceRemotePickerOpen}
+        initialPath="/"
+        onClose={closeSourceRemotePicker}
+        onConfirm={handleConfirmSourceRemoteFile}
       />
     </div>
   );

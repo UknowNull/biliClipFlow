@@ -5,6 +5,7 @@ import { showErrorDialog } from "../lib/dialog";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime, formatDuration, formatNumber, parseVideoInput } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
+import BaiduRemoteFilePicker from "../components/BaiduRemoteFilePicker";
 
 const recordTabs = [
   { key: "pending", label: "待下载", status: 0 },
@@ -190,6 +191,8 @@ const buildSubmittedVideoPart = (part, localSource) => {
   const source = localSource || part;
   const isLocal = Boolean(localSource);
   return {
+    sourceType: source.sourceType || (isLocal ? "LOCAL" : part.sourceType || "BILIBILI"),
+    remotePath: source.remotePath || part.remotePath || null,
     originalTitle: isLocal
       ? source.title || getFileTitle(source.sourceFilePath)
       : part.title,
@@ -371,6 +374,7 @@ export default function DownloadSection({
   const [quickFillSearch, setQuickFillSearch] = useState("");
   const quickFillPageSize = 10;
   const [syncPickerOpen, setSyncPickerOpen] = useState(false);
+  const [remoteSourcePickerOpen, setRemoteSourcePickerOpen] = useState(false);
   const [deleteConfirmRecord, setDeleteConfirmRecord] = useState(null);
   const [deleteConfirmDeleteFile, setDeleteConfirmDeleteFile] = useState(false);
 
@@ -413,10 +417,13 @@ export default function DownloadSection({
       title: source.title || "本地视频",
       videoKey: source.localId,
       videoTitle: source.title || "本地视频",
-      sourceType: "LOCAL",
+      sourceType: source.sourceType || "LOCAL",
+      remotePath: source.remotePath || "",
       filePath: source.sourceFilePath,
       startTime: source.startTime || "00:00:00",
-      endTime: source.endTime || source.durationText || "00:00:00",
+      endTime:
+        source.endTime ||
+        (source.sourceType === "BAIDU" ? "" : source.durationText || "00:00:00"),
       duration: source.durationSeconds || 0,
       uploadPartTitle: source.uploadPartTitle || "",
       uploadPartTitleMode: source.uploadPartTitleMode || "AUTO",
@@ -1380,7 +1387,9 @@ export default function DownloadSection({
         ...prev,
         {
           localId,
+          sourceType: "LOCAL",
           sourceFilePath: path,
+          remotePath: "",
           title: getFileTitle(path),
           cid: 0,
           startTime: "00:00:00",
@@ -1394,6 +1403,42 @@ export default function DownloadSection({
     } catch (error) {
       setMessage(error?.message || "选择本地视频失败");
     }
+  };
+
+  const openRemoteSourcePicker = () => {
+    setRemoteSourcePickerOpen(true);
+  };
+
+  const closeRemoteSourcePicker = () => {
+    setRemoteSourcePickerOpen(false);
+  };
+
+  const handleConfirmRemoteSourceFile = (remotePath, entry) => {
+    if (!remotePath) {
+      return;
+    }
+    const fileName = entry?.name || remotePath.split("/").filter(Boolean).pop() || "网盘视频.mp4";
+    const title = fileName.replace(/\.[^.]+$/, "") || "网盘视频";
+    const localId = buildLocalPartKey();
+    setSourceVideos((prev) => [
+      ...prev,
+      {
+        localId,
+        sourceType: "BAIDU",
+        sourceFilePath: "",
+        remotePath,
+        title,
+        cid: 0,
+        startTime: "00:00:00",
+        endTime: "",
+        durationSeconds: 0,
+        durationText: "",
+        uploadPartTitle: "",
+        uploadPartTitleMode: "AUTO",
+      },
+    ]);
+    setMessage(`已添加网盘视频：${remotePath}`);
+    closeRemoteSourcePicker();
   };
 
   const duplicateLocalSource = (sourceId) => {
@@ -2072,6 +2117,8 @@ export default function DownloadSection({
           .filter(Boolean)
           .map((source, index) => ({
             sourceFilePath: source.filePath,
+            sourceType: source.sourceType || "BILIBILI",
+            remotePath: source.remotePath || null,
             startTime: source.startTime || null,
             endTime: source.endTime || null,
             sortOrder: index + 1,
@@ -2096,6 +2143,8 @@ export default function DownloadSection({
           sources: [
             {
               sourceFilePath: source.filePath,
+              sourceType: source.sourceType || "BILIBILI",
+              remotePath: source.remotePath || null,
               startTime: source.startTime || null,
               endTime: source.endTime || null,
               sortOrder: 1,
@@ -2107,6 +2156,8 @@ export default function DownloadSection({
       } else {
         remainingSources.push({
           sourceFilePath: source.filePath,
+          sourceType: source.sourceType || "BILIBILI",
+          remotePath: source.remotePath || null,
           startTime: source.startTime || null,
           endTime: source.endTime || null,
         });
@@ -2191,6 +2242,7 @@ export default function DownloadSection({
     }
     const part = selectedPartsConfig[partIndex];
     const isLocalSource = part.sourceType === "LOCAL";
+    const isBaiduSource = part.sourceType === "BAIDU";
     const isGroupedRow = Boolean(groupId);
     const activeMergeId = mergeItemId || sourceId;
     const submitMergeItem = !isGroupedRow ? submitMergeItems.find((i) => i.type === "SOURCE" && i.sourceId === sourceId) : null;
@@ -2264,6 +2316,10 @@ export default function DownloadSection({
               }
               className="w-full"
             />
+          ) : isBaiduSource ? (
+            <div className="w-full rounded-lg border border-[var(--split-color)] bg-black/5 px-3 py-2 text-xs text-[var(--content-color)]">
+              {part.remotePath || "网盘路径未设置"}
+            </div>
           ) : (
             <input value={part.filePath} readOnly className="w-full" />
           )}
@@ -2394,7 +2450,10 @@ export default function DownloadSection({
     }
     for (let index = 0; index < selectedPartsConfig.length; index += 1) {
       const part = selectedPartsConfig[index];
-      if (!String(part.filePath || "").trim()) {
+      if (part.sourceType === "BAIDU" && !String(part.remotePath || "").trim()) {
+        return { valid: false, message: `第${index + 1}个网盘源视频缺少远程路径` };
+      }
+      if (part.sourceType !== "BAIDU" && !String(part.filePath || "").trim()) {
         return { valid: false, message: `第${index + 1}个源视频的文件路径不能为空` };
       }
       if (!isValidTimeFormat(part.startTime)) {
@@ -2449,7 +2508,7 @@ export default function DownloadSection({
       await logClient(`download_submit:integration:invalid:${validation.message}`);
       return { ok: false, errorMessage: validation.message };
     }
-    if (hasSelection && !(await ensureDownloadPathReady())) {
+    if (selectedPartsConfig.length > 0 && !(await ensureDownloadPathReady())) {
       await logClient("download_submit:integration:invalid_path");
       return { ok: false, errorMessage: "下载目录不可用" };
     }
@@ -2481,6 +2540,25 @@ export default function DownloadSection({
           downloadName,
         },
       }));
+      const baiduDownloadRequests = sourceVideos
+        .filter((source) => source.sourceType === "BAIDU" && String(source.remotePath || "").trim())
+        .map((source) => ({
+          videoUrl: source.remotePath,
+          sourceType: "BAIDU",
+          parts: [
+            {
+              cid: 0,
+              title: source.title || source.remotePath.split("/").filter(Boolean).pop() || "网盘视频",
+              duration: source.durationSeconds || null,
+              targetPath: source.sourceFilePath || null,
+            },
+          ],
+          config: {
+            ...baseConfig,
+            downloadName,
+          },
+        }));
+      downloadRequests.push(...baiduDownloadRequests);
       const orderedVideoParts = buildOrderedSubmissionVideoParts(
         selectedPartsConfig,
         sourceVideos,
@@ -3508,7 +3586,13 @@ export default function DownloadSection({
                         className="h-8 px-3 rounded-lg border border-[var(--split-color)] text-xs text-[var(--content-color)]"
                         onClick={addLocalSourceFile}
                       >
-                        添加视频
+                        添加本地视频
+                      </button>
+                      <button
+                        className="h-8 px-3 rounded-lg border border-[var(--split-color)] text-xs text-[var(--content-color)]"
+                        onClick={openRemoteSourcePicker}
+                      >
+                        添加网盘视频
                       </button>
                       <button
                         className="h-8 px-3 rounded-lg border border-[var(--split-color)] text-xs text-[var(--content-color)] disabled:cursor-not-allowed disabled:opacity-60"
@@ -3901,6 +3985,12 @@ export default function DownloadSection({
         onConfirm={handleConfirmSyncPicker}
         onClose={handleCloseSyncPicker}
         onChange={handleSyncPathChange}
+      />
+      <BaiduRemoteFilePicker
+        open={remoteSourcePickerOpen}
+        initialPath="/"
+        onClose={closeRemoteSourcePicker}
+        onConfirm={handleConfirmRemoteSourceFile}
       />
       {deleteConfirmRecord ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">

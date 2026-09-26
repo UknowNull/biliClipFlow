@@ -177,6 +177,8 @@ pub struct SubmissionTaskInput {
 #[serde(rename_all = "camelCase")]
 pub struct SourceVideoInput {
     pub source_file_path: String,
+    pub source_type: Option<String>,
+    pub remote_path: Option<String>,
     pub sort_order: i64,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
@@ -640,6 +642,8 @@ pub struct TaskSourceVideoRecord {
     pub id: String,
     pub task_id: String,
     pub source_file_path: String,
+    pub source_type: String,
+    pub remote_path: Option<String>,
     pub remote_video_url: Option<String>,
     pub sort_order: i64,
     pub start_time: Option<String>,
@@ -1011,6 +1015,9 @@ pub async fn submission_create(
     request: SubmissionCreateRequest,
 ) -> Result<ApiResponse<TaskCreationResult>, String> {
     let context = SubmissionContext::new(&state);
+    if let Err(err) = validate_source_video_inputs(&request.source_videos) {
+        return Ok(ApiResponse::error(err));
+    }
     let bilibili_uid = match resolve_requested_bilibili_uid(&state, request.task.bilibili_uid) {
         Ok(value) => value,
         Err(err) => return Ok(ApiResponse::error(err)),
@@ -1056,10 +1063,20 @@ pub async fn submission_create(
         .source_videos
         .iter()
         .map(|source| {
-            to_stored_local_path_with_prefix(
-                context.local_path_prefix.as_path(),
-                &source.source_file_path,
-            )
+            let source_path = if normalize_source_type(source) == "BAIDU"
+                && source.source_file_path.trim().is_empty()
+            {
+                resolve_baidu_source_path_for_task(
+                    &context,
+                    &task_id,
+                    source.remote_path.as_deref().unwrap_or(""),
+                )
+                .to_string_lossy()
+                .to_string()
+            } else {
+                source.source_file_path.clone()
+            };
+            to_stored_local_path_with_prefix(context.local_path_prefix.as_path(), &source_path)
         })
         .collect::<Vec<_>>();
     append_log(
@@ -1135,14 +1152,18 @@ pub async fn submission_create(
       let source_id = uuid::Uuid::new_v4().to_string();
       let (remote_bvid, remote_aid, remote_cid, remote_part_title, remote_video_url) =
         normalize_source_remote_binding(source);
+      let source_type = normalize_source_type(source);
+      let remote_path = normalize_optional_text(source.remote_path.clone());
       let (upload_part_title, upload_part_title_mode) = normalize_upload_part_title(source);
       conn.execute(
-        "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO task_source_video (id, task_id, source_file_path, source_type, remote_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         (
           source_id,
           &task_id,
           stored_source_path.as_str(),
+          source_type.as_str(),
+          remote_path.as_deref(),
           source.sort_order,
           source.start_time.as_deref(),
           source.end_time.as_deref(),
@@ -1198,7 +1219,43 @@ pub async fn submission_create(
         }
     }
 
-    if immediate_submit && result.workflow_instance_id.is_some() {
+    if result.workflow_instance_id.is_some() {
+        let workflow_instance_id = result.workflow_instance_id.clone().unwrap_or_default();
+        let source_paths = load_source_videos(&context, &task_id).unwrap_or_default();
+        let source_paths = source_paths
+            .into_iter()
+            .map(|source| source.input_path)
+            .collect::<Vec<_>>();
+        let created_download_ids = match prepare_integrated_source_downloads(
+            &context,
+            &task_id,
+            &workflow_instance_id,
+            &source_paths,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                result.workflow_error = Some(err);
+                Vec::new()
+            }
+        };
+        if !created_download_ids.is_empty() {
+            if immediate_submit {
+                if let Err(err) = crate::commands::download::requeue_integrated_downloads(
+                    &state,
+                    &created_download_ids,
+                )
+                .await
+                {
+                    result.workflow_error = Some(format!("创建远程源视频下载任务失败: {}", err));
+                }
+            } else if let Err(err) = defer_integrated_downloads(&context, &created_download_ids) {
+                result.workflow_error = Some(format!("暂存远程源视频下载任务失败: {}", err));
+            }
+            return Ok(ApiResponse::success(result));
+        }
+        if !immediate_submit {
+            return Ok(ApiResponse::success(result));
+        }
         let context_clone = context.clone();
         let task_id_clone = task_id.clone();
         tauri::async_runtime::spawn(async move {
@@ -1271,7 +1328,20 @@ pub async fn submission_update(
     let new_source_paths = request
         .source_videos
         .iter()
-        .map(|source| source.source_file_path.trim().to_string())
+        .map(|source| {
+            let source_type = normalize_source_type(source);
+            if source_type == "BAIDU" && source.source_file_path.trim().is_empty() {
+                resolve_baidu_source_path_for_task(
+                    &context,
+                    &task_id,
+                    source.remote_path.as_deref().unwrap_or(""),
+                )
+                .to_string_lossy()
+                .to_string()
+            } else {
+                source.source_file_path.trim().to_string()
+            }
+        })
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     let created_download_ids = match prepare_integrated_source_downloads(
@@ -2309,6 +2379,27 @@ fn prepare_integrated_source_downloads(
     create_retry_download_records(context, task_id, workflow_instance_id, &retry_records)
 }
 
+fn defer_integrated_downloads(
+    context: &SubmissionContext,
+    download_ids: &[i64],
+) -> Result<(), String> {
+    if download_ids.is_empty() {
+        return Ok(());
+    }
+    context
+        .db
+        .with_conn(|conn| {
+            for id in download_ids {
+                conn.execute(
+                    "UPDATE video_download SET status = 5, update_time = ?1 WHERE id = ?2 AND status = 0",
+                    (now_rfc3339(), id),
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|err| err.to_string())
+}
+
 fn extract_source_paths_from_task(detail: &SubmissionTaskDetail) -> Vec<String> {
     detail
         .source_videos
@@ -2419,6 +2510,7 @@ struct MergeGroupPlan {
 
 fn extract_merge_groups_from_config(
     context: &SubmissionContext,
+    task_id: &str,
     config: Option<&Value>,
 ) -> Vec<MergeGroupPlan> {
     let Some(config) = config else {
@@ -2450,6 +2542,20 @@ fn extract_merge_groups_from_config(
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let remote_path = item
+                .get("remotePath")
+                .or_else(|| item.get("remote_path"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let raw_path = if raw_path.is_empty() && !remote_path.is_empty() {
+                resolve_baidu_source_path_for_task(context, task_id, &remote_path)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                raw_path
+            };
             if raw_path.is_empty() {
                 continue;
             }
@@ -2758,7 +2864,7 @@ fn resolve_merge_groups(
     config: Option<&Value>,
     fallback_sources: &[ClipSource],
 ) -> Vec<MergeGroupPlan> {
-    let mut groups = extract_merge_groups_from_config(context, config);
+    let mut groups = extract_merge_groups_from_config(context, task_id, config);
     repair_merge_groups_from_fallback(context, task_id, &mut groups, fallback_sources);
     let has_config_groups = !groups.is_empty();
     if has_config_groups {
@@ -3394,6 +3500,8 @@ fn detect_merged_video_decode_issue(stderr: &str) -> Option<&'static str> {
         ("cabac_init_idc", "invalid_cabac_init_idc"),
         ("slice type", "invalid_slice_type"),
         ("truncated at", "truncated_nal_or_sei"),
+        ("invalid nal unit size", "invalid_nal_unit_size"),
+        ("error splitting the input into nal units", "nal_unit_split_fail"),
     ];
     patterns
         .into_iter()
@@ -3759,6 +3867,17 @@ async fn try_repost_transcode_with_existing_clean_merged(
     workflow_config: &Value,
     integrate_current_bvid: bool,
 ) -> Result<Option<ApiResponse<String>>, String> {
+    let task = load_task_record(context, task_id)?;
+    if is_remote_transcode_failed_state(task.remote_state) {
+        append_log(
+            &state.app_log_path,
+            &format!(
+                "submission_transcode_reuse_merged_skip task_id={} reason=remote_transcode_failed",
+                task_id
+            ),
+        );
+        return Ok(None);
+    }
     let merged = match load_latest_merged_video(context, task_id)? {
         Some(value) => value,
         None => return Ok(None),
@@ -5652,18 +5771,19 @@ fn load_source_retry_bindings(
     .db
     .with_conn(|conn| {
       let mut stmt = conn.prepare(
-        "SELECT source_file_path, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title \
+        "SELECT source_file_path, source_type, remote_path, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title \
          FROM task_source_video WHERE task_id = ?1",
       )?;
       let rows = stmt.query_map([task_id], |row| {
-        let remote_aid: Option<i64> = row.get(3)?;
-        Ok(SourceRetryBinding {
-          source_file_path: row.get(0)?,
-          remote_video_url: row.get(1)?,
-          remote_bvid: row.get(2)?,
-          remote_aid: remote_aid.map(|value| value.to_string()),
-          remote_cid: row.get(4)?,
-          remote_part_title: row.get(5)?,
+          Ok(SourceRetryBinding {
+            source_file_path: row.get(0)?,
+            source_type: row.get::<_, Option<String>>(1)?.unwrap_or_else(|| "LOCAL".to_string()),
+            remote_path: row.get(2)?,
+            remote_video_url: row.get(3)?,
+            remote_bvid: row.get(4)?,
+            remote_aid: row.get::<_, Option<i64>>(5)?.map(|value| value.to_string()),
+            remote_cid: row.get(6)?,
+            remote_part_title: row.get(7)?,
         })
       })?;
       Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -5711,7 +5831,33 @@ fn collect_retry_download_records_for_missing_sources(
             continue;
         }
         if let Some(binding) = source_bindings.get(&runtime_path) {
+            let binding_type = binding.source_type.trim().to_ascii_uppercase();
             let binding_url = binding.remote_video_url.as_deref().unwrap_or("").trim();
+            let binding_remote_path = binding.remote_path.as_deref().unwrap_or("").trim();
+            if binding_type == "BAIDU" || !binding_remote_path.is_empty() {
+                retry_records.push(IntegratedDownloadRecord {
+                    id: 0,
+                    download_url: if !binding_remote_path.is_empty() {
+                        binding_remote_path.to_string()
+                    } else {
+                        binding_url.to_string()
+                    },
+                    bvid: None,
+                    aid: None,
+                    title: binding.remote_part_title.clone(),
+                    part_title: binding.remote_part_title.clone(),
+                    part_count: Some(1),
+                    current_part: Some(1),
+                    local_path: runtime_path.clone(),
+                    resolution: None,
+                    codec: None,
+                    format: None,
+                    cid: None,
+                    content: None,
+                    source_type: crate::commands::download::DOWNLOAD_SOURCE_BAIDU.to_string(),
+                });
+                continue;
+            }
             let is_direct_url = !binding_url.is_empty()
                 && binding
                     .remote_bvid
@@ -12020,8 +12166,8 @@ pub fn submission_remote_import_save(
       let stored_source_path = to_stored_submission_path(&context, &source.source_file_path);
       let remote_video_url = format!("https://www.bilibili.com/video/{}", source.bvid);
       tx.execute(
-        "INSERT INTO task_source_video (id, task_id, source_file_path, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, sort_order, start_time, end_time) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO task_source_video (id, task_id, source_file_path, source_type, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, sort_order, start_time, end_time) \
+         VALUES (?1, ?2, ?3, 'BILIBILI', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         (
           &source_id,
           &task_id,
@@ -12569,24 +12715,26 @@ fn load_task_detail(
     .db
     .with_conn(|conn| {
       let mut source_stmt = conn.prepare(
-        "SELECT id, task_id, source_file_path, remote_video_url, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
+                "SELECT id, task_id, source_file_path, source_type, remote_path, remote_video_url, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
       )?;
       let source_videos = source_stmt
         .query_map([task_id], |row| {
           Ok(TaskSourceVideoRecord {
-            id: row.get(0)?,
-            task_id: row.get(1)?,
-            source_file_path: row.get(2)?,
-            remote_video_url: row.get(3)?,
-            sort_order: row.get(4)?,
-            start_time: row.get(5)?,
-            end_time: row.get(6)?,
-            remote_bvid: row.get(7)?,
-            remote_aid: row.get(8)?,
-            remote_cid: row.get(9)?,
-            remote_part_title: row.get(10)?,
-            upload_part_title: row.get(11)?,
-            upload_part_title_mode: row.get(12)?,
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    source_file_path: row.get(2)?,
+                    source_type: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "LOCAL".to_string()),
+                    remote_path: row.get(4)?,
+                    remote_video_url: row.get(5)?,
+                    sort_order: row.get(6)?,
+                    start_time: row.get(7)?,
+                    end_time: row.get(8)?,
+                    remote_bvid: row.get(9)?,
+                    remote_aid: row.get(10)?,
+                    remote_cid: row.get(11)?,
+                    remote_part_title: row.get(12)?,
+                    upload_part_title: row.get(13)?,
+                    upload_part_title_mode: row.get(14)?,
           })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -14351,6 +14499,8 @@ struct IntegratedDownloadRecord {
 #[derive(Clone)]
 struct SourceRetryBinding {
     source_file_path: String,
+    source_type: String,
+    remote_path: Option<String>,
     remote_video_url: Option<String>,
     remote_bvid: Option<String>,
     remote_aid: Option<String>,
@@ -14385,6 +14535,7 @@ const REMOTE_AUDIT_STATUS_REVIEWING: &str = "is_pubing";
 const REMOTE_AUDIT_STATUS_REJECTED: &str = "not_pubed";
 const REMOTE_AUDIT_STATUS_PUBLISHED: &str = "pubed";
 const REMOTE_AUDIT_STATUS_SCOPE: &str = "is_pubing|not_pubed|pubed(reconcile_only)";
+const REMOTE_STATE_TRANSCODE_FAILED: i64 = -16;
 const REMOTE_DEBUG_BVID: &str = "BV1VJkFBZENQ";
 const REMOTE_PART_VERIFY_RETRY_LIMIT: u32 = 5;
 const REMOTE_PART_VERIFY_RETRY_WAIT_SECS: u64 = 2;
@@ -14480,6 +14631,10 @@ fn is_rate_limit_error(err: &str) -> bool {
 
 fn is_remote_part_count_mismatch_error(err: &str) -> bool {
     err.contains("远程分P数量与本地不一致")
+}
+
+fn is_remote_transcode_failed_state(state: Option<i64>) -> bool {
+    matches!(state, Some(REMOTE_STATE_TRANSCODE_FAILED))
 }
 
 fn should_retry_remote_part_verification(error: Option<&str>) -> bool {
@@ -14763,6 +14918,9 @@ fn should_reconcile_submission(task: &SubmissionTaskRecord) -> bool {
         return true;
     }
     if task.status != "FAILED" {
+        return false;
+    }
+    if is_remote_transcode_failed_state(task.remote_state) {
         return false;
     }
     let error = task
@@ -16421,12 +16579,17 @@ impl RemoteTrackedTask {
         if is_submission_reconciliation_status(&self.status) {
             return true;
         }
-        self.status == "FAILED"
-            && (is_submit_result_unknown_error(&self.error_message)
-                || is_submission_created_error(&self.error_message)
-                || (!self.bvid.trim().is_empty()
-                    && (is_rate_limit_error(&self.error_message)
-                        || is_remote_part_count_mismatch_error(&self.error_message))))
+        if self.status != "FAILED" {
+            return false;
+        }
+        if is_remote_transcode_failed_state(self.remote_state) {
+            return false;
+        }
+        is_submit_result_unknown_error(&self.error_message)
+            || is_submission_created_error(&self.error_message)
+            || (!self.bvid.trim().is_empty()
+                && (is_rate_limit_error(&self.error_message)
+                    || is_remote_part_count_mismatch_error(&self.error_message)))
     }
 
     fn needs_published_lookup(&self) -> bool {
@@ -19612,7 +19775,7 @@ fn load_task_source_video_records(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, task_id, source_file_path, remote_video_url, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title \
+                "SELECT id, task_id, source_file_path, source_type, remote_path, remote_video_url, sort_order, start_time, end_time, remote_bvid, remote_aid, remote_cid, remote_part_title \
          FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
             )?;
             let rows = stmt.query_map([task_id], |row| {
@@ -19620,14 +19783,16 @@ fn load_task_source_video_records(
                     id: row.get(0)?,
                     task_id: row.get(1)?,
                     source_file_path: row.get(2)?,
-                    remote_video_url: row.get(3)?,
-                    sort_order: row.get(4)?,
-                    start_time: row.get(5)?,
-                    end_time: row.get(6)?,
-                    remote_bvid: row.get(7)?,
-                    remote_aid: row.get(8)?,
-                    remote_cid: row.get(9)?,
-                    remote_part_title: row.get(10)?,
+                    source_type: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "LOCAL".to_string()),
+                    remote_path: row.get(4)?,
+                    remote_video_url: row.get(5)?,
+                    sort_order: row.get(6)?,
+                    start_time: row.get(7)?,
+                    end_time: row.get(8)?,
+                    remote_bvid: row.get(9)?,
+                    remote_aid: row.get(10)?,
+                    remote_cid: row.get(11)?,
+                    remote_part_title: row.get(12)?,
                     upload_part_title: None,
                     upload_part_title_mode: None,
                 })
@@ -20027,7 +20192,12 @@ fn validate_source_video_inputs(sources: &[SourceVideoInput]) -> Result<(), Stri
     for (index, source) in sources.iter().enumerate() {
         let row = index + 1;
         let source_path = source.source_file_path.trim();
-        if source_path.is_empty() {
+        let source_type = normalize_source_type(source);
+        let remote_path = source.remote_path.as_deref().unwrap_or("").trim();
+        if source_type == "BAIDU" && remote_path.is_empty() {
+            return Err(format!("第{}行百度网盘源视频缺少远程路径", row));
+        }
+        if source_path.is_empty() && source_type != "BAIDU" {
             return Err(format!("第{}行源视频路径不能为空", row));
         }
         let start = match source
@@ -20048,12 +20218,13 @@ fn validate_source_video_inputs(sources: &[SourceVideoInput]) -> Result<(), Stri
         {
             Some(value) => parse_source_time_seconds(value)
                 .ok_or_else(|| format!("第{}行结束时间格式不合法", row))?,
+            None if source_type == "BAIDU" => 0.0,
             None => return Err(format!("第{}行结束时间不能为空", row)),
         };
-        if start < 0.0 || end <= 0.0 {
+        if start < 0.0 || (source_type != "BAIDU" && end <= 0.0) {
             return Err(format!("第{}行时间范围不合法", row));
         }
-        if start >= end {
+        if end > 0.0 && start >= end {
             return Err(format!("第{}行开始时间必须小于结束时间", row));
         }
         if let Some(remote_cid) = source.remote_cid {
@@ -20123,6 +20294,61 @@ fn normalize_source_remote_binding(
         remote_part_title,
         remote_video_url,
     )
+}
+
+fn normalize_source_type(source: &SourceVideoInput) -> String {
+    let value = source
+        .source_type
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    match value.as_str() {
+        "BAIDU" => "BAIDU".to_string(),
+        "DIRECT" => "DIRECT".to_string(),
+        "BILIBILI" => "BILIBILI".to_string(),
+        _ => {
+            if source
+                .remote_path
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+                && source
+                    .remote_bvid
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                && source
+                    .remote_video_url
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+            {
+                "LOCAL".to_string()
+            } else if source
+                .remote_path
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .starts_with('/')
+            {
+                "BAIDU".to_string()
+            } else if source
+                .remote_bvid
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                "DIRECT".to_string()
+            } else {
+                "BILIBILI".to_string()
+            }
+        }
+    }
 }
 
 /// 归一化源视频「上传分P标题」与其模式。
@@ -20218,17 +20444,32 @@ fn replace_source_videos(
       conn.execute("DELETE FROM task_source_video WHERE task_id = ?1", [task_id])?;
       for source in sources {
         let source_id = uuid::Uuid::new_v4().to_string();
-        let stored_source_path = to_stored_submission_path(context, &source.source_file_path);
+        let source_type = normalize_source_type(source);
+        let runtime_source_path = if source_type == "BAIDU" && source.source_file_path.trim().is_empty() {
+          resolve_baidu_source_path_for_task(
+            context,
+            task_id,
+            source.remote_path.as_deref().unwrap_or(""),
+          )
+          .to_string_lossy()
+          .to_string()
+        } else {
+          source.source_file_path.trim().to_string()
+        };
+        let stored_source_path = to_stored_submission_path(context, &runtime_source_path);
         let (remote_bvid, remote_aid, remote_cid, remote_part_title, remote_video_url) =
           normalize_source_remote_binding(source);
+        let remote_path = normalize_optional_text(source.remote_path.clone());
         let (upload_part_title, upload_part_title_mode) = normalize_upload_part_title(source);
         conn.execute(
-          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode) \
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          "INSERT INTO task_source_video (id, task_id, source_file_path, source_type, remote_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
           (
             source_id,
             task_id,
             stored_source_path.as_str(),
+            source_type.as_str(),
+            remote_path.as_deref(),
             source.sort_order,
             source.start_time.as_deref(),
             source.end_time.as_deref(),
@@ -20265,17 +20506,32 @@ fn append_source_videos(
       for (index, source) in sources.iter().enumerate() {
         let source_id = uuid::Uuid::new_v4().to_string();
         let sort_order = base_order + index as i64 + 1;
-        let stored_source_path = to_stored_submission_path(context, &source.source_file_path);
+        let source_type = normalize_source_type(source);
+        let runtime_source_path = if source_type == "BAIDU" && source.source_file_path.trim().is_empty() {
+          resolve_baidu_source_path_for_task(
+            context,
+            task_id,
+            source.remote_path.as_deref().unwrap_or(""),
+          )
+          .to_string_lossy()
+          .to_string()
+        } else {
+          source.source_file_path.trim().to_string()
+        };
+        let stored_source_path = to_stored_submission_path(context, &runtime_source_path);
         let (remote_bvid, remote_aid, remote_cid, remote_part_title, remote_video_url) =
           normalize_source_remote_binding(source);
+        let remote_path = normalize_optional_text(source.remote_path.clone());
         let (upload_part_title, upload_part_title_mode) = normalize_upload_part_title(source);
         conn.execute(
-          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode) \
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          "INSERT INTO task_source_video (id, task_id, source_file_path, source_type, remote_path, sort_order, start_time, end_time, remote_video_url, remote_bvid, remote_aid, remote_cid, remote_part_title, upload_part_title, upload_part_title_mode) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
           (
             source_id,
             task_id,
             stored_source_path.as_str(),
+            source_type.as_str(),
+            remote_path.as_deref(),
             sort_order,
             source.start_time.as_deref(),
             source.end_time.as_deref(),
@@ -22599,6 +22855,20 @@ fn resolve_submission_base_dir(context: &SubmissionContext, task_id: &str) -> Pa
     base.join(task_id)
 }
 
+fn resolve_baidu_source_path_for_task(
+    context: &SubmissionContext,
+    task_id: &str,
+    remote_path: &str,
+) -> PathBuf {
+    let remote_name = remote_path
+        .rsplit('/')
+        .find(|value| !value.is_empty())
+        .unwrap_or("baidu_source.mp4");
+    resolve_submission_base_dir(context, task_id)
+        .join("integrated_sources")
+        .join(crate::utils::sanitize_filename(remote_name))
+}
+
 fn to_runtime_submission_path(context: &SubmissionContext, value: &str) -> String {
     let path = to_absolute_local_path_with_prefix(context.local_path_prefix.as_path(), value);
     if path.as_os_str().is_empty() {
@@ -23597,6 +23867,8 @@ mod tests {
     fn validate_source_video_inputs_accepts_zero_start_time() {
         let sources = vec![SourceVideoInput {
             source_file_path: "demo/source.mp4".to_string(),
+            source_type: None,
+            remote_path: None,
             sort_order: 1,
             start_time: Some("00:00:00".to_string()),
             end_time: Some("00:00:05".to_string()),
@@ -23616,6 +23888,8 @@ mod tests {
     fn validate_source_video_inputs_rejects_zero_end_time() {
         let sources = vec![SourceVideoInput {
             source_file_path: "demo/source.mp4".to_string(),
+            source_type: None,
+            remote_path: None,
             sort_order: 1,
             start_time: Some("00:00:00".to_string()),
             end_time: Some("00:00:00".to_string()),
@@ -23629,6 +23903,49 @@ mod tests {
         }];
         let result = validate_source_video_inputs(&sources);
         assert_eq!(result.unwrap_err(), "第1行时间范围不合法");
+    }
+
+    #[test]
+    fn validate_source_video_inputs_accepts_baidu_without_end_time() {
+        let sources = vec![SourceVideoInput {
+            source_file_path: String::new(),
+            source_type: Some("BAIDU".to_string()),
+            remote_path: Some("/视频/示例.mp4".to_string()),
+            sort_order: 1,
+            start_time: Some("00:00:00".to_string()),
+            end_time: None,
+            remote_bvid: None,
+            remote_aid: None,
+            remote_cid: None,
+            remote_part_title: None,
+            remote_video_url: None,
+            upload_part_title: None,
+            upload_part_title_mode: None,
+        }];
+        assert!(validate_source_video_inputs(&sources).is_ok());
+    }
+
+    #[test]
+    fn validate_source_video_inputs_rejects_baidu_without_remote_path() {
+        let sources = vec![SourceVideoInput {
+            source_file_path: String::new(),
+            source_type: Some("BAIDU".to_string()),
+            remote_path: None,
+            sort_order: 1,
+            start_time: Some("00:00:00".to_string()),
+            end_time: None,
+            remote_bvid: None,
+            remote_aid: None,
+            remote_cid: None,
+            remote_part_title: None,
+            remote_video_url: None,
+            upload_part_title: None,
+            upload_part_title_mode: None,
+        }];
+        assert_eq!(
+            validate_source_video_inputs(&sources).unwrap_err(),
+            "第1行百度网盘源视频缺少远程路径"
+        );
     }
 
     #[test]
@@ -23647,6 +23964,18 @@ mod tests {
         assert_eq!(
             detect_merged_video_decode_issue(stderr),
             Some("missing_picture_in_access_unit")
+        );
+    }
+
+    #[test]
+    fn detect_merged_video_decode_issue_matches_hevc_nal_corruption() {
+        let stderr = "\
+[hevc @ 0x1] Invalid NAL unit size (1677734572 > 125991).
+[hevc @ 0x1] Error splitting the input into NAL units.
+";
+        assert_eq!(
+            detect_merged_video_decode_issue(stderr),
+            Some("invalid_nal_unit_size")
         );
     }
 
@@ -23800,6 +24129,21 @@ mod tests {
         });
         assert!(should_reconcile_submission(&task));
         assert!(should_block_submission_retry(&task));
+    }
+
+    #[test]
+    fn failed_submission_with_remote_transcode_failure_allows_repost() {
+        let mut task = build_test_task(IMPORT_MODE_NON_SEGMENTED, false);
+        task.status = "FAILED".to_string();
+        task.remote_state = Some(REMOTE_STATE_TRANSCODE_FAILED);
+        task.workflow_status = Some(WorkflowStatusRecord {
+            status: "FAILED".to_string(),
+            current_step: None,
+            progress: 0.0,
+            error_message: Some("远程分P数量与本地不一致（本地=158，远程=50）".to_string()),
+        });
+        assert!(!should_reconcile_submission(&task));
+        assert!(!should_block_submission_retry(&task));
     }
 
     #[test]

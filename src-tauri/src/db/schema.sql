@@ -156,6 +156,8 @@ CREATE TABLE IF NOT EXISTS task_source_video (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL,
   source_file_path TEXT NOT NULL,
+  source_type TEXT NOT NULL DEFAULT 'LOCAL',
+  remote_path TEXT,
   remote_video_url TEXT,
   remote_bvid TEXT,
   remote_aid INTEGER,

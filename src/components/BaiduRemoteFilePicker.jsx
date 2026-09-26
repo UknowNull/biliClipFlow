@@ -104,7 +104,8 @@ export default function BaiduRemoteFilePicker({
     if (!selectedFilePath) {
       return;
     }
-    onConfirm?.(selectedFilePath);
+    const selectedEntry = entries.find((entry) => entry.path === selectedFilePath) || null;
+    onConfirm?.(selectedFilePath, selectedEntry);
   };
 
   if (!open) {

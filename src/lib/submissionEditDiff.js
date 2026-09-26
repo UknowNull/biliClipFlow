@@ -41,9 +41,16 @@ export function buildBasicSnapshot(form, tagList) {
 
 export function buildSourceSnapshot(items) {
   return (items || [])
-    .filter((item) => normalizeText(item.sourceFilePath))
+    .filter(
+      (item) =>
+        normalizeText(item.sourceFilePath) ||
+        (normalizeText(item.sourceType || "LOCAL").toUpperCase() === "BAIDU" &&
+          normalizeText(item.remotePath)),
+    )
     .map((item, index) => ({
       sourceFilePath: normalizeText(item.sourceFilePath),
+      sourceType: normalizeText(item.sourceType || "LOCAL").toUpperCase(),
+      remotePath: normalizeText(item.remotePath),
       remoteBvid: normalizeText(item.remoteBvid),
       remoteAid: Number(item.remoteAid || 0),
       remoteCid: Number(item.remoteCid || 0),
@@ -126,10 +133,17 @@ export function resolveEditChangedModules({
 
 export function validateSourceVideos({ items, parseHmsToSeconds, isVideoFilePath }) {
   const validSources = (items || [])
-    .filter((item) => normalizeText(item.sourceFilePath))
+    .filter(
+      (item) =>
+        normalizeText(item.sourceFilePath) ||
+        (normalizeText(item.sourceType || "LOCAL").toUpperCase() === "BAIDU" &&
+          normalizeText(item.remotePath)),
+    )
     .map((item) => ({
       ...item,
       sourceFilePath: normalizeText(item.sourceFilePath),
+      sourceType: normalizeText(item.sourceType || "LOCAL").toUpperCase(),
+      remotePath: normalizeText(item.remotePath),
       remoteBvid: normalizeText(item.remoteBvid),
       remoteAid: Number(item.remoteAid || 0) || 0,
       remoteCid: Number(item.remoteCid || 0) || 0,
@@ -140,20 +154,28 @@ export function validateSourceVideos({ items, parseHmsToSeconds, isVideoFilePath
   if (validSources.length === 0) {
     return { valid: false, message: "请至少添加一个源视频", validSources: [] };
   }
-  const invalidSource = validSources.find((item) => !isVideoFilePath(item.sourceFilePath));
+  const invalidSource = validSources.find(
+    (item) => item.sourceType !== "BAIDU" && !isVideoFilePath(item.sourceFilePath),
+  );
+  const invalidRemoteSource = validSources.find(
+    (item) => item.sourceType === "BAIDU" && !normalizeText(item.remotePath),
+  );
+  if (invalidRemoteSource) {
+    return { valid: false, message: "百度网盘源视频缺少远程路径", validSources: [] };
+  }
   if (invalidSource) {
     return { valid: false, message: "源视频仅支持常见视频格式", validSources: [] };
   }
   const invalidTime = validSources.find((item) => {
     const start = parseHmsToSeconds(item.startTime);
     const end = parseHmsToSeconds(item.endTime);
-    if (start === null || end === null) {
+    if (start === null || (end === null && item.sourceType !== "BAIDU")) {
       return true;
     }
-    if (start < 0 || end <= 0 || start >= end) {
+    if (start < 0 || (end !== null && (end <= 0 || start >= end))) {
       return true;
     }
-    if (item.durationSeconds > 0 && end > item.durationSeconds) {
+    if (end !== null && item.durationSeconds > 0 && end > item.durationSeconds) {
       return true;
     }
     return false;

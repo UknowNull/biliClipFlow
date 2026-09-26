@@ -228,6 +228,14 @@ impl Db {
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE task_source_video ADD COLUMN source_type TEXT DEFAULT 'LOCAL'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE task_source_video ADD COLUMN remote_path TEXT",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE task_source_video ADD COLUMN remote_video_url TEXT",
             [],
         );
