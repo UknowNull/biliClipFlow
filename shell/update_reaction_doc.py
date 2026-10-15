@@ -96,11 +96,76 @@ def fmt_ts(v):
     return str(v).strip().replace("T", " ")[:19]
 
 
+STRIP_PREFIX = "/Bilibili/Reaction/"
+
+
+def _season_num(seg):
+    """目录/文件名里的季号：season2/Season3/第二季/第2季 → 2；识别不出返回 None。"""
+    s = str(seg).strip().lower()
+    m = re.search(r"(?:season|s)\s*(\d+)", s)
+    if m:
+        return int(m.group(1))
+    zh = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    m = re.search(r"第([一二三四五六七八九十\d]+)[季部]", s)
+    if m:
+        v = m.group(1)
+        return int(v) if v.isdigit() else zh.get(v)
+    if s in ("movie", "剧场版"):
+        return 101
+    return None
+
+
+def _first_episode(fn):
+    """文件名里的起始集数：1~9 → 1；6~12 → 6；10 → 10；识别不出返回 None。"""
+    stem = re.sub(r"\.(mp4|mkv|flv|mov|ts)$", "", fn, flags=re.I)
+    m = re.search(r"(\d+)\s*[~\-～]\s*\d+", stem)
+    if m:
+        return int(m.group(1))
+    m = re.fullmatch(r"\D*(\d+)\D*", stem)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _split_parts(p):
+    """拆出 (作品层级目录链, 文件名)。
+
+    路径形态：/Bilibili/Reaction/{主播}/{分类?}/{作品}/{子目录...}/{文件}
+    分类目录存在时先剥掉，剩下的第一段即作品名。
+    """
+    parts = [x for x in str(p or "").lstrip("/").split("/") if x]
+    rest = parts[3:] if len(parts) > 3 else parts     # 去 Bilibili/Reaction/主播
+    if rest and rest[0].strip().lower() in PATHCAT:
+        rest = rest[1:]                                # 去分类目录
+    if len(rest) <= 1:
+        return [], (rest[0] if rest else "")
+    return rest[1:-1], rest[-1]
+
+
 def natkey(row):
-    fn = str(row[0]).rstrip("/").split("/")[-1]
-    fn = re.sub(r"\.(mp4|mkv|flv|mov|ts)$", "", fn, flags=re.I)
-    m = re.search(r"(\d+)\s*~\s*\d+", fn) or re.search(r"\d+", fn)
-    return (int(m.group(1) if m and m.lastindex else (m.group() if m else 10**9)) if m else 10**9, fn)
+    """多级排序键：作品内目录链(季号) → 文件起始集数 → 文件名。
+
+    修正此前"只看文件名"导致的 Season3 排在 Season2 前、季间集数交错的问题。
+    约定：
+      * 无季号子目录 → 排在最后（分级目录如 Season1/2/3 优先）；
+      * 子目录名 == 作品名（如 头文字D/头文字D/）→ 按第 1 季处理；
+      * 文件名无集数时（如 merged_video.mp4）→ 取上一级目录名里的集数（火影 1~19/merged_video.mp4）。
+    """
+    p = str(row[0] or "")
+    rel = p.split(STRIP_PREFIX, 1)[1] if STRIP_PREFIX in p else p.lstrip("/")
+    work_segs = [x for x in rel.split("/") if x]
+    work = work_segs[2] if len(work_segs) > 2 else ""
+    dirs, fn = _split_parts(p)
+    dir_key = []
+    for d in dirs:
+        sn = _season_num(d)
+        if sn is None and work and d.strip().lower() == work.strip().lower():
+            sn = 1                                   # 同名子目录视为第一季
+        dir_key.append(sn if sn is not None else 10**6)
+    ep = _first_episode(fn)
+    if ep is None and dirs:
+        ep = _first_episode(dirs[-1])                # 集数在目录名里
+    return (tuple(dir_key), ep if ep is not None else 10**9, fn)
 
 
 def sheet_cat(title):
@@ -292,8 +357,8 @@ def run(DB, XLSX, DRY, CONFIRM=False):
 
     for units in model.values():
         for u in units:
-            if u["touched"] and len(u["rows"]) > 1:
-                u["rows"].sort(key=natkey)
+            if len(u["rows"]) > 1:
+                u["rows"].sort(key=natkey)      # 全量按 季号→集数→文件名 排序（含历史行）
 
     # ---------- 3) 重建工作簿 ----------
     def write_units(ws, units):

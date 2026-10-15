@@ -16572,7 +16572,10 @@ impl RemoteTrackedTask {
             && (self.needs_reconciliation()
                 || (self.status == "COMPLETED"
                     && !self.bvid.trim().is_empty()
-                    && matches!(self.remote_state, None | Some(-1) | Some(-30) | Some(-60))))
+                    && matches!(
+                        self.remote_state,
+                        None | Some(-1) | Some(-30) | Some(-60) | Some(-2) | Some(-4)
+                    )))
     }
 
     fn needs_reconciliation(&self) -> bool {
@@ -17127,7 +17130,7 @@ fn load_remote_tasks_by_owner(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.remote_state, COALESCE(st.remote_status_ignored, 0), st.created_at, st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED') OR (st.status = 'COMPLETED' AND COALESCE(TRIM(st.bvid), '') <> '' AND (st.remote_state IS NULL OR st.remote_state IN (-1, -30, -60)))",
+                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.remote_state, COALESCE(st.remote_status_ignored, 0), st.created_at, st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED') OR (st.status = 'COMPLETED' AND COALESCE(TRIM(st.bvid), '') <> '' AND (st.remote_state IS NULL OR st.remote_state IN (-1, -30, -60, -2, -4)))",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -24403,6 +24406,8 @@ mod tests {
         assert!(build_remote_refresh_task("COMPLETED", "BV1test", Some(-1)).needs_remote_refresh());
         assert!(build_remote_refresh_task("COMPLETED", "BV1test", Some(-30)).needs_remote_refresh());
         assert!(build_remote_refresh_task("COMPLETED", "BV1test", Some(-60)).needs_remote_refresh());
+        assert!(build_remote_refresh_task("COMPLETED", "BV1test", Some(-2)).needs_remote_refresh());
+        assert!(build_remote_refresh_task("COMPLETED", "BV1test", Some(-4)).needs_remote_refresh());
         assert!(!build_remote_refresh_task("COMPLETED", "BV1test", Some(0)).needs_remote_refresh());
         assert!(!build_remote_refresh_task("COMPLETED", "", None).needs_remote_refresh());
     }

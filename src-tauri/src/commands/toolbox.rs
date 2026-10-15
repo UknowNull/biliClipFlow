@@ -4530,7 +4530,26 @@ async fn add_episodes_to_section(
                 )
                 .await?;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                let sample = chunk
+                    .iter()
+                    .take(3)
+                    .map(|item| format!("aid={} cid={}", item.aid, item.cid))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                append_toolbox_log(
+                    state,
+                    &format!(
+                        "toolbox_bilibili_season_restore_add_episodes_fail section_id={} title={} batch_size={} sample=[{}] err={}",
+                        section_id,
+                        section.title,
+                        chunk.len(),
+                        sample,
+                        err
+                    ),
+                );
+                return Err(err);
+            }
         }
     }
     Ok(added_count)
