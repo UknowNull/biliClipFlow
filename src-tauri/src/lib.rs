@@ -251,6 +251,7 @@ pub fn run() {
             commands::live::live_room_auto_record_update,
             commands::live::live_room_baidu_sync_update,
             commands::live::live_room_baidu_sync_toggle,
+            commands::live::live_room_record_config_update,
             commands::video::video_detail,
             commands::video::video_playurl,
             commands::video::video_playurl_by_aid,

@@ -14,6 +14,17 @@ export default function AnchorSection() {
   const [syncLoading, setSyncLoading] = useState(false);
   const [syncMessage, setSyncMessage] = useState("");
   const [syncPickerOpen, setSyncPickerOpen] = useState(false);
+  const [recordConfigAnchor, setRecordConfigAnchor] = useState(null);
+  const [recordConfigMode, setRecordConfigMode] = useState("DAILY");
+  const [recordConfigDates, setRecordConfigDates] = useState([]);
+  const [recordConfigKeepAfter, setRecordConfigKeepAfter] = useState(false);
+  const [recordConfigCalMonth, setRecordConfigCalMonth] = useState(() => {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() };
+  });
+  const [recordConfigLoading, setRecordConfigLoading] = useState(false);
+  const [recordConfigMessage, setRecordConfigMessage] = useState("");
+  const [recordConfigHelpOpen, setRecordConfigHelpOpen] = useState(false);
   const [syncBrowserPath, setSyncBrowserPath] = useState("/");
   const [syncFolders, setSyncFolders] = useState([]);
   const [syncBrowseLoading, setSyncBrowseLoading] = useState(false);
@@ -588,6 +599,94 @@ export default function AnchorSection() {
 
   const handleSyncSelectCurrent = () => {
     setSyncPath(syncBrowserPath);
+  };
+
+  // ── 录制日期配置 ──
+  const formatRecordDate = (date) =>
+    `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(
+      date.getDate(),
+    ).padStart(2, "0")}`;
+
+  const handleOpenRecordConfig = (anchor) => {
+    setRecordConfigAnchor(anchor);
+    setRecordConfigMode(String(anchor?.recordMode || "DAILY").toUpperCase());
+    setRecordConfigDates(Array.isArray(anchor?.recordDates) ? [...anchor.recordDates].sort() : []);
+    setRecordConfigKeepAfter(Boolean(anchor?.keepRecordAfter));
+    const now = new Date();
+    setRecordConfigCalMonth({ year: now.getFullYear(), month: now.getMonth() });
+    setRecordConfigMessage("");
+    setRecordConfigHelpOpen(false);
+  };
+
+  const handleCloseRecordConfig = () => {
+    if (recordConfigLoading) {
+      return;
+    }
+    setRecordConfigAnchor(null);
+    setRecordConfigMessage("");
+    setRecordConfigHelpOpen(false);
+  };
+
+  const handleToggleRecordDate = (key) => {
+    setRecordConfigDates((prev) =>
+      prev.includes(key) ? prev.filter((item) => item !== key) : [...prev, key].sort(),
+    );
+    setRecordConfigMessage("");
+  };
+
+  const handleAddRecordDate = (offsetDays) => {
+    const target = new Date();
+    target.setDate(target.getDate() + offsetDays);
+    const key = formatRecordDate(target);
+    setRecordConfigDates((prev) => (prev.includes(key) ? prev : [...prev, key].sort()));
+    setRecordConfigMessage("");
+  };
+
+  const handleSaveRecordConfig = async () => {
+    if (!recordConfigAnchor) {
+      return;
+    }
+    if (recordConfigMode === "SELECTED" && recordConfigDates.length === 0) {
+      setRecordConfigMessage("「仅指定日期」至少需要选择 1 天；或切换到「每天录制」");
+      return;
+    }
+    setRecordConfigLoading(true);
+    setRecordConfigMessage("");
+    try {
+      await invokeCommand("live_room_record_config_update", {
+        roomId: recordConfigAnchor.uid,
+        mode: recordConfigMode,
+        dates: recordConfigDates,
+        keepRecordAfter: recordConfigMode === "SELECTED" && recordConfigKeepAfter,
+      });
+      await loadAnchors();
+      setMessage("录制日期配置已保存");
+      setRecordConfigAnchor(null);
+      setRecordConfigMessage("");
+      setRecordConfigHelpOpen(false);
+    } catch (error) {
+      setRecordConfigMessage(error?.message || "保存失败");
+    } finally {
+      setRecordConfigLoading(false);
+    }
+  };
+
+  const renderRecordDateBadge = (anchor) => {
+    const mode = String(anchor?.recordMode || "DAILY").toUpperCase();
+    if (mode !== "SELECTED") {
+      return (
+        <span className="rounded-full bg-black/5 px-2 py-1 text-xs font-semibold text-[var(--muted)]">
+          每天录制
+        </span>
+      );
+    }
+    const count = Array.isArray(anchor?.recordDates) ? anchor.recordDates.length : 0;
+    const suffix = anchor?.keepRecordAfter ? " · 后续转每天" : "";
+    return (
+      <span className="rounded-full bg-[var(--accent)]/10 px-2 py-1 text-xs font-semibold text-[var(--accent)]">
+        仅指定日期（{count} 天）{suffix}
+      </span>
+    );
   };
 
   const handleOpenSyncPicker = () => {
@@ -2216,6 +2315,12 @@ export default function AnchorSection() {
                 >
                   {anchor.autoRecord ? "关闭" : "开启"}
                 </button>
+                <button
+                  className="cursor-pointer"
+                  onClick={() => handleOpenRecordConfig(anchor)}
+                >
+                  {renderRecordDateBadge(anchor)}
+                </button>
                 <span>同步上传：{anchor.baiduSyncEnabled ? "已开启" : "未开启"}</span>
                 <button
                   className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
@@ -2249,6 +2354,12 @@ export default function AnchorSection() {
                   onClick={() => handleOpenRecordView(anchor)}
                 >
                   录播管理
+                </button>
+                <button
+                  className="rounded-full bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:brightness-110"
+                  onClick={() => handleOpenRecordConfig(anchor)}
+                >
+                  录制日期
                 </button>
                 <button
                   className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)]"
@@ -2288,6 +2399,257 @@ export default function AnchorSection() {
           <div className="mt-4 text-sm text-[var(--muted)]">暂无订阅记录。</div>
         ) : null}
       </div>
+      {recordConfigAnchor ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="w-[460px] max-h-[88vh] overflow-y-auto rounded-2xl bg-[var(--block-color)] p-5 text-sm text-[var(--content-color)] shadow-xl">
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="text-base font-semibold">录制日期</div>
+                <div className="mt-1 text-xs text-[var(--desc-color)]">
+                  主播：{recordConfigAnchor.nickname || recordConfigAnchor.uid}
+                </div>
+              </div>
+              <button
+                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={handleCloseRecordConfig}
+              >
+                关闭
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-2">
+              <div className="text-xs text-[var(--desc-color)]">录制模式</div>
+              <div className="flex gap-1 rounded-xl bg-black/5 p-1">
+                <button
+                  className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition ${
+                    recordConfigMode === "DAILY"
+                      ? "bg-white text-[var(--ink)] shadow-sm"
+                      : "text-[var(--muted)]"
+                  }`}
+                  onClick={() => setRecordConfigMode("DAILY")}
+                >
+                  每天录制
+                </button>
+                <button
+                  className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition ${
+                    recordConfigMode === "SELECTED"
+                      ? "bg-white text-[var(--ink)] shadow-sm"
+                      : "text-[var(--muted)]"
+                  }`}
+                  onClick={() => setRecordConfigMode("SELECTED")}
+                >
+                  仅指定日期
+                </button>
+              </div>
+              <div className="rounded-lg border border-black/10 bg-white/60 px-3 py-2 text-xs text-[var(--muted)]">
+                {recordConfigMode === "DAILY"
+                  ? "每天开播都会自动录制（与现有行为一致）"
+                  : "只在下方的日期开播时自动录制"}
+              </div>
+            </div>
+
+            <div
+              className={
+                recordConfigMode === "DAILY"
+                  ? "pointer-events-none mt-4 space-y-3 opacity-40"
+                  : "mt-4 space-y-3"
+              }
+            >
+              <div className="flex items-center justify-between">
+                <button
+                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={() =>
+                    setRecordConfigCalMonth((prev) => {
+                      const month = prev.month - 1;
+                      return month < 0
+                        ? { year: prev.year - 1, month: 11 }
+                        : { year: prev.year, month };
+                    })
+                  }
+                >
+                  ‹
+                </button>
+                <div className="text-sm font-semibold text-[var(--ink)]">
+                  {recordConfigCalMonth.year} 年 {recordConfigCalMonth.month + 1} 月
+                </div>
+                <button
+                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={() =>
+                    setRecordConfigCalMonth((prev) => {
+                      const month = prev.month + 1;
+                      return month > 11
+                        ? { year: prev.year + 1, month: 0 }
+                        : { year: prev.year, month };
+                    })
+                  }
+                >
+                  ›
+                </button>
+              </div>
+              <div className="grid grid-cols-7 gap-1 text-center text-xs text-[var(--muted)]">
+                {["日", "一", "二", "三", "四", "五", "六"].map((label) => (
+                  <div key={label}>{label}</div>
+                ))}
+              </div>
+              <div className="grid grid-cols-7 gap-1">
+                {(() => {
+                  const { year, month } = recordConfigCalMonth;
+                  const firstWeekday = new Date(year, month, 1).getDay();
+                  const daysInMonth = new Date(year, month + 1, 0).getDate();
+                  const todayKey = formatRecordDate(new Date());
+                  const cells = [];
+                  for (let i = 0; i < firstWeekday; i += 1) {
+                    cells.push(<div key={`pad-${i}`} />);
+                  }
+                  for (let day = 1; day <= daysInMonth; day += 1) {
+                    const date = new Date(year, month, day);
+                    const key = formatRecordDate(date);
+                    const isPast = key < todayKey;
+                    const isSelected = recordConfigDates.includes(key);
+                    const isToday = key === todayKey;
+                    cells.push(
+                      <button
+                        key={key}
+                        disabled={isPast}
+                        onClick={() => handleToggleRecordDate(key)}
+                        className={`rounded-lg py-2 text-sm transition ${
+                          isSelected
+                            ? "bg-[var(--accent)] font-semibold text-white"
+                            : "text-[var(--ink)] hover:bg-[var(--accent)] hover:text-white"
+                        } ${isPast ? "cursor-not-allowed opacity-30 hover:bg-transparent hover:text-[var(--ink)]" : ""} ${
+                          isToday && !isSelected ? "ring-2 ring-inset ring-[var(--accent)]" : ""
+                        }`}
+                      >
+                        {day}
+                      </button>,
+                    );
+                  }
+                  return cells;
+                })()}
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={() => handleAddRecordDate(0)}
+                >
+                  今天
+                </button>
+                <button
+                  className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={() => handleAddRecordDate(1)}
+                >
+                  明天
+                </button>
+                <button
+                  className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-rose-600"
+                  onClick={() => {
+                    setRecordConfigDates([]);
+                    setRecordConfigMessage("");
+                  }}
+                >
+                  清空日期
+                </button>
+              </div>
+
+              <div>
+                <div className="text-xs text-[var(--desc-color)]">
+                  已选日期（{recordConfigDates.length} 天）
+                </div>
+                <div className="mt-2 flex min-h-[32px] flex-wrap gap-2">
+                  {recordConfigDates.length === 0 ? (
+                    <span className="text-xs text-rose-500">
+                      尚未选择日期（保存前需至少选 1 天）
+                    </span>
+                  ) : (
+                    recordConfigDates.map((key) => {
+                      const [, month, day] = key.split("-");
+                      return (
+                        <span
+                          key={key}
+                          className="inline-flex items-center gap-1.5 rounded-full bg-[var(--accent)]/10 px-2.5 py-1 text-xs font-semibold text-[var(--accent)]"
+                        >
+                          {month}/{day}
+                          <button
+                            className="opacity-60 hover:opacity-100"
+                            onClick={() => handleToggleRecordDate(key)}
+                          >
+                            ×
+                          </button>
+                        </span>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-start justify-between gap-3 rounded-lg border border-black/10 bg-white/70 px-3 py-3">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-semibold text-[var(--ink)]">是否继续录制</span>
+                  <span
+                    className="relative inline-flex"
+                    onMouseEnter={() => setRecordConfigHelpOpen(true)}
+                    onMouseLeave={() => setRecordConfigHelpOpen(false)}
+                  >
+                    <span className="flex h-4 w-4 cursor-help items-center justify-center rounded-full bg-black/10 text-[10px] font-bold text-[var(--muted)]">
+                      ?
+                    </span>
+                    {recordConfigHelpOpen ? (
+                      <span className="absolute bottom-full left-1/2 z-10 mb-2 w-[260px] -translate-x-1/2 rounded-lg bg-[var(--ink)] px-3 py-2 text-xs leading-relaxed text-white shadow-lg">
+                        开启后当最新指定日期录制结束后，开启自动录制功能
+                      </span>
+                    ) : null}
+                  </span>
+                </div>
+                <button
+                  role="switch"
+                  aria-checked={recordConfigKeepAfter}
+                  className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
+                    recordConfigKeepAfter ? "bg-[var(--accent)]" : "bg-black/15"
+                  }`}
+                  onClick={() => setRecordConfigKeepAfter((prev) => !prev)}
+                >
+                  <span
+                    className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                      recordConfigKeepAfter ? "translate-x-5" : "translate-x-0"
+                    }`}
+                  />
+                </button>
+              </div>
+              <div className="text-xs text-[var(--muted)]">
+                {recordConfigKeepAfter
+                  ? "指定日期结束后自动转为每天录制，无需手动切换模式"
+                  : "仅指定日期录制；所有指定日期结束后停止自动录制"}
+              </div>
+            </div>
+
+            {recordConfigMode === "DAILY" ? (
+              <div className="mt-4 rounded-lg border border-black/10 bg-white/60 px-3 py-3 text-xs text-[var(--muted)]">
+                每天开播都会自动录制。
+                <span className="text-[var(--accent)]">已选的日期列表会保留</span>
+                ，切回「仅指定日期」时可直接复用。
+              </div>
+            ) : null}
+
+            {recordConfigMessage ? (
+              <div className="mt-3 text-xs text-rose-600">{recordConfigMessage}</div>
+            ) : null}
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button className="h-9 rounded-lg px-4" onClick={handleCloseRecordConfig}>
+                取消
+              </button>
+              <button
+                className="h-9 rounded-lg bg-[var(--accent)] px-4 font-semibold text-white disabled:opacity-60"
+                onClick={handleSaveRecordConfig}
+                disabled={recordConfigLoading}
+              >
+                {recordConfigLoading ? "保存中" : "保存"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {syncAnchor ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <div className="w-[420px] rounded-2xl bg-[var(--block-color)] p-5 text-sm text-[var(--content-color)] shadow-xl">

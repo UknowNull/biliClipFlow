@@ -66,7 +66,13 @@ pub async fn live_room_auto_record_update(
         let settings =
             load_live_settings_from_db(&state.db).unwrap_or_else(|_| default_live_settings());
         let room_info = fetch_room_info(&state.bilibili, &room_id).await?;
-        if room_info.live_status == 1 {
+        if room_info.live_status == 1
+            && crate::live_recorder::should_auto_record_now(
+                &state.db,
+                &room_id,
+                &state.app_log_path,
+            )
+        {
             let context = LiveContext {
                 db: state.db.clone(),
                 bilibili: state.bilibili.clone(),
@@ -163,5 +169,66 @@ pub fn live_room_baidu_sync_toggle(
     match result {
         Ok(()) => ApiResponse::success("已更新".to_string()),
         Err(err) => ApiResponse::error(format!("Failed to update sync toggle: {}", err)),
+    }
+}
+
+#[tauri::command]
+pub fn live_room_record_config_update(
+    state: State<'_, AppState>,
+    room_id: String,
+    mode: String,
+    dates: Vec<String>,
+    keep_record_after: bool,
+) -> ApiResponse<String> {
+    let room_id = room_id.trim().to_string();
+    if room_id.is_empty() {
+        return ApiResponse::error("房间号不能为空".to_string());
+    }
+    let mode = mode.trim().to_ascii_uppercase();
+    if mode != "DAILY" && mode != "SELECTED" {
+        return ApiResponse::error("录制模式无效".to_string());
+    }
+
+    let mut normalized = Vec::new();
+    for item in dates {
+        let value = item.trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        if !crate::live_recorder::is_valid_record_date(&value) {
+            return ApiResponse::error(format!("日期格式无效: {}", value));
+        }
+        normalized.push(value);
+    }
+    normalized.sort();
+    normalized.dedup();
+
+    if mode == "SELECTED" && normalized.is_empty() {
+        return ApiResponse::error("「仅指定日期」至少需要选择 1 天".to_string());
+    }
+
+    let dates_json = serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_string());
+    let keep = if mode == "SELECTED" && keep_record_after {
+        1_i64
+    } else {
+        0_i64
+    };
+    let now = now_rfc3339();
+    let result = state.db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO live_room_settings (room_id, auto_record, record_mode, record_dates, keep_record_after, update_time) \
+             VALUES (?1, 1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(room_id) DO UPDATE SET \
+               record_mode = excluded.record_mode, \
+               record_dates = excluded.record_dates, \
+               keep_record_after = excluded.keep_record_after, \
+               update_time = excluded.update_time",
+            (room_id.as_str(), mode.as_str(), dates_json.as_str(), keep, &now),
+        )?;
+        Ok(())
+    });
+    match result {
+        Ok(()) => ApiResponse::success("已更新".to_string()),
+        Err(err) => ApiResponse::error(format!("Failed to update record config: {}", err)),
     }
 }

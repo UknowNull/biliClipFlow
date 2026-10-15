@@ -42,6 +42,9 @@ pub struct Anchor {
     pub auto_record: bool,
     pub baidu_sync_enabled: bool,
     pub baidu_sync_path: Option<String>,
+    pub record_mode: String,
+    pub record_dates: Vec<String>,
+    pub keep_record_after: bool,
     pub recording_status: Option<String>,
     pub recording_file: Option<String>,
     pub recording_start_time: Option<String>,
@@ -128,7 +131,13 @@ pub async fn anchor_subscribe(
 
         if info.live_status == 1 {
             if let Ok(room_info) = fetch_room_info(&state.bilibili, &uid).await {
-                if !state.live_runtime.is_recording(&uid) {
+                if !state.live_runtime.is_recording(&uid)
+                    && crate::live_recorder::should_auto_record_now(
+                        &state.db,
+                        &uid,
+                        &state.app_log_path,
+                    )
+                {
                     if let Err(err) =
                         start_recording(context.clone(), &uid, room_info, settings.clone())
                     {
@@ -154,7 +163,7 @@ pub async fn anchor_subscribe(
 pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
     match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path \
+      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path, IFNULL(l.record_mode, 'DAILY'), l.record_dates, IFNULL(l.keep_record_after, 0) \
        FROM anchor a LEFT JOIN live_room_settings l ON a.uid = l.room_id ORDER BY a.id DESC",
     )?;
     let anchors = stmt
@@ -177,6 +186,9 @@ pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
           auto_record: auto_record != 0,
           baidu_sync_enabled: sync_enabled != 0,
           baidu_sync_path: row.get(9)?,
+          record_mode: row.get(10)?,
+          record_dates: crate::live_recorder::parse_record_dates_public(row.get(11)?),
+          keep_record_after: row.get::<_, i64>(12)? != 0,
           recording_status: record_info.as_ref().map(|_| "RECORDING".to_string()),
           recording_file: record_info.as_ref().map(|info| info.file_path.clone()),
           recording_start_time: record_info.map(|info| info.start_time),
@@ -980,7 +992,7 @@ pub async fn anchor_check(state: State<'_, AppState>) -> Result<ApiResponse<Vec<
     };
     let anchors = match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path \
+      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path, IFNULL(l.record_mode, 'DAILY'), l.record_dates, IFNULL(l.keep_record_after, 0) \
        FROM anchor a LEFT JOIN live_room_settings l ON a.uid = l.room_id ORDER BY a.id DESC",
     )?;
     let list = stmt
@@ -1000,6 +1012,9 @@ pub async fn anchor_check(state: State<'_, AppState>) -> Result<ApiResponse<Vec<
           auto_record: row.get::<_, i64>(7)? != 0,
           baidu_sync_enabled: sync_enabled != 0,
           baidu_sync_path: row.get(9)?,
+          record_mode: row.get(10)?,
+          record_dates: crate::live_recorder::parse_record_dates_public(row.get(11)?),
+          keep_record_after: row.get::<_, i64>(12)? != 0,
           recording_status: None,
           recording_file: None,
           recording_start_time: None,
@@ -1056,12 +1071,22 @@ pub async fn anchor_check(state: State<'_, AppState>) -> Result<ApiResponse<Vec<
             auto_record: anchor.auto_record,
             baidu_sync_enabled: anchor.baidu_sync_enabled,
             baidu_sync_path: anchor.baidu_sync_path,
+            record_mode: anchor.record_mode,
+            record_dates: anchor.record_dates,
+            keep_record_after: anchor.keep_record_after,
             recording_status: record_info.as_ref().map(|_| "RECORDING".to_string()),
             recording_file: record_info.as_ref().map(|info| info.file_path.clone()),
             recording_start_time: record_info.map(|info| info.start_time),
         });
 
-        if anchor.auto_record && info.live_status == 1 && !state.live_runtime.is_recording(&room_id)
+        if anchor.auto_record
+            && info.live_status == 1
+            && !state.live_runtime.is_recording(&room_id)
+            && crate::live_recorder::should_auto_record_now(
+                &state.db,
+                &room_id,
+                &state.app_log_path,
+            )
         {
             if let Ok(room_info) = fetch_room_info(&state.bilibili, &room_id).await {
                 if let Err(err) =

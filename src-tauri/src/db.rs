@@ -272,6 +272,18 @@ impl Db {
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE live_room_settings ADD COLUMN record_mode TEXT NOT NULL DEFAULT 'DAILY'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_room_settings ADD COLUMN record_dates TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_room_settings ADD COLUMN keep_record_after INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE live_clip_item ADD COLUMN source_file_path TEXT",
             [],
         );

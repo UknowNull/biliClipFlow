@@ -496,8 +496,11 @@ pub fn start_auto_record_loop(context: LiveContext) {
                     match fetch_room_info(&context.bilibili, &room_id).await {
                         Ok(info) => {
                             let _ = update_anchor_status(&context.db, &room_id, info.live_status);
-                            let auto_record =
-                                load_room_auto_record(&context.db, &room_id).unwrap_or(true);
+                            let auto_record = should_auto_record_now(
+                                &context.db,
+                                &room_id,
+                                context.app_log_path.as_ref(),
+                            );
                             let recording = context.live_runtime.is_recording(&room_id);
                             if info.live_status == 1 && auto_record && !recording {
                                 match start_recording(
@@ -2949,6 +2952,145 @@ fn load_room_auto_record(db: &Db, room_id: &str) -> Result<bool, String> {
     .map_err(|err| err.to_string())
 }
 
+/// 主播录制日期配置。
+#[derive(Clone, Debug)]
+pub struct RoomRecordConfig {
+    pub auto_record: bool,
+    pub mode: String,
+    pub dates: Vec<String>,
+    pub keep_record_after: bool,
+}
+
+impl Default for RoomRecordConfig {
+    fn default() -> Self {
+        Self {
+            auto_record: true,
+            mode: "DAILY".to_string(),
+            dates: Vec::new(),
+            keep_record_after: false,
+        }
+    }
+}
+
+fn parse_record_dates(raw: Option<String>) -> Vec<String> {
+    let text = raw.unwrap_or_default();
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<String>>(text)
+        .map(|items| {
+            let mut dates = items
+                .into_iter()
+                .map(|item| item.trim().to_string())
+                .filter(|item| is_valid_record_date(item))
+                .collect::<Vec<_>>();
+            dates.sort();
+            dates.dedup();
+            dates
+        })
+        .unwrap_or_default()
+}
+
+/// 供 anchor 查询复用（DB 读取的原始 JSON 文本 → 去重排序后的日期列表）。
+pub fn parse_record_dates_public(raw: Option<String>) -> Vec<String> {
+    parse_record_dates(raw)
+}
+
+/// 校验日期格式为 yyyy-MM-dd（并确保是真实日期）。
+pub fn is_valid_record_date(value: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").is_ok()
+}
+
+pub fn load_room_record_config(db: &Db, room_id: &str) -> Result<RoomRecordConfig, String> {
+    db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT auto_record, COALESCE(record_mode, 'DAILY'), record_dates, COALESCE(keep_record_after, 0) \
+             FROM live_room_settings WHERE room_id = ?1",
+            [room_id],
+            |row| {
+                Ok(RoomRecordConfig {
+                    auto_record: row.get::<_, i64>(0)? != 0,
+                    mode: row.get(1)?,
+                    dates: parse_record_dates(row.get(2)?),
+                    keep_record_after: row.get::<_, i64>(3)? != 0,
+                })
+            },
+        )
+        .optional()
+    })
+    .map(|value| value.unwrap_or_default())
+    .map_err(|err| err.to_string())
+}
+
+/// 「指定日期全部结束且开启了继续录制」→ 需要把模式落库为 DAILY。
+/// 返回 true 表示本次调用已执行了自动切换。
+pub fn promote_room_mode_if_expired(
+    db: &Db,
+    room_id: &str,
+    config: &RoomRecordConfig,
+    today: &str,
+) -> bool {
+    if config.mode != "SELECTED" || !config.keep_record_after || config.dates.is_empty() {
+        return false;
+    }
+    if config.dates.iter().any(|date| date.as_str() >= today) {
+        return false;
+    }
+    let now = now_rfc3339();
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE live_room_settings SET record_mode = 'DAILY', update_time = ?1 WHERE room_id = ?2",
+            (now.as_str(), room_id),
+        )?;
+        Ok(())
+    })
+    .is_ok()
+}
+
+/// 当前是否应当自动录制（含日期判定，必要时自动把过期配置升级为每天录制）。
+pub fn should_auto_record_now(db: &Db, room_id: &str, log_path: &Path) -> bool {
+    let config = match load_room_record_config(db, room_id) {
+        Ok(config) => config,
+        Err(err) => {
+            append_log(
+                log_path,
+                &format!(
+                    "record_date_config_load_fail room={} err={}",
+                    room_id, err
+                ),
+            );
+            return true; // 读取失败时保持现有行为（录），避免静默漏录
+        }
+    };
+    if !config.auto_record {
+        return false;
+    }
+    if config.mode != "SELECTED" || config.dates.is_empty() {
+        return true;
+    }
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    if config.dates.iter().any(|date| date == &today) {
+        return true;
+    }
+    // 今天未命中：若所有指定日期都已过去且开启了继续录制 → 自动转每天录
+    let all_expired = config.dates.iter().all(|date| date.as_str() < today.as_str());
+    if all_expired && config.keep_record_after {
+        if promote_room_mode_if_expired(db, room_id, &config, today.as_str()) {
+            append_log(
+                log_path,
+                &format!(
+                    "record_date_auto_promote room={} last_date={}",
+                    room_id,
+                    config.dates.last().map(String::as_str).unwrap_or("")
+                ),
+            );
+        }
+        return true;
+    }
+    false
+}
+
 fn update_anchor_status(db: &Db, room_id: &str, live_status: i64) -> Result<(), String> {
     let now = now_rfc3339();
     db.with_conn(|conn| {
@@ -4366,5 +4508,125 @@ mod stream_timeout_reader_tests {
             elapsed < Duration::from_millis(1500),
             "超时返回过慢: {elapsed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod record_date_tests {
+    use super::*;
+    use crate::db::Db;
+
+    fn open_test_db() -> Db {
+        let path = std::env::temp_dir().join(format!(
+            "bcf_record_date_test_{}_{}.sqlite3",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        Db::new(path).expect("create test db")
+    }
+
+    fn upsert_config(db: &Db, room_id: &str, mode: &str, dates: &[&str], keep: bool) {
+        let json = serde_json::to_string(dates).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO live_room_settings (room_id, auto_record, record_mode, record_dates, keep_record_after, update_time) \
+                 VALUES (?1, 1, ?2, ?3, ?4, '2026-01-01T00:00:00Z') \
+                 ON CONFLICT(room_id) DO UPDATE SET record_mode = excluded.record_mode, record_dates = excluded.record_dates, keep_record_after = excluded.keep_record_after",
+                (room_id, mode, json, keep as i64),
+            )?;
+            Ok(())
+        })
+        .expect("upsert config");
+    }
+
+    fn load_mode(db: &Db, room_id: &str) -> String {
+        db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(record_mode, 'DAILY') FROM live_room_settings WHERE room_id = ?1",
+                [room_id],
+                |row| row.get(0),
+            )
+        })
+        .expect("load mode")
+    }
+
+    #[test]
+    fn daily_mode_always_records() {
+        let db = open_test_db();
+        upsert_config(&db, "room1", "DAILY", &[], false);
+        assert!(should_auto_record_now(
+            &db,
+            "room1",
+            std::path::Path::new("/dev/null")
+        ));
+    }
+
+    #[test]
+    fn missing_config_records_by_default() {
+        let db = open_test_db();
+        assert!(should_auto_record_now(
+            &db,
+            "unlisted",
+            std::path::Path::new("/dev/null")
+        ));
+    }
+
+    #[test]
+    fn selected_mode_only_hits_today_or_promotes_when_expired() {
+        let db = open_test_db();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let yesterday = (chrono::Local::now() - ChronoDuration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let tomorrow = (chrono::Local::now() + ChronoDuration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        // 命中今天 → 录
+        upsert_config(&db, "hit", "SELECTED", &[today.as_str()], false);
+        assert!(should_auto_record_now(
+            &db,
+            "hit",
+            std::path::Path::new("/dev/null")
+        ));
+
+        // 未命中未来日期 → 不录
+        upsert_config(&db, "future", "SELECTED", &[tomorrow.as_str()], false);
+        assert!(!should_auto_record_now(
+            &db,
+            "future",
+            std::path::Path::new("/dev/null")
+        ));
+
+        // 已全部过期 + 关闭续录 → 不录，模式保持 SELECTED
+        upsert_config(&db, "expired", "SELECTED", &[yesterday.as_str()], false);
+        assert!(!should_auto_record_now(
+            &db,
+            "expired",
+            std::path::Path::new("/dev/null")
+        ));
+        assert_eq!(load_mode(&db, "expired"), "SELECTED");
+
+        // 已全部过期 + 开启续录 → 录，且模式自动升级为 DAILY
+        upsert_config(&db, "promote", "SELECTED", &[yesterday.as_str()], true);
+        assert!(should_auto_record_now(
+            &db,
+            "promote",
+            std::path::Path::new("/dev/null")
+        ));
+        assert_eq!(load_mode(&db, "promote"), "DAILY");
+    }
+
+    #[test]
+    fn invalid_dates_are_dropped() {
+        let db = open_test_db();
+        upsert_config(&db, "bad", "SELECTED", &["not-a-date"], false);
+        // 非法日期被丢弃 → dates 为空 → 按每天录兜底
+        assert!(should_auto_record_now(
+            &db,
+            "bad",
+            std::path::Path::new("/dev/null")
+        ));
     }
 }

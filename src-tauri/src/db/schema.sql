@@ -451,6 +451,9 @@ CREATE TABLE IF NOT EXISTS live_room_settings (
   auto_record INTEGER NOT NULL DEFAULT 1,
   baidu_sync_enabled INTEGER NOT NULL DEFAULT 0,
   baidu_sync_path TEXT,
+  record_mode TEXT NOT NULL DEFAULT 'DAILY',
+  record_dates TEXT,
+  keep_record_after INTEGER NOT NULL DEFAULT 0,
   update_time TEXT NOT NULL
 );
 
