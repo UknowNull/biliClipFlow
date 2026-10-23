@@ -744,46 +744,19 @@ pub async fn submission_repost(
                 Some("SEGMENTING"),
                 70.0,
             );
-            let merge_inputs_clone = merge_inputs.clone();
-            let merge_result = tauri::async_runtime::spawn_blocking(move || {
-                merge_files(&merge_inputs_clone, &merge_output_for_merge)
-            })
-            .await;
-            match merge_result {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    let _ = mark_submission_failure(
-                        &context_clone,
-                        &task_id_clone,
-                        Some("SEGMENTING"),
-                        &format!("重新投稿合并失败: {}", err),
-                    );
-                    append_log(
-                        app_log_path.as_ref(),
-                        &format!(
-                            "submission_repost_merge_fail task_id={} err={}",
-                            task_id_clone, err
-                        ),
-                    );
-                    return;
-                }
-                Err(err) => {
-                    let _ = mark_submission_failure(
-                        &context_clone,
-                        &task_id_clone,
-                        Some("SEGMENTING"),
-                        &format!("重新投稿合并失败: {}", err),
-                    );
-                    append_log(
-                        app_log_path.as_ref(),
-                        &format!(
-                            "submission_repost_merge_fail task_id={} err={}",
-                            task_id_clone, err
-                        ),
-                    );
-                    return;
-                }
-            };
+            if !run_reprocess_merge(
+                &context_clone,
+                &task_id_clone,
+                merge_inputs.clone(),
+                merge_output_for_merge,
+                app_log_path.as_ref(),
+                "重新投稿",
+                "submission_repost_merge_fail",
+            )
+            .await
+            {
+                return;
+            }
             let segment_outputs = if should_segment {
                 if enable_segmentation {
                     let merge_output_for_segment_clone = merge_output_for_segment.clone();
@@ -2565,46 +2538,19 @@ pub(super) async fn resume_resegment_after_restore(
                     Some("SEGMENTING"),
                     70.0,
                 );
-                let merge_inputs_clone = merge_inputs.clone();
-                let merge_result = tauri::async_runtime::spawn_blocking(move || {
-                    merge_files(&merge_inputs_clone, &merge_output_for_merge)
-                })
-                .await;
-                match merge_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        let _ = mark_submission_failure(
-                            &context_clone,
-                            &task_id_clone,
-                            Some("SEGMENTING"),
-                            &format!("重新分段合并失败: {}", err),
-                        );
-                        append_log(
-                            app_log_path.as_ref(),
-                            &format!(
-                                "submission_resegment_merge_fail task_id={} err={}",
-                                task_id_clone, err
-                            ),
-                        );
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = mark_submission_failure(
-                            &context_clone,
-                            &task_id_clone,
-                            Some("SEGMENTING"),
-                            &format!("重新分段合并失败: {}", err),
-                        );
-                        append_log(
-                            app_log_path.as_ref(),
-                            &format!(
-                                "submission_resegment_merge_fail task_id={} err={}",
-                                task_id_clone, err
-                            ),
-                        );
-                        return;
-                    }
-                };
+                if !run_reprocess_merge(
+                    &context_clone,
+                    &task_id_clone,
+                    merge_inputs.clone(),
+                    merge_output_for_merge,
+                    app_log_path.as_ref(),
+                    "重新分段",
+                    "submission_resegment_merge_fail",
+                )
+                .await
+                {
+                    return;
+                }
                 let merge_output_for_segment_clone = merge_output_for_segment.clone();
                 let segment_outputs = match tauri::async_runtime::spawn_blocking(move || {
                     segment_file_with_options(
@@ -3203,46 +3149,19 @@ pub(super) async fn resume_repost_after_restore(
                     Some("SEGMENTING"),
                     70.0,
                 );
-                let merge_inputs_clone = merge_inputs.clone();
-                let merge_result = tauri::async_runtime::spawn_blocking(move || {
-                    merge_files(&merge_inputs_clone, &merge_output_for_merge)
-                })
-                .await;
-                match merge_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        let _ = mark_submission_failure(
-                            &context_clone,
-                            &task_id_clone,
-                            Some("SEGMENTING"),
-                            &format!("重新投稿合并失败: {}", err),
-                        );
-                        append_log(
-                            app_log_path.as_ref(),
-                            &format!(
-                                "submission_repost_merge_fail task_id={} err={}",
-                                task_id_clone, err
-                            ),
-                        );
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = mark_submission_failure(
-                            &context_clone,
-                            &task_id_clone,
-                            Some("SEGMENTING"),
-                            &format!("重新投稿合并失败: {}", err),
-                        );
-                        append_log(
-                            app_log_path.as_ref(),
-                            &format!(
-                                "submission_repost_merge_fail task_id={} err={}",
-                                task_id_clone, err
-                            ),
-                        );
-                        return;
-                    }
-                };
+                if !run_reprocess_merge(
+                    &context_clone,
+                    &task_id_clone,
+                    merge_inputs.clone(),
+                    merge_output_for_merge,
+                    app_log_path.as_ref(),
+                    "重新投稿",
+                    "submission_repost_merge_fail",
+                )
+                .await
+                {
+                    return;
+                }
                 let segment_outputs = if should_segment {
                     if enable_segmentation {
                         let merge_output_for_segment_clone = merge_output_for_segment.clone();
@@ -4258,46 +4177,19 @@ pub async fn submission_resegment(
                 Some("SEGMENTING"),
                 70.0,
             );
-            let merge_inputs_clone = merge_inputs.clone();
-            let merge_result = tauri::async_runtime::spawn_blocking(move || {
-                merge_files(&merge_inputs_clone, &merge_output_for_merge)
-            })
-            .await;
-            match merge_result {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    let _ = mark_submission_failure(
-                        &context_clone,
-                        &task_id_clone,
-                        Some("SEGMENTING"),
-                        &format!("重新分段合并失败: {}", err),
-                    );
-                    append_log(
-                        app_log_path.as_ref(),
-                        &format!(
-                            "submission_resegment_merge_fail task_id={} err={}",
-                            task_id_clone, err
-                        ),
-                    );
-                    return;
-                }
-                Err(err) => {
-                    let _ = mark_submission_failure(
-                        &context_clone,
-                        &task_id_clone,
-                        Some("SEGMENTING"),
-                        &format!("重新分段合并失败: {}", err),
-                    );
-                    append_log(
-                        app_log_path.as_ref(),
-                        &format!(
-                            "submission_resegment_merge_fail task_id={} err={}",
-                            task_id_clone, err
-                        ),
-                    );
-                    return;
-                }
-            };
+            if !run_reprocess_merge(
+                &context_clone,
+                &task_id_clone,
+                merge_inputs.clone(),
+                merge_output_for_merge,
+                app_log_path.as_ref(),
+                "重新分段",
+                "submission_resegment_merge_fail",
+            )
+            .await
+            {
+                return;
+            }
             let still_latest_after_merge = ensure_workflow_instance_latest(
                 &context_clone,
                 &task_id_clone,
@@ -5415,4 +5307,33 @@ pub(super) fn build_resegment_workflow_config(config: Option<Value>, segment_dur
         }
     }
     config
+}
+
+/// 在阻塞线程池中合并重处理的输入文件；失败时标记任务失败并记录日志，返回 false。
+pub(super) async fn run_reprocess_merge(
+    context: &SubmissionContext,
+    task_id: &str,
+    inputs: Vec<PathBuf>,
+    output: PathBuf,
+    log_path: &Path,
+    failure_label: &str,
+    log_key: &str,
+) -> bool {
+    let err = match tauri::async_runtime::spawn_blocking(move || merge_files(&inputs, &output)).await
+    {
+        Ok(Ok(())) => return true,
+        Ok(Err(err)) => err,
+        Err(err) => err.to_string(),
+    };
+    let _ = mark_submission_failure(
+        context,
+        task_id,
+        Some("SEGMENTING"),
+        &format!("{}合并失败: {}", failure_label, err),
+    );
+    append_log(
+        log_path,
+        &format!("{} task_id={} err={}", log_key, task_id, err),
+    );
+    false
 }
