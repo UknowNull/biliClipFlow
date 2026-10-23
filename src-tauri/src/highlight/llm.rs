@@ -9,8 +9,6 @@ use serde_json::{json, Value};
 use super::settings::LlmSettings;
 use super::signals::Profile;
 
-pub const MODE_ORDER: [&str; 3] = ["json_schema", "json_object", "prompt"];
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Judgement {
@@ -70,23 +68,73 @@ fn request(client: &Client, settings: &LlmSettings, path: &str) -> reqwest::Requ
     req
 }
 
-/// 去掉 ```json 包裹后解析 JSON；兜底截取第一个 { 到最后一个 }
+const NOT_JSON: &str = "模型输出不是合法 JSON: ";
+
+/// 找出文本中所有顶层的完整 JSON 对象（跳过字符串内的括号）
+fn json_objects(text: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let (mut depth, mut start, mut in_str, mut escaped) = (0usize, None, false, false);
+    for (i, ch) in text.char_indices() {
+        if in_str {
+            match (escaped, ch) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' if depth > 0 => in_str = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(v) = start.and_then(|st| serde_json::from_str::<Value>(&text[st..=i]).ok()) {
+                        out.push(v);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 解析模型输出：优先整体解析，否则取第一个不是 JSON Schema 本身的对象（模型有时会先复述 schema）
 fn parse_content(content: &str) -> Option<Value> {
     let trimmed = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-    serde_json::from_str(trimmed).ok().or_else(|| {
-        let (a, b) = (trimmed.find('{')?, trimmed.rfind('}')?);
-        serde_json::from_str(&trimmed[a..=b]).ok()
-    })
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if !looks_like_schema(&v) {
+            return Some(v);
+        }
+    }
+    json_objects(trimmed).into_iter().find(|v| !looks_like_schema(v))
+}
+
+fn looks_like_schema(v: &Value) -> bool {
+    v.get("properties").is_some() && v.get("type").and_then(|t| t.as_str()) == Some("object")
 }
 
 /// 调用一次 chat completions，按 `mode` 约束输出，返回解析后的 JSON。限流与服务端错误退避重试两次。
+/// 所有模式都把 schema 写进系统提示词：部分网关会忽略 response_format，只靠参数约束不可靠。
 pub async fn chat_json(settings: &LlmSettings, mode: &str, system: &str, user: &str, schema: &Value) -> Result<Value, String> {
+    chat_json_inner(settings, mode, system, user, schema, true).await
+}
+
+async fn chat_json_inner(settings: &LlmSettings, mode: &str, system: &str, user: &str, schema: &Value, schema_hint: bool) -> Result<Value, String> {
     let client = client(settings)?;
     let mut system = system.to_string();
     let mut body = json!({
         "model": settings.model,
         "temperature": settings.temperature,
-        "max_tokens": 1500,
+        // 推理类模型会把思考过程计入输出长度，上限过小会截断 JSON
+        "max_tokens": 4096,
     });
     match mode {
         "json_schema" => {
@@ -94,9 +142,14 @@ pub async fn chat_json(settings: &LlmSettings, mode: &str, system: &str, user: &
         }
         "json_object" => {
             body["response_format"] = json!({"type": "json_object"});
-            system.push_str(&format!("\n只输出一个 JSON 对象，结构遵循：{}", schema));
         }
-        _ => system.push_str(&format!("\n只输出一个 JSON 对象，不要输出其他文字，结构遵循：{}", schema)),
+        _ => {}
+    }
+    if schema_hint {
+        system.push_str(&format!(
+            "\n只输出一个 JSON 对象，不要输出其他文字。按下面的 JSON Schema 填入实际内容，不要输出 Schema 本身：\n{}",
+            schema
+        ));
     }
     body["messages"] = json!([{"role": "system", "content": system}, {"role": "user", "content": user}]);
     let mut last_err = String::new();
@@ -122,7 +175,13 @@ pub async fn chat_json(settings: &LlmSettings, mode: &str, system: &str, user: &
         }
         let data: Value = serde_json::from_str(&text).map_err(|_| format!("响应不是 JSON: {}", truncate(&text, 200)))?;
         let content = data["choices"][0]["message"]["content"].as_str().unwrap_or("");
-        return parse_content(content).ok_or_else(|| format!("模型输出不是合法 JSON: {}", truncate(content, 200)));
+        if let Some(v) = parse_content(content) {
+            return Ok(v);
+        }
+        if data["choices"][0]["finish_reason"].as_str() == Some("length") {
+            return Err("模型输出被截断（达到输出长度上限）".to_string());
+        }
+        return Err(format!("{}{}", NOT_JSON, truncate(content, 200)));
     }
     Err(last_err)
 }
@@ -131,29 +190,56 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// 依次尝试三种结构化输出方式，返回第一种可用的
+/// 测试连接。自动检测时，用不提及 JSON 的请求探测服务端是否真正执行结构化约束：
+/// 只有约束生效时才会返回 JSON；都不生效则退回「仅提示词」（schema 写在提示词里，解析时容错）。
+/// 手动指定档位时只检查连通性与 JSON 解析。
 pub async fn test_connection(settings: &LlmSettings) -> TestResult {
     if !settings.is_configured() {
         return TestResult { message: "请先填写接口地址和模型名".into(), ..Default::default() };
     }
-    let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]});
-    let modes: Vec<&str> = if settings.structured_output == "auto" {
-        MODE_ORDER.to_vec()
-    } else {
-        vec![settings.structured_output.as_str()]
+    let schema = json!({"type": "object", "properties": {"greeting": {"type": "string"}}, "required": ["greeting"]});
+    let probe = |mode: &'static str, hint: bool| {
+        let schema = schema.clone();
+        async move {
+            let started = Instant::now();
+            let r = chat_json_inner(settings, mode, "你是一个友好的助手。", "用一句话向我问好。", &schema, hint).await;
+            (r, started.elapsed().as_millis() as u64)
+        }
     };
+    let ok_value = |v: &Value| v.get("greeting").and_then(|x| x.as_str()).is_some();
+    if settings.structured_output != "auto" {
+        let mode: &'static str = match settings.structured_output.as_str() {
+            "json_schema" => "json_schema",
+            "json_object" => "json_object",
+            _ => "prompt",
+        };
+        return match probe(mode, true).await {
+            (Ok(v), ms) if ok_value(&v) => TestResult { ok: true, mode: mode.into(), latency_ms: ms, message: "连接成功".into() },
+            (Ok(v), _) => TestResult { message: format!("返回内容不符合预期 {}", truncate(&v.to_string(), 80)), ..Default::default() },
+            (Err(e), _) => TestResult { message: e, ..Default::default() },
+        };
+    }
     let mut errors = Vec::new();
-    for mode in modes {
-        let started = Instant::now();
-        match chat_json(settings, mode, "你是接口连通性测试助手。", "返回 {\"ok\": true}", &schema).await {
-            Ok(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => {
-                return TestResult { ok: true, mode: mode.into(), latency_ms: started.elapsed().as_millis() as u64, message: "连接成功".into() };
+    for mode in ["json_schema", "json_object"] {
+        match probe(mode, false).await {
+            (Ok(v), ms) if ok_value(&v) => {
+                return TestResult { ok: true, mode: mode.into(), latency_ms: ms, message: "连接成功".into() };
             }
-            Ok(v) => errors.push(format!("{}: 返回内容不符合预期 {}", mode, truncate(&v.to_string(), 80))),
-            Err(e) => errors.push(format!("{}: {}", mode, e)),
+            (Err(e), _) if e.starts_with(NOT_JSON) => errors.push(format!("{} 未生效", mode)),
+            (Ok(_), _) => errors.push(format!("{} 未生效", mode)),
+            (Err(e), _) => errors.push(format!("{} 不可用（{}）", mode, truncate(&e, 60))),
         }
     }
-    TestResult { ok: false, message: errors.join("；"), ..Default::default() }
+    match probe("prompt", true).await {
+        (Ok(v), ms) if ok_value(&v) => TestResult {
+            ok: true,
+            mode: "prompt".into(),
+            latency_ms: ms,
+            message: format!("连接成功；服务端不执行结构化约束（{}），将依靠提示词输出 JSON", errors.join("，")),
+        },
+        (Ok(v), _) => TestResult { message: format!("返回内容不符合预期 {}", truncate(&v.to_string(), 80)), ..Default::default() },
+        (Err(e), _) => TestResult { message: e, ..Default::default() },
+    }
 }
 
 pub async fn list_models(settings: &LlmSettings) -> Result<Vec<String>, String> {
@@ -314,5 +400,8 @@ mod tests {
     fn parses_fenced_json() {
         assert_eq!(parse_content("```json\n{\"ok\": true}\n```").unwrap()["ok"], true);
         assert_eq!(parse_content("好的：{\"ok\": true} 完成").unwrap()["ok"], true);
+        // 模型先复述 schema 再给结果
+        let echoed = r#"{"type":"object","properties":{"ok":{"type":"boolean"}}} {"ok": true, "note": "a}b"}"#;
+        assert_eq!(parse_content(echoed).unwrap()["ok"], true);
     }
 }
