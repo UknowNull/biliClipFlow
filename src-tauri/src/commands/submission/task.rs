@@ -378,24 +378,20 @@ pub async fn submission_update(
 }
 
 #[tauri::command]
-#[allow(non_snake_case)]
 pub async fn submission_list(
     state: State<'_, AppState>,
     page: Option<i64>,
     page_size: Option<i64>,
-    pageSize: Option<i64>,
     query: Option<String>,
     refresh_remote: Option<bool>,
     source_type: Option<String>,
-    sourceType: Option<String>,
     bilibili_uid: Option<i64>,
-    bilibiliUid: Option<i64>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
     let context = SubmissionContext::new(&state);
     let page = page.unwrap_or(1).max(1);
-    let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
+    let page_size = page_size.unwrap_or(20).max(1);
     let bilibili_uid =
-        match resolve_submission_list_bilibili_uid(&state, &context, bilibili_uid.or(bilibiliUid))?
+        match resolve_submission_list_bilibili_uid(&state, &context, bilibili_uid)?
         {
             Some(value) => value,
             None => {
@@ -423,7 +419,7 @@ pub async fn submission_list(
         page_size,
         query,
         bilibili_uid,
-        source_type.or(sourceType),
+        source_type,
     ) {
         Ok(result) => ApiResponse::success(result),
         Err(err) => ApiResponse::error(format!("Failed to load tasks: {}", err)),
@@ -432,25 +428,21 @@ pub async fn submission_list(
 }
 
 #[tauri::command]
-#[allow(non_snake_case)]
 pub async fn submission_list_by_status(
     state: State<'_, AppState>,
     status: String,
     page: Option<i64>,
     page_size: Option<i64>,
-    pageSize: Option<i64>,
     query: Option<String>,
     refresh_remote: Option<bool>,
     source_type: Option<String>,
-    sourceType: Option<String>,
     bilibili_uid: Option<i64>,
-    bilibiliUid: Option<i64>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
     let context = SubmissionContext::new(&state);
     let page = page.unwrap_or(1).max(1);
-    let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
+    let page_size = page_size.unwrap_or(20).max(1);
     let bilibili_uid =
-        match resolve_submission_list_bilibili_uid(&state, &context, bilibili_uid.or(bilibiliUid))?
+        match resolve_submission_list_bilibili_uid(&state, &context, bilibili_uid)?
         {
             Some(value) => value,
             None => {
@@ -481,7 +473,7 @@ pub async fn submission_list_by_status(
         page_size,
         query,
         bilibili_uid,
-        source_type.or(sourceType),
+        source_type,
     ) {
         Ok(result) => ApiResponse::success(result),
         Err(err) => ApiResponse::error(format!("Failed to load tasks: {}", err)),

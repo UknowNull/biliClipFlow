@@ -1117,7 +1117,7 @@ export default function SubmissionSection({
     bilibiliUidOverride = "",
   ) => {
     try {
-      const payload = { page, page_size: size, pageSize: size };
+      const payload = { page, pageSize: size };
       const currentBilibiliUid = Number(
         bilibiliUidOverride || selectedBilibiliUid || currentUpProfile?.uid || 0,
       );
@@ -1139,7 +1139,7 @@ export default function SubmissionSection({
         } catch (_) {}
       }
       if (refreshRemote) {
-        payload.refresh_remote = true;
+        payload.refreshRemote = true;
       }
       const data =
         filter === "ALL"
@@ -1190,7 +1190,7 @@ export default function SubmissionSection({
           message: `quick_fill_request page=${page} size=${quickFillPageSize}`,
         });
       } catch (_) {}
-      const payload = { page, page_size: quickFillPageSize, pageSize: quickFillPageSize };
+      const payload = { page, pageSize: quickFillPageSize };
       const trimmedKeyword = keyword?.trim();
       if (trimmedKeyword) {
         payload.query = trimmedKeyword;

@@ -702,7 +702,6 @@ export default function DownloadSection({
       const data = await invokeCommand("download_list_by_status", {
         status,
         page,
-        page_size: size,
         pageSize: size,
       });
       setDownloadList(data?.items || []);
@@ -1606,7 +1605,7 @@ export default function DownloadSection({
           message: `quick_fill_request page=${page} size=${quickFillPageSize}`,
         });
       } catch (_) {}
-      const payload = { page, page_size: quickFillPageSize, pageSize: quickFillPageSize };
+      const payload = { page, pageSize: quickFillPageSize };
       const currentBilibiliUid = Number(selectedBilibiliUid || currentUpProfile?.uid || 0);
       if (Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0) {
         payload.bilibiliUid = currentBilibiliUid;
