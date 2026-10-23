@@ -139,6 +139,7 @@ impl LiveRuntime {
 const STALE_RECORD_REMUX_MAX_AGE_SECS: u64 = 36 * 60 * 60;
 const STALE_RECORD_IDLE_SECS: u64 = 30 * 60;
 const STALE_RECORD_RECOVERY_INTERVAL_SECS: u64 = 10 * 60;
+const ROOM_CHECK_TIMEOUT_SECS: u64 = 10;
 
 pub fn recover_stale_recordings(context: LiveContext) {
     let records = context
@@ -493,7 +494,14 @@ pub fn start_auto_record_loop(context: LiveContext) {
             let interval_sec = settings.check_interval_sec.max(10);
             if let Ok(rooms) = load_anchor_room_ids(&context.db) {
                 for room_id in rooms {
-                    match fetch_room_info(&context.bilibili, &room_id).await {
+                    // 单个房间请求卡住会阻塞整轮检测，导致所有主播漏检开播，必须限时。
+                    let room_info = tokio::time::timeout(
+                        Duration::from_secs(ROOM_CHECK_TIMEOUT_SECS),
+                        fetch_room_info(&context.bilibili, &room_id),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("查询直播间状态超时".to_string()));
+                    match room_info {
                         Ok(info) => {
                             let _ = update_anchor_status(&context.db, &room_id, info.live_status);
                             let auto_record = should_auto_record_now(

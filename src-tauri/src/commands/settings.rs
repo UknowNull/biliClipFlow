@@ -628,7 +628,7 @@ pub fn default_live_settings() -> LiveSettings {
         stream_retry_no_qn_sec: 90,
         stream_connect_timeout_ms: 5000,
         stream_read_timeout_ms: 15000,
-        check_interval_sec: 180,
+        check_interval_sec: 30,
         flv_fix_split_on_missing: false,
         flv_fix_adjust_timestamp_jump: false,
         flv_fix_split_on_timestamp_jump: true,

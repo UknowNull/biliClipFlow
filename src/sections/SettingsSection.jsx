@@ -59,7 +59,7 @@ export default function SettingsSection() {
     streamRetryNoQnSec: 90,
     streamConnectTimeoutMs: 5000,
     streamReadTimeoutMs: 15000,
-    checkIntervalSec: 180,
+    checkIntervalSec: 30,
     flvFixSplitOnMissing: false,
     flvFixAdjustTimestampJump: false,
     flvFixSplitOnTimestampJump: true,
