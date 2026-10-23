@@ -2453,7 +2453,7 @@ export default function SubmissionSection({
       });
       const detail = await fetchTaskDetail(deleteMergedTarget.taskId, { log: false });
       setSelectedTask(detail);
-      if (deleteLocalFile) {
+      if (deleteMergedLocalFile) {
         setMessage("合并视频已删除，本地文件已同步删除");
       } else if (result?.archivedLocalPath) {
         setMessage(`合并视频已删除，本地文件已归档到：${result.archivedLocalPath}`);
