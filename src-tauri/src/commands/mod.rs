@@ -1,5 +1,6 @@
 pub mod anchor;
 pub mod app_update;
+pub mod auto_clip;
 pub mod auth;
 pub mod baidu_sync;
 pub mod download;

@@ -2,12 +2,14 @@ import { useEffect, useState } from "react";
 import { confirm as dialogConfirm, message as dialogMessage, open } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../lib/tauri";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
+import AutoClipSettings from "./settings/AutoClipSettings";
 
 const SETTINGS_TABS = [
   { key: "download", title: "下载设置", group: "设置" },
   { key: "sync", title: "同步配置", group: "同步" },
   { key: "live", title: "直播录制", group: "直播录制" },
   { key: "cache", title: "缓存", group: "存储" },
+  { key: "autoClip", title: "自动切片", group: "AI" },
 ];
 
 const CACHE_ITEMS = [
@@ -1232,6 +1234,7 @@ export default function SettingsSection() {
           </div>
         ) : null}
       </div>
+      <AutoClipSettings visible={activeTab === "autoClip"} />
         </div>
         <div className="tab hidden xl:flex">
           {SETTINGS_TABS.map((tab) => (

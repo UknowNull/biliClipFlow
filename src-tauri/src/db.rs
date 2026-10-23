@@ -296,6 +296,74 @@ impl Db {
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE live_room_settings ADD COLUMN clip_profile TEXT NOT NULL DEFAULT 'reaction'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_record_task ADD COLUMN remux_status TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_task ADD COLUMN trigger_type TEXT NOT NULL DEFAULT 'MANUAL'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_task ADD COLUMN session_key TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_task ADD COLUMN stage TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_task ADD COLUMN progress REAL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN score REAL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN signals TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN category TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN titles TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN description TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN tags TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN cover_text TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN reason TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN evidence TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN ai_status TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN mark TEXT NOT NULL DEFAULT 'PENDING'",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE anchor_submission_config ADD COLUMN activity_title TEXT",
             [],
         );
@@ -321,6 +389,12 @@ impl Db {
       "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES ('active_baidu_uid', '', datetime('now'))",
       [],
     );
+        // 存量录播的转封装状态：MP4 视为完成，其余视为失败（不会再自动重试），录制中的保持为空。
+        let _ = conn.execute(
+            "UPDATE live_record_task SET remux_status = CASE WHEN LOWER(file_path) LIKE '%.mp4' THEN 'DONE' ELSE 'FAILED' END \
+       WHERE remux_status IS NULL AND status <> 'RECORDING'",
+            [],
+        );
         let baidu_account_count = conn
             .query_row("SELECT COUNT(*) FROM baidu_account_info", [], |row| {
                 row.get::<_, i64>(0)

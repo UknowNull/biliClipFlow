@@ -1,7 +1,28 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { confirm as dialogConfirm } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime } from "../lib/format";
+
+const CLIP_ACTIVE_STATUSES = ["RUNNING", "QUEUED"];
+const CLIP_STAGE_LABELS = {
+  PREPARE: "准备",
+  ASR: "语音识别",
+  CANDIDATES: "挑选候选",
+  TRANSCRIBE: "转写",
+  AI: "AI 精排",
+  CUT: "剪辑",
+};
+const CLIP_PROFILES = [
+  { value: "reaction", label: "reaction（看作品解说）" },
+  { value: "game", label: "游戏" },
+  { value: "chat", label: "杂谈" },
+];
+const CLIP_AI_LABELS = {
+  KEPT: "AI 推荐",
+  SIGNAL_ONLY: "仅信号",
+  UNVERIFIED: "证据未通过",
+  ERROR: "AI 失败",
+};
 
 export default function AnchorSection() {
   const [newAnchorUid, setNewAnchorUid] = useState("");
@@ -41,6 +62,8 @@ export default function AnchorSection() {
   const [clipListMessage, setClipListMessage] = useState("");
   const [clipEdit, setClipEdit] = useState(null);
   const [reclipLoading, setReclipLoading] = useState({});
+  const [clipExpanded, setClipExpanded] = useState({});
+  const [clipProfile, setClipProfile] = useState("reaction");
   const [clipSubmitView, setClipSubmitView] = useState(null);
   const [clipSubmitMessage, setClipSubmitMessage] = useState("");
   const [clipSubmitSubmitting, setClipSubmitSubmitting] = useState(false);
@@ -864,7 +887,10 @@ export default function AnchorSection() {
         recordIds,
       });
       const items = data?.items ?? data ?? [];
-      setClipView({ dateLabel: day, records: items, recordIds });
+      setClipView({ dateLabel: day, records: items, recordIds, task: data });
+      invokeCommand("anchor_clip_profile_get", { roomId: recordView.uid })
+        .then((value) => setClipProfile(value || "reaction"))
+        .catch(() => {});
     } catch (error) {
       setClipListError(error?.message || "加载切片记录失败");
     } finally {
@@ -887,7 +913,7 @@ export default function AnchorSection() {
         recordIds: clipView.recordIds,
       });
       const items = data?.items ?? data ?? [];
-      setClipView((prev) => (prev ? { ...prev, records: items } : prev));
+      setClipView((prev) => (prev ? { ...prev, records: items, task: data } : prev));
     } catch (error) {
       setClipListError(error?.message || "刷新切片记录失败");
     } finally {
@@ -929,19 +955,21 @@ export default function AnchorSection() {
     const polling = setInterval(async () => {
       const entries = Object.entries(analyzingTasks);
       for (const [day, task] of entries) {
-        if (!task?.taskId || task.status !== "RUNNING") {
+        if (!task?.taskId || !CLIP_ACTIVE_STATUSES.includes(task.status)) {
           continue;
         }
         try {
           const result = await invokeCommand("anchor_clip_task_status", {
             taskId: task.taskId,
           });
-          if (result?.status && result.status !== "RUNNING") {
+          if (result?.status) {
             setAnalyzingTasks((prev) => ({
               ...prev,
               [day]: {
                 ...task,
                 status: result.status,
+                stage: result.stage || "",
+                progress: Number(result.progress || 0),
                 errorMessage: result.errorMessage || "",
               },
             }));
@@ -1862,9 +1890,11 @@ export default function AnchorSection() {
                     const dirPath = getDirPath(records[0]?.filePath);
                     const dayTitle = records[records.length - 1]?.title || records[0]?.title || "";
                     const analyzing = analyzingTasks[day];
-                    const isRunning = analyzing?.status === "RUNNING";
+                    const isRunning = CLIP_ACTIVE_STATUSES.includes(analyzing?.status);
                     const analyzeLabel = isRunning
-                      ? "分析中..."
+                      ? analyzing?.status === "QUEUED"
+                        ? "排队中..."
+                        : `${CLIP_STAGE_LABELS[analyzing?.stage] || "分析中"} ${Math.round(analyzing?.progress || 0)}%`
                       : analyzing?.status === "FAILED"
                         ? "分析失败"
                         : "分析";
@@ -1984,7 +2014,33 @@ export default function AnchorSection() {
                   <div className="mt-0.5 text-base font-semibold text-[var(--ink)]">
                     {clipView.dateLabel} 切片记录
                   </div>
+                  {clipView.task?.errorMessage ? (
+                    <div className="mt-1 text-xs text-amber-700">{clipView.task.errorMessage}</div>
+                  ) : null}
                 </div>
+                <label className="ml-auto mr-3 flex items-center gap-2 text-xs text-[var(--muted)]">
+                  内容类型
+                  <select
+                    className="rounded-lg border border-black/10 bg-white px-2 py-1 text-xs text-[var(--ink)]"
+                    value={clipProfile}
+                    title="影响信号权重与 AI 判断方式，下次分析生效"
+                    onChange={async (event) => {
+                      const value = event.target.value;
+                      setClipProfile(value);
+                      try {
+                        await invokeCommand("anchor_clip_profile_set", { roomId: recordView.uid, profile: value });
+                      } catch (error) {
+                        setClipListError(error?.message || "保存内容类型失败");
+                      }
+                    }}
+                  >
+                    {CLIP_PROFILES.map((item) => (
+                      <option key={item.value} value={item.value}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
             <button
               className="rounded-full border border-black/10 bg-white px-3 py-1 text-sm font-semibold text-[var(--ink)] hover:border-black/20"
               onClick={() => {
@@ -2013,39 +2069,54 @@ export default function AnchorSection() {
                     <thead>
                       <tr className="border-b border-black/5 text-left text-[var(--muted)]">
                         <th className="pb-2 pr-4 font-medium">序号</th>
-                        <th className="pb-2 pr-4 font-medium">源视频</th>
-                        <th className="pb-2 pr-4 font-medium">文件名</th>
+                        <th className="pb-2 pr-4 font-medium">标题</th>
+                        <th className="pb-2 pr-4 font-medium">类型</th>
+                        <th className="pb-2 pr-4 font-medium">分数</th>
                         <th className="pb-2 pr-4 font-medium">起始时间</th>
                         <th className="pb-2 pr-4 font-medium">结束时间</th>
                         <th className="pb-2 pr-4 font-medium">时长</th>
-                        <th className="pb-2 pr-4 font-medium">弹幕峰值</th>
                         <th className="pb-2 pr-4 font-medium">状态</th>
+                        <th className="pb-2 pr-4 font-medium">标记</th>
                         <th className="pb-2 font-medium">操作</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-black/5">
-                      {clipView.records.map((record, index) => (
-                        <tr key={record.id || record.filePath || index}>
+                      {clipView.records.map((record, index) => {
+                        const expanded = Boolean(clipExpanded[record.id]);
+                        const title = record.titles?.[0] || record.filePath?.split(/[\/\\]/).pop() || "-";
+                        const mark = String(record.mark || "PENDING").toUpperCase();
+                        const setMark = async (value) => {
+                          const next = mark === value ? "PENDING" : value;
+                          try {
+                            await invokeCommand("anchor_clip_mark", { clipId: record.id, mark: next });
+                            setClipView((prev) =>
+                              prev
+                                ? { ...prev, records: prev.records.map((item) => (item.id === record.id ? { ...item, mark: next } : item)) }
+                                : prev
+                            );
+                          } catch (error) {
+                            setClipListError(error?.message || "标记失败");
+                          }
+                        };
+                        return (
+                        <Fragment key={record.id || record.filePath || index}>
+                        <tr>
                           <td className="py-2 pr-4 tabular-nums text-[var(--muted)]">{index + 1}</td>
-                          <td className="py-2 pr-4 max-w-[240px] truncate" title={record.sourceFilePath}>
-                            {record.sourceFilePath ? (
-                              <button
-                                className="text-blue-600 hover:underline text-left truncate max-w-full"
-                                onClick={() =>
-                                  invokeCommand("anchor_open_record_file", {
-                                    filePath: record.sourceFilePath,
-                                  }).catch((err) => alert(err?.message || "打开失败"))
-                                }
-                              >
-                                {record.sourceFilePath.split(/[\/\\]/).pop()}
-                              </button>
-                            ) : (
-                              "-"
-                            )}
+                          <td className="py-2 pr-4 max-w-[280px]">
+                            <button
+                              className="truncate max-w-full text-left font-semibold text-[var(--ink)] hover:underline"
+                              title={title}
+                              onClick={() => setClipExpanded((prev) => ({ ...prev, [record.id]: !prev[record.id] }))}
+                            >
+                              {expanded ? "▾ " : "▸ "}
+                              {title}
+                            </button>
+                            {record.aiStatus ? (
+                              <div className="mt-0.5 text-[10px] text-[var(--muted)]">{CLIP_AI_LABELS[record.aiStatus] || record.aiStatus}</div>
+                            ) : null}
                           </td>
-                          <td className="py-2 pr-4 max-w-[240px] truncate" title={record.filePath}>
-                            {record.filePath?.split(/[\/\\]/).pop() || "-"}
-                          </td>
+                          <td className="py-2 pr-4 text-[var(--muted)]">{record.category || "-"}</td>
+                          <td className="py-2 pr-4 tabular-nums text-[var(--muted)]">{Number(record.score || 0).toFixed(2)}</td>
                           <td
                             className="py-2 pr-4 tabular-nums text-[var(--muted)]"
                             onDoubleClick={() => startClipEdit(record, "start")}
@@ -2099,10 +2170,23 @@ export default function AnchorSection() {
                           <td className="py-2 pr-4 tabular-nums text-[var(--muted)]">
                             {formatSeconds(record.duration)}
                           </td>
-                          <td className="py-2 pr-4 tabular-nums text-[var(--muted)]">
-                            {record.peakCount ?? "-"}
-                          </td>
                           <td className="py-2 pr-4 text-[var(--muted)]">{clipStatusLabel(record)}</td>
+                          <td className="py-2 pr-4">
+                            <div className="flex gap-1">
+                              <button
+                                className={`rounded-full border px-2 py-0.5 text-xs font-semibold ${mark === "KEEP" ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-black/10 bg-white text-[var(--muted)]"}`}
+                                onClick={() => setMark("KEEP")}
+                              >
+                                保留
+                              </button>
+                              <button
+                                className={`rounded-full border px-2 py-0.5 text-xs font-semibold ${mark === "DISCARD" ? "border-red-400 bg-red-50 text-red-600" : "border-black/10 bg-white text-[var(--muted)]"}`}
+                                onClick={() => setMark("DISCARD")}
+                              >
+                                丢弃
+                              </button>
+                            </div>
+                          </td>
                           <td className="py-2">
                             <div className="flex flex-wrap gap-2">
                               <button
@@ -2184,7 +2268,48 @@ export default function AnchorSection() {
                             </div>
                           </td>
                         </tr>
-                      ))}
+                        {expanded ? (
+                          <tr className="bg-black/[0.02]">
+                            <td />
+                            <td colSpan={9} className="py-3 pr-4 text-xs leading-relaxed text-[var(--content-color)]">
+                              {record.reason ? (
+                                <div><span className="font-semibold text-[var(--ink)]">理由：</span>{record.reason}</div>
+                              ) : null}
+                              {record.evidence?.length ? (
+                                <div className="mt-1">
+                                  <span className="font-semibold text-[var(--ink)]">原文证据：</span>
+                                  {record.evidence.map((item, i) => (
+                                    <div key={i} className="ml-4 text-[var(--muted)]">「{item}」</div>
+                                  ))}
+                                </div>
+                              ) : null}
+                              {record.signals?.summary ? (
+                                <div className="mt-1"><span className="font-semibold text-[var(--ink)]">信号：</span>{record.signals.summary}</div>
+                              ) : null}
+                              {record.description ? (
+                                <div className="mt-1"><span className="font-semibold text-[var(--ink)]">简介：</span>{record.description}</div>
+                              ) : null}
+                              {record.tags ? (
+                                <div className="mt-1"><span className="font-semibold text-[var(--ink)]">标签：</span>{record.tags}</div>
+                              ) : null}
+                              {record.titles?.length > 1 ? (
+                                <div className="mt-1">
+                                  <span className="font-semibold text-[var(--ink)]">其他标题：</span>
+                                  {record.titles.slice(1).join(" ／ ")}
+                                </div>
+                              ) : null}
+                              {record.coverText ? (
+                                <div className="mt-1"><span className="font-semibold text-[var(--ink)]">封面文案：</span>{record.coverText}</div>
+                              ) : null}
+                              <div className="mt-1 break-all text-[var(--muted)]">
+                                源视频：{record.sourceFilePath || "-"}　切片文件：{record.filePath || "-"}
+                              </div>
+                            </td>
+                          </tr>
+                        ) : null}
+                        </Fragment>
+                        );
+                      })}
                     </tbody>
                   </table>
                 )}

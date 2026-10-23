@@ -39,6 +39,9 @@ rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.10"
 rand = "0.8"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# 本地语音识别（静态链接预编译库）；识别结果的完整字段需直接调用 sys 接口
+sherpa-onnx = "=1.13.8"
+sherpa-onnx-sys = "=1.13.8"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "blocking"] }

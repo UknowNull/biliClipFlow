@@ -17,6 +17,7 @@ mod commands;
 mod config;
 mod db;
 mod ffmpeg;
+mod highlight;
 mod live_recorder;
 mod login_refresh;
 mod login_store;
@@ -202,6 +203,11 @@ pub fn run() {
             );
             commands::toolbox::start_bilibili_season_backup_scheduler(app.handle().clone());
             change_events::start_emit_loop(app.handle().clone());
+            highlight::start(highlight::ClipContext {
+                db: Arc::clone(&app.state::<AppState>().db),
+                app_log_path: Arc::clone(&app.state::<AppState>().app_log_path),
+                app_data_dir: app_dir.clone(),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -248,6 +254,15 @@ pub fn run() {
             commands::anchor::anchor_clip_reclip,
             commands::anchor::anchor_clip_delete,
             commands::anchor::anchor_clip_list,
+            commands::anchor::anchor_clip_mark,
+            commands::auto_clip::anchor_clip_profile_get,
+            commands::auto_clip::anchor_clip_profile_set,
+            commands::auto_clip::auto_clip_settings_get,
+            commands::auto_clip::auto_clip_settings_save,
+            commands::auto_clip::auto_clip_llm_test,
+            commands::auto_clip::auto_clip_llm_models,
+            commands::auto_clip::auto_clip_asr_status,
+            commands::auto_clip::auto_clip_asr_download,
             commands::live::live_record_start,
             commands::live::live_record_stop,
             commands::live::live_room_auto_record_update,

@@ -2657,8 +2657,10 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
         .unwrap_or("")
         .to_string();
     if !ext.eq_ignore_ascii_case("flv") {
+        set_record_remux_status(&context.db, record_id, "DONE");
         return;
     }
+    set_record_remux_status(&context.db, record_id, "PENDING");
     let target_path = source_path.with_extension("mp4");
     let source = source_path.to_string_lossy().to_string();
     let target = target_path.to_string_lossy().to_string();
@@ -2784,6 +2786,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
                     record_id, used_fallback_transcode
                 ),
             );
+            set_record_remux_status(&db, record_id, "FAILED");
             if let Err(err) = baidu_sync::enqueue_live_sync(&db, log_path.as_ref(), record_id) {
                 append_log(
                     log_path.as_ref(),
@@ -2796,6 +2799,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
             return;
         }
 
+        set_record_remux_status(&db, record_id, "DONE");
         if let Err(err) = update_record_task_file_path(&db, record_id, &target, final_target_size) {
             append_log(
                 log_path.as_ref(),
@@ -2918,6 +2922,16 @@ fn update_record_task(
     Ok(())
   })
   .map_err(|err| format!("更新录制任务失败: {}", err))
+}
+
+/// 记录分段转封装状态，自动切片据此判断一场直播的所有分段是否已就绪。
+fn set_record_remux_status(db: &Db, record_id: i64, status: &str) {
+    let _ = db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE live_record_task SET remux_status = ?1 WHERE id = ?2",
+            (status, record_id),
+        )
+    });
 }
 
 fn update_record_task_file_path(

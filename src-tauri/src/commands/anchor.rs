@@ -1,5 +1,3 @@
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,9 +10,8 @@ use tauri::State;
 
 use crate::api::ApiResponse;
 use crate::commands::settings::{default_live_settings, load_live_settings_from_db};
-use crate::ffmpeg::run_ffmpeg;
 use crate::live_recorder::{fetch_room_info, start_recording, stop_recording, LiveContext};
-use crate::utils::{append_log, now_rfc3339, sanitize_filename};
+use crate::utils::{append_log, now_rfc3339};
 use crate::AppState;
 
 const LIVE_ROOM_INFO_URL: &str = "https://api.live.bilibili.com/room/v1/Room/get_info";
@@ -248,6 +245,8 @@ pub struct LiveClipTaskStatus {
     pub status: String,
     pub clip_count: i64,
     pub error_message: Option<String>,
+    pub stage: Option<String>,
+    pub progress: f64,
 }
 
 #[derive(Serialize)]
@@ -262,6 +261,46 @@ pub struct LiveClipItem {
     pub duration: i64,
     pub peak_count: i64,
     pub create_time: String,
+    pub score: f64,
+    pub signals: Option<Value>,
+    pub category: Option<String>,
+    pub titles: Vec<String>,
+    pub description: Option<String>,
+    pub tags: Option<String>,
+    pub cover_text: Option<String>,
+    pub reason: Option<String>,
+    pub evidence: Vec<String>,
+    pub ai_status: Option<String>,
+    pub mark: String,
+}
+
+const CLIP_ITEM_COLUMNS: &str = "id, source_file_path, status, file_path, start_offset, end_offset, duration, peak_count, create_time, \
+     score, signals, category, titles, description, tags, cover_text, reason, evidence, ai_status, mark";
+
+fn map_clip_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveClipItem> {
+    let json_list = |v: Option<String>| -> Vec<String> { v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default() };
+    Ok(LiveClipItem {
+        id: row.get(0)?,
+        source_file_path: row.get(1)?,
+        status: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        file_path: row.get(3)?,
+        start_offset: row.get(4)?,
+        end_offset: row.get(5)?,
+        duration: row.get(6)?,
+        peak_count: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+        create_time: row.get(8)?,
+        score: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+        signals: row.get::<_, Option<String>>(10)?.and_then(|s| serde_json::from_str(&s).ok()),
+        category: row.get(11)?,
+        titles: json_list(row.get(12)?),
+        description: row.get(13)?,
+        tags: row.get(14)?,
+        cover_text: row.get(15)?,
+        reason: row.get(16)?,
+        evidence: json_list(row.get(17)?),
+        ai_status: row.get(18)?,
+        mark: row.get::<_, Option<String>>(19)?.unwrap_or_else(|| "PENDING".to_string()),
+    })
 }
 
 #[derive(Serialize)]
@@ -309,20 +348,13 @@ pub struct LiveClipListResponse {
 }
 
 #[derive(Clone)]
-struct LiveRecordSegment {
-    record_id: i64,
-    file_path: String,
-    start_time: DateTime<Utc>,
-    end_time: DateTime<Utc>,
-    offset_start: i64,
-    offset_end: i64,
-}
-
-#[derive(Clone)]
-struct ClipInterval {
-    start_offset: i64,
-    end_offset: i64,
-    peak_count: i64,
+pub(crate) struct LiveRecordSegment {
+    pub(crate) record_id: i64,
+    pub(crate) file_path: String,
+    pub(crate) start_time: DateTime<Utc>,
+    pub(crate) end_time: DateTime<Utc>,
+    pub(crate) offset_start: i64,
+    pub(crate) offset_end: i64,
 }
 
 #[tauri::command(async)]
@@ -535,76 +567,24 @@ pub fn anchor_open_record_file(file_path: String) -> ApiResponse<String> {
     }
 }
 
-#[tauri::command]
-pub async fn anchor_analyze_clips(
+#[tauri::command(async)]
+pub fn anchor_analyze_clips(
     state: State<'_, AppState>,
     room_id: String,
     record_ids: Vec<i64>,
-) -> Result<ApiResponse<i64>, String> {
+) -> ApiResponse<i64> {
     let room_id = room_id.trim().to_string();
     if room_id.is_empty() {
-        return Ok(ApiResponse::error("room_id 不能为空"));
-    }
-    if record_ids.is_empty() {
-        return Ok(ApiResponse::error("record_ids 不能为空"));
+        return ApiResponse::error("room_id 不能为空");
     }
     let normalized_ids = normalize_record_ids(&record_ids);
     if normalized_ids.is_empty() {
-        return Ok(ApiResponse::error("record_ids 无效"));
+        return ApiResponse::error("record_ids 无效");
     }
-
-    let segments = match load_record_segments(&state.db, &room_id, &normalized_ids) {
-        Ok(value) => value,
-        Err(err) => return Ok(ApiResponse::error(err)),
-    };
-    let segments = normalize_segments_for_analysis(segments, Some(state.app_log_path.as_path()));
-    if segments.is_empty() {
-        return Ok(ApiResponse::error("未找到录播记录"));
+    match crate::highlight::create_task(&state.db, &room_id, &normalized_ids, "MANUAL", None) {
+        Ok(task_id) => ApiResponse::success(task_id),
+        Err(err) => ApiResponse::error(err),
     }
-    let date_label = segments[0].start_time.format("%Y-%m-%d").to_string();
-    let record_ids_json =
-        serde_json::to_string(&normalized_ids).unwrap_or_else(|_| "[]".to_string());
-    let now = now_rfc3339();
-    let task_id = match state.db.with_conn_mut(|conn| {
-    conn.execute(
-      "INSERT INTO live_clip_task (room_id, record_ids, date_label, status, clip_count, error_message, create_time, update_time) \
-       VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6)",
-      (&room_id, &record_ids_json, &date_label, "RUNNING", &now, &now),
-    )?;
-    Ok(conn.last_insert_rowid())
-  }) {
-    Ok(value) => value,
-    Err(err) => return Ok(ApiResponse::error(format!("创建切片任务失败: {}", err))),
-  };
-
-    let db = state.db.clone();
-    let app_log_path = state.app_log_path.clone();
-    let room_id_clone = room_id.clone();
-    let record_ids_clone = normalized_ids.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Err(err) = run_clip_analysis(
-            &db,
-            app_log_path.as_path(),
-            &room_id_clone,
-            &record_ids_clone,
-            task_id,
-        ) {
-            let now = now_rfc3339();
-            let _ = db.with_conn_mut(|conn| {
-        conn.execute(
-          "UPDATE live_clip_task SET status = ?1, error_message = ?2, update_time = ?3 WHERE id = ?4",
-          ("FAILED", err.as_str(), &now, task_id),
-        )?;
-        Ok(())
-      });
-            append_log(
-                app_log_path.as_path(),
-                &format!("anchor_clip_task_failed task_id={} err={}", task_id, err),
-            );
-        }
-    });
-
-    Ok(ApiResponse::success(task_id))
 }
 
 #[tauri::command(async)]
@@ -617,13 +597,15 @@ pub fn anchor_clip_task_status(
     }
     let result = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT status, clip_count, error_message FROM live_clip_task WHERE id = ?1",
+            "SELECT status, clip_count, error_message, stage, progress FROM live_clip_task WHERE id = ?1",
             [task_id],
             |row| {
                 Ok(LiveClipTaskStatus {
                     status: row.get(0)?,
                     clip_count: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                     error_message: row.get(2)?,
+                    stage: row.get(3)?,
+                    progress: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
                 })
             },
         )
@@ -660,25 +642,12 @@ pub fn anchor_clip_update_time(
     }
 
     let item_result = state.db.with_conn(|conn| {
-    conn.query_row(
-      "SELECT id, source_file_path, status, file_path, start_offset, end_offset, duration, peak_count, create_time \
-       FROM live_clip_item WHERE id = ?1",
-      [clip_id],
-      |row| {
-        Ok(LiveClipItem {
-          id: row.get(0)?,
-          source_file_path: row.get(1)?,
-          status: row.get(2)?,
-          file_path: row.get(3)?,
-          start_offset: row.get(4)?,
-          end_offset: row.get(5)?,
-          duration: row.get(6)?,
-          peak_count: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
-          create_time: row.get(8)?,
-        })
-      },
-    )
-  });
+        conn.query_row(
+            &format!("SELECT {} FROM live_clip_item WHERE id = ?1", CLIP_ITEM_COLUMNS),
+            [clip_id],
+            map_clip_item,
+        )
+    });
     match item_result {
         Ok(item) => ApiResponse::success(item),
         Err(err) => ApiResponse::error(format!("读取切片记录失败: {}", err)),
@@ -712,65 +681,36 @@ pub fn anchor_clip_reclip(state: State<'_, AppState>, clip_id: i64) -> ApiRespon
         Ok(value) => value,
         Err(err) => return ApiResponse::error(format!("读取切片记录失败: {}", err)),
     };
-    let mut resolved_source = source_path.and_then(|value| {
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    });
-    if resolved_source.is_none() {
-        resolved_source = resolve_source_path_for_clip(&state.db, task_id, &room_id, start_offset);
-        if let Some(path) = resolved_source.as_ref() {
-            let _ = state.db.with_conn_mut(|conn| {
-                conn.execute(
-                    "UPDATE live_clip_item SET source_file_path = ?1 WHERE id = ?2",
-                    (path, clip_id),
-                )?;
-                Ok(())
-            });
-        }
+    if start_offset < 0 || end_offset <= start_offset {
+        return ApiResponse::error("时间段无效");
     }
-    let Some(source_path) = resolved_source else {
-        return ApiResponse::error("源视频路径为空，无法重新剪辑");
+    // 切片起止是场次时间轴上的秒数，需换算到所在录播文件内的偏移
+    let (source_path, start_in_file) = match resolve_source_path_for_clip(&state.db, task_id, &room_id, start_offset) {
+        Some(found) => found,
+        None => match source_path.filter(|v| !v.trim().is_empty()) {
+            Some(path) => (path, start_offset),
+            None => return ApiResponse::error("源视频路径为空，无法重新剪辑"),
+        },
     };
     let source_path =
         resolve_existing_record_path(&source_path).unwrap_or_else(|| source_path.clone());
     if !Path::new(&source_path).exists() {
         return ApiResponse::error(format!("源视频不存在: {}", source_path));
     }
-    if start_offset < 0 || end_offset <= start_offset {
-        return ApiResponse::error("时间段无效");
-    }
-    let duration = end_offset - start_offset;
     let _ = state.db.with_conn_mut(|conn| {
         conn.execute(
-            "UPDATE live_clip_item SET status = 'RUNNING' WHERE id = ?1",
-            [clip_id],
+            "UPDATE live_clip_item SET status = 'RUNNING', source_file_path = ?1 WHERE id = ?2",
+            (&source_path, clip_id),
         )?;
         Ok(())
     });
+    let duration = end_offset - start_offset;
     let db = state.db.clone();
     let clip_id_copy = clip_id;
     let clip_path_copy = clip_path.clone();
     let source_path_copy = source_path.clone();
     std::thread::spawn(move || {
-        let args = vec![
-            "-y".to_string(),
-            "-ss".to_string(),
-            start_offset.to_string(),
-            "-t".to_string(),
-            duration.to_string(),
-            "-accurate_seek".to_string(),
-            "-i".to_string(),
-            source_path_copy,
-            "-c".to_string(),
-            "copy".to_string(),
-            "-avoid_negative_ts".to_string(),
-            "1".to_string(),
-            clip_path_copy.clone(),
-        ];
-        match run_ffmpeg(&args) {
+        match crate::highlight::cutter::cut(&source_path_copy, start_in_file as f64, duration as f64, std::path::Path::new(&clip_path_copy)) {
             Ok(_) => {
                 let actual_duration = probe_duration_seconds(&clip_path_copy).unwrap_or(duration);
                 let _ = db.with_conn_mut(|conn| {
@@ -847,6 +787,18 @@ pub fn anchor_clip_delete(state: State<'_, AppState>, clip_id: i64) -> ApiRespon
 }
 
 #[tauri::command(async)]
+pub fn anchor_clip_mark(state: State<'_, AppState>, clip_id: i64, mark: String) -> ApiResponse<String> {
+    let mark = mark.trim().to_ascii_uppercase();
+    if !["PENDING", "KEEP", "DISCARD"].contains(&mark.as_str()) {
+        return ApiResponse::error("标记无效");
+    }
+    match state.db.with_conn(|c| c.execute("UPDATE live_clip_item SET mark = ?1 WHERE id = ?2", (&mark, clip_id))) {
+        Ok(_) => ApiResponse::success(mark),
+        Err(err) => ApiResponse::error(format!("更新标记失败: {}", err)),
+    }
+}
+
+#[tauri::command(async)]
 pub fn anchor_clip_list(
     state: State<'_, AppState>,
     room_id: String,
@@ -860,26 +812,42 @@ pub fn anchor_clip_list(
     if normalized_ids.is_empty() {
         return ApiResponse::error("record_ids 无效");
     }
-    let record_ids_json =
-        serde_json::to_string(&normalized_ids).unwrap_or_else(|_| "[]".to_string());
-
+    let mut task_record_ids: Vec<i64> = Vec::new();
+    // 自动任务按场次划分，可能与按日期分组的录播不完全一致：优先完全匹配，否则取与这些录播有交集的最近任务
+    let wanted: std::collections::HashSet<i64> = normalized_ids.iter().copied().collect();
     let task_row = state.db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT id, room_id, date_label, status, clip_count, error_message \
-       FROM live_clip_task WHERE room_id = ?1 AND record_ids = ?2 ORDER BY id DESC LIMIT 1",
-            (&room_id, &record_ids_json),
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            },
-        )
+        let mut stmt = conn.prepare(
+            "SELECT id, room_id, date_label, status, clip_count, error_message, record_ids \
+       FROM live_clip_task WHERE room_id = ?1 ORDER BY id DESC LIMIT 200",
+        )?;
+        let rows = stmt.query_map([&room_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let tasks = rows.collect::<Result<Vec<_>, _>>()?;
+        let ids_of = |raw: &str| -> Vec<i64> { serde_json::from_str(raw).unwrap_or_default() };
+        let exact = tasks.iter().find(|t| ids_of(&t.6) == normalized_ids);
+        let overlap = tasks.iter().find(|t| ids_of(&t.6).iter().any(|id| wanted.contains(id)));
+        exact.or(overlap).cloned().ok_or(rusqlite::Error::QueryReturnedNoRows)
     });
+    let task_row = task_row.map(|t| {
+        let ids: Vec<i64> = serde_json::from_str(&t.6).unwrap_or_default();
+        ((t.0, t.1, t.2, t.3, t.4, t.5), ids)
+    });
+    let task_row = match task_row {
+        Ok((row, ids)) => {
+            task_record_ids = ids;
+            Ok(row)
+        }
+        Err(err) => Err(err),
+    };
 
     let (task_id, task_room_id, date_label, status, clip_count, error_message) = match task_row {
         Ok(value) => value,
@@ -898,29 +866,13 @@ pub fn anchor_clip_list(
     };
 
     let items_result = state.db.with_conn(|conn| {
-    let mut stmt = conn.prepare(
-      "SELECT id, source_file_path, status, file_path, start_offset, end_offset, duration, peak_count, create_time \
-       FROM live_clip_item WHERE task_id = ?1 ORDER BY id ASC",
-    )?;
-    let rows = stmt.query_map([task_id], |row| {
-      Ok(LiveClipItem {
-        id: row.get(0)?,
-        source_file_path: row.get(1)?,
-        status: row.get(2)?,
-        file_path: row.get(3)?,
-        start_offset: row.get(4)?,
-        end_offset: row.get(5)?,
-        duration: row.get(6)?,
-        peak_count: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
-        create_time: row.get(8)?,
-      })
-    })?;
-    let mut items = Vec::new();
-    for row in rows {
-      items.push(row?);
-    }
-    Ok(items)
-  });
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM live_clip_item WHERE task_id = ?1 ORDER BY start_offset ASC, id ASC",
+            CLIP_ITEM_COLUMNS
+        ))?;
+        let rows = stmt.query_map([task_id], map_clip_item)?;
+        rows.collect::<Result<Vec<_>, _>>()
+    });
 
     let items = match items_result {
         Ok(value) => value,
@@ -932,7 +884,7 @@ pub fn anchor_clip_list(
         .iter()
         .any(|item| item.source_file_path.as_deref().unwrap_or("").is_empty())
     {
-        if let Ok(segments) = load_record_segments(&state.db, &task_room_id, &normalized_ids) {
+        if let Ok(segments) = load_record_segments(&state.db, &task_room_id, &task_record_ids) {
             let segments = normalize_segments_for_analysis(segments, None);
             if !segments.is_empty() {
                 for item in &mut items {
@@ -1174,7 +1126,7 @@ async fn fetch_live_info(state: &State<'_, AppState>, uid: &str) -> Result<Ancho
     })
 }
 
-fn normalize_record_ids(record_ids: &[i64]) -> Vec<i64> {
+pub(crate) fn normalize_record_ids(record_ids: &[i64]) -> Vec<i64> {
     let mut ids = record_ids
         .iter()
         .copied()
@@ -1191,7 +1143,7 @@ fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>, String> {
         .map_err(|err| format!("时间解析失败: {}", err))
 }
 
-fn load_record_segments(
+pub(crate) fn load_record_segments(
     db: &crate::db::Db,
     room_id: &str,
     record_ids: &[i64],
@@ -1317,280 +1269,13 @@ fn probe_duration_seconds(file_path: &str) -> Option<i64> {
     }
 }
 
-fn run_clip_analysis(
-    db: &crate::db::Db,
-    app_log_path: &Path,
-    room_id: &str,
-    record_ids: &[i64],
-    task_id: i64,
-) -> Result<(), String> {
-    let segments = load_record_segments(db, room_id, record_ids)?;
-    let segments = normalize_segments_for_analysis(segments, Some(app_log_path));
-    if segments.is_empty() {
-        return Err("未找到录播记录".to_string());
-    }
-
-    let base_time = segments
-        .iter()
-        .map(|item| item.start_time)
-        .min()
-        .unwrap_or_else(|| segments[0].start_time);
-
-    let mut buckets = std::collections::BTreeMap::<i64, i64>::new();
-    let mut timestamps = Vec::<i64>::new();
-    for segment in &segments {
-        let danmaku_jsonl_path = Path::new(&segment.file_path).with_extension("danmaku.jsonl");
-        let danmaku_xml_path = Path::new(&segment.file_path).with_extension("xml");
-        let mut loaded = false;
-
-        if danmaku_jsonl_path.exists() {
-            let file = File::open(&danmaku_jsonl_path).map_err(|err| {
-                format!(
-                    "读取弹幕失败: {} {}",
-                    danmaku_jsonl_path.to_string_lossy(),
-                    err
-                )
-            })?;
-            let reader = BufReader::new(file);
-            for line in reader.lines().flatten() {
-                let value: Value = match serde_json::from_str(&line) {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
-                let cmd = value.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
-                if cmd != "DANMU_MSG" && cmd != "SUPER_CHAT_MESSAGE" {
-                    continue;
-                }
-                let timestamp = value.get("timestamp").and_then(|v| v.as_str());
-                let Some(timestamp) = timestamp else {
-                    continue;
-                };
-                let Ok(dt) = DateTime::parse_from_rfc3339(timestamp) else {
-                    continue;
-                };
-                let offset = (dt.with_timezone(&Utc) - base_time).num_seconds();
-                push_danmaku_offset(offset, &mut buckets, &mut timestamps);
-            }
-            loaded = true;
-        } else if danmaku_xml_path.exists() {
-            collect_danmaku_xml_offsets(
-                &danmaku_xml_path,
-                segment.offset_start,
-                &mut buckets,
-                &mut timestamps,
-            )?;
-            loaded = true;
-        }
-
-        if !loaded {
-            append_log(
-                app_log_path,
-                &format!(
-                    "anchor_clip_danmaku_missing record_id={} path={}",
-                    segment.record_id,
-                    danmaku_jsonl_path.to_string_lossy()
-                ),
-            );
-        }
-    }
-
-    let mut intervals = Vec::new();
-    let mut threshold_intervals = compute_clip_intervals(&buckets);
-    if !threshold_intervals.is_empty() {
-        intervals.append(&mut threshold_intervals);
-    }
-    let mut sliding_intervals = compute_sliding_intervals(&timestamps, 60, 3, 30, 1);
-    if !sliding_intervals.is_empty() {
-        intervals.append(&mut sliding_intervals);
-    }
-    if !intervals.is_empty() {
-        intervals = merge_overlapping_intervals(intervals);
-    }
-    if intervals.is_empty() {
-        let now = now_rfc3339();
-        let _ = db.with_conn_mut(|conn| {
-            conn.execute(
-        "UPDATE live_clip_task SET status = ?1, clip_count = 0, update_time = ?2 WHERE id = ?3",
-        ("COMPLETED", &now, task_id),
-      )?;
-            Ok(())
-        });
-        return Ok(());
-    }
-
-    let clips_dir = resolve_clips_dir(&segments[0].file_path)?;
-    fs::create_dir_all(&clips_dir)
-        .map_err(|err| format!("创建切片目录失败: {} {}", clips_dir.to_string_lossy(), err))?;
-    cleanup_old_clip_files(&clips_dir, app_log_path)?;
-
-    let mut clip_count = 0;
-    for (index, interval) in intervals.iter().enumerate() {
-        let Some((segment, start_in_file, max_available)) =
-            locate_segment_for_offset(&segments, interval.start_offset)
-        else {
-            append_log(
-                app_log_path,
-                &format!(
-                    "anchor_clip_skip_no_segment task_id={} offset={}",
-                    task_id, interval.start_offset
-                ),
-            );
-            continue;
-        };
-        let mut end_offset = interval.end_offset;
-        let max_end = interval.start_offset + max_available;
-        if end_offset > max_end {
-            end_offset = max_end;
-        }
-        let duration = end_offset - interval.start_offset;
-        if duration < 60 {
-            continue;
-        }
-
-        let file_name = build_clip_file_name(index + 1, interval.start_offset, end_offset);
-        let output_path = clips_dir.join(file_name);
-        let input_path = resolve_existing_record_path(&segment.file_path)
-            .unwrap_or_else(|| segment.file_path.clone());
-        let args = vec![
-            "-y".to_string(),
-            "-ss".to_string(),
-            start_in_file.to_string(),
-            "-t".to_string(),
-            duration.to_string(),
-            "-accurate_seek".to_string(),
-            "-i".to_string(),
-            input_path.clone(),
-            "-c".to_string(),
-            "copy".to_string(),
-            "-avoid_negative_ts".to_string(),
-            "1".to_string(),
-            output_path.to_string_lossy().to_string(),
-        ];
-        run_ffmpeg(&args)
-            .map_err(|err| format!("剪辑失败: {} {}", output_path.to_string_lossy(), err))?;
-
-        let now = now_rfc3339();
-        db.with_conn_mut(|conn| {
-      conn.execute(
-        "INSERT INTO live_clip_item (task_id, room_id, source_file_path, file_path, start_offset, end_offset, duration, peak_count, create_time) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        (
-          task_id,
-          room_id,
-          input_path.clone(),
-          output_path.to_string_lossy(),
-          interval.start_offset,
-          end_offset,
-          duration,
-          interval.peak_count,
-          &now,
-        ),
-      )?;
-      Ok(())
-    })
-    .map_err(|err| format!("写入切片记录失败: {}", err))?;
-        clip_count += 1;
-    }
-
-    let now = now_rfc3339();
-    db.with_conn_mut(|conn| {
-        conn.execute(
-      "UPDATE live_clip_task SET status = ?1, clip_count = ?2, update_time = ?3 WHERE id = ?4",
-      ("COMPLETED", clip_count, &now, task_id),
-    )?;
-        Ok(())
-    })
-    .map_err(|err| format!("更新切片任务失败: {}", err))?;
-
-    Ok(())
-}
-
-fn resolve_clips_dir(file_path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_clips_dir(file_path: &str) -> Result<PathBuf, String> {
     let path = Path::new(file_path);
     let dir = path.parent().unwrap_or(path);
     Ok(dir.join("clips"))
 }
 
-fn compute_clip_intervals(buckets: &std::collections::BTreeMap<i64, i64>) -> Vec<ClipInterval> {
-    let up_ratio = 2.5;
-    let down_ratio = 0.75;
-    let mut intervals = Vec::new();
-    let mut active: Option<(i64, i64, i64)> = None;
-    let mut prev_count: Option<i64> = None;
-    let mut last_bucket_start = None;
-
-    for (bucket_start, count) in buckets.iter() {
-        let count = *count;
-        last_bucket_start = Some(*bucket_start);
-        match active {
-            Some((start, peak, last_count)) => {
-                let next_peak = peak.max(count);
-                if last_count > 0 && (count as f64) <= (last_count as f64) * down_ratio {
-                    intervals.push(ClipInterval {
-                        start_offset: start,
-                        end_offset: bucket_start + 60,
-                        peak_count: next_peak,
-                    });
-                    active = None;
-                } else {
-                    active = Some((start, next_peak, count));
-                }
-            }
-            None => {
-                if let Some(prev) = prev_count {
-                    let should_start = if prev == 0 {
-                        count > 0
-                    } else {
-                        (count as f64) >= (prev as f64) * up_ratio
-                    };
-                    if should_start {
-                        active = Some((*bucket_start, count, count));
-                    }
-                }
-            }
-        }
-        prev_count = Some(count);
-    }
-
-    if let Some((start, peak, _)) = active {
-        if let Some(last_bucket_start) = last_bucket_start {
-            intervals.push(ClipInterval {
-                start_offset: start,
-                end_offset: last_bucket_start + 60,
-                peak_count: peak,
-            });
-        }
-    }
-
-    intervals
-        .into_iter()
-        .map(|interval| {
-            let start = (interval.start_offset - 30).max(0);
-            let end = interval.end_offset + 30;
-            ClipInterval {
-                start_offset: start,
-                end_offset: end,
-                peak_count: interval.peak_count,
-            }
-        })
-        .filter(|interval| interval.end_offset - interval.start_offset >= 60)
-        .collect()
-}
-
-fn push_danmaku_offset(
-    offset: i64,
-    buckets: &mut std::collections::BTreeMap<i64, i64>,
-    timestamps: &mut Vec<i64>,
-) {
-    if offset < 0 {
-        return;
-    }
-    timestamps.push(offset);
-    let bucket = (offset / 60) * 60;
-    *buckets.entry(bucket).or_insert(0) += 1;
-}
-
-fn normalize_segments_for_analysis(
+pub(crate) fn normalize_segments_for_analysis(
     segments: Vec<LiveRecordSegment>,
     app_log_path: Option<&Path>,
 ) -> Vec<LiveRecordSegment> {
@@ -1640,7 +1325,7 @@ fn normalize_segments_for_analysis(
     filtered
 }
 
-fn resolve_existing_record_path(file_path: &str) -> Option<String> {
+pub(crate) fn resolve_existing_record_path(file_path: &str) -> Option<String> {
     let path = Path::new(file_path);
     if path.exists() {
         return Some(file_path.to_string());
@@ -1672,12 +1357,13 @@ fn resolve_existing_record_path(file_path: &str) -> Option<String> {
     None
 }
 
+/// 返回切片起点所在的录播文件，以及起点在该文件内的秒数
 fn resolve_source_path_for_clip(
     db: &crate::db::Db,
     task_id: i64,
     room_id: &str,
     start_offset: i64,
-) -> Option<String> {
+) -> Option<(String, i64)> {
     if task_id <= 0 || room_id.trim().is_empty() || start_offset < 0 {
         return None;
     }
@@ -1696,174 +1382,11 @@ fn resolve_source_path_for_clip(
     }
     let segments = load_record_segments(db, room_id, &record_ids).ok()?;
     let segments = normalize_segments_for_analysis(segments, None);
-    let (segment, _, _) = locate_segment_for_offset(&segments, start_offset)?;
-    Some(segment.file_path)
+    let (segment, start_in_file, _) = locate_segment_for_offset(&segments, start_offset)?;
+    Some((segment.file_path, start_in_file))
 }
 
-fn cleanup_old_clip_files(clips_dir: &Path, app_log_path: &Path) -> Result<(), String> {
-    if !clips_dir.exists() {
-        return Ok(());
-    }
-    let entries = std::fs::read_dir(clips_dir)
-        .map_err(|err| format!("读取切片目录失败: {} {}", clips_dir.to_string_lossy(), err))?;
-    for entry in entries {
-        let entry = entry.map_err(|err| format!("读取切片目录失败: {}", err))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("clip_") || !name.ends_with(".mp4") {
-            continue;
-        }
-        if let Err(err) = std::fs::remove_file(&path) {
-            append_log(
-                app_log_path,
-                &format!(
-                    "anchor_clip_cleanup_failed path={} err={}",
-                    path.to_string_lossy(),
-                    err
-                ),
-            );
-            return Err(format!(
-                "清理切片文件失败: {} {}",
-                path.to_string_lossy(),
-                err
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn collect_danmaku_xml_offsets(
-    path: &Path,
-    base_offset: i64,
-    buckets: &mut std::collections::BTreeMap<i64, i64>,
-    timestamps: &mut Vec<i64>,
-) -> Result<(), String> {
-    let file = File::open(path)
-        .map_err(|err| format!("读取弹幕失败: {} {}", path.to_string_lossy(), err))?;
-    let reader = BufReader::new(file);
-    for line in reader.lines().flatten() {
-        let mut remain = line.as_str();
-        while let Some(p_index) = remain.find("p=\"") {
-            let after_p = &remain[(p_index + 3)..];
-            let Some(end_index) = after_p.find('"') else {
-                break;
-            };
-            let p_value = &after_p[..end_index];
-            if let Some(first) = p_value.split(',').next() {
-                if let Ok(value) = first.parse::<f64>() {
-                    let offset = base_offset + value.floor() as i64;
-                    push_danmaku_offset(offset, buckets, timestamps);
-                }
-            }
-            remain = &after_p[(end_index + 1)..];
-        }
-    }
-    Ok(())
-}
-
-fn compute_sliding_intervals(
-    timestamps: &[i64],
-    window_size: i64,
-    top_n: usize,
-    max_overlap: i64,
-    step: usize,
-) -> Vec<ClipInterval> {
-    if timestamps.is_empty() || window_size <= 0 || top_n == 0 || step == 0 {
-        return Vec::new();
-    }
-    let mut time_counts = std::collections::BTreeMap::<i64, i64>::new();
-    for &ts in timestamps {
-        if ts >= 0 {
-            *time_counts.entry(ts).or_insert(0) += 1;
-        }
-    }
-    if time_counts.is_empty() {
-        return Vec::new();
-    }
-    let mut times = time_counts.keys().copied().collect::<Vec<_>>();
-    times.sort_unstable();
-
-    let mut density_periods: Vec<(i64, i64)> = Vec::new();
-    for i in (0..times.len()).step_by(step) {
-        let start_time = times[i];
-        let end_time = start_time + window_size;
-        let mut current_density = 0;
-        for (&time, &count) in time_counts.iter() {
-            if time >= start_time && time < end_time {
-                current_density += count;
-            }
-            if time >= end_time {
-                break;
-            }
-        }
-        density_periods.push((start_time, current_density));
-    }
-    density_periods.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let mut filtered: Vec<(i64, i64)> = Vec::new();
-    for (start_time, density) in density_periods {
-        let mut valid = true;
-        for (selected_start, _) in &filtered {
-            let overlap = (selected_start + window_size).min(start_time + window_size)
-                - (*selected_start).max(start_time);
-            if overlap > max_overlap {
-                valid = false;
-                break;
-            }
-        }
-        if valid {
-            filtered.push((start_time, density));
-            if filtered.len() == top_n {
-                break;
-            }
-        }
-    }
-
-    filtered
-        .into_iter()
-        .map(|(start_time, density): (i64, i64)| {
-            let start = (start_time - 30).max(0);
-            let end = start_time + window_size + 30;
-            ClipInterval {
-                start_offset: start,
-                end_offset: end.max(start),
-                peak_count: density,
-            }
-        })
-        .filter(|interval| interval.end_offset - interval.start_offset >= 60)
-        .collect()
-}
-
-fn merge_overlapping_intervals(mut intervals: Vec<ClipInterval>) -> Vec<ClipInterval> {
-    if intervals.is_empty() {
-        return intervals;
-    }
-    intervals.sort_by_key(|interval| interval.start_offset);
-    let mut merged = Vec::new();
-    let mut current = intervals[0].clone();
-    for interval in intervals.into_iter().skip(1) {
-        if interval.start_offset <= current.end_offset {
-            if interval.end_offset > current.end_offset {
-                current.end_offset = interval.end_offset;
-            }
-            if interval.peak_count > current.peak_count {
-                current.peak_count = interval.peak_count;
-            }
-        } else {
-            merged.push(current);
-            current = interval;
-        }
-    }
-    merged.push(current);
-    merged
-}
-
-fn locate_segment_for_offset(
+pub(crate) fn locate_segment_for_offset(
     segments: &[LiveRecordSegment],
     offset: i64,
 ) -> Option<(LiveRecordSegment, i64, i64)> {
@@ -1875,19 +1398,4 @@ fn locate_segment_for_offset(
         }
     }
     None
-}
-
-fn build_clip_file_name(index: usize, start_offset: i64, end_offset: i64) -> String {
-    let start = format_hms(start_offset);
-    let end = format_hms(end_offset);
-    let raw = format!("clip_{:03}_{}-{}", index, start, end);
-    format!("{}.mp4", sanitize_filename(&raw))
-}
-
-fn format_hms(seconds: i64) -> String {
-    let total = seconds.max(0);
-    let hours = total / 3600;
-    let minutes = (total % 3600) / 60;
-    let secs = total % 60;
-    format!("{:02}_{:02}_{:02}", hours, minutes, secs)
 }
