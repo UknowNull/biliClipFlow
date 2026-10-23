@@ -2,8 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import LoadingButton from "../components/LoadingButton";
-import { showErrorDialog } from "../lib/dialog";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime, parseVideoInput } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
@@ -12,7 +10,6 @@ import CoverCropModal from "../components/CoverCropModal";
 import RemoteImportTaskView from "../components/RemoteImportTaskView";
 import useSubmissionCover from "../hooks/useSubmissionCover";
 import useAppDataChanged from "../lib/useAppDataChanged";
-import { validateSourceVideos } from "../lib/submissionEditDiff";
 import {
   buildSourceId,
   buildMergeGroupId,
@@ -23,12 +20,10 @@ import {
   insertMergeItemClone,
   defaultWorkflowConfig,
   buildMergeItemsFromSources,
-  formatSourceBindingSummary,
   isDownloadUrlInput,
   resolveSourceRemoteInput,
   normalizeUploadPartTitle,
   resolveUploadPartTitleMode,
-  buildSourceVideoPayload,
   resolveUploadPartTitles,
   sanitizeLocalFileName,
   parseDirectVideoUrl,
@@ -36,6 +31,8 @@ import {
 } from "./submission/helpers";
 import SubmissionListView from "./submission/SubmissionListView";
 import SubmissionDetailView from "./submission/SubmissionDetailView";
+import SubmissionCreateView from "./submission/SubmissionCreateView";
+import SubmissionUpdateView from "./submission/SubmissionUpdateView";
 
 export default function SubmissionSection({
   activeBilibiliUid = "",
@@ -172,7 +169,7 @@ export default function SubmissionSection({
     path: "",
     filename: "",
   });
-  const [createSubmitting, setCreateSubmitting] = useState(false);
+  
   
   
   const normalizedActiveBilibiliUid = String(activeBilibiliUid || "").trim();
@@ -264,13 +261,13 @@ export default function SubmissionSection({
   const isCreateView = submissionView === "create";
   const isDetailView = submissionView === "detail";
   const isEditView = submissionView === "edit";
-  const isUpdateView = submissionView === "update";
+  
   const isRemoteImportView = submissionView === "remoteImport";
   const canModifySelectedTask = isEditView;
-  const isReadOnly = isDetailView;
+  
   const selectedTaskHasBvid = Boolean(String(selectedTask?.task?.bvid || "").trim());
   const canSyncRemoteEdit = selectedTaskHasBvid;
-  const groupedSourceIds = buildGroupedSourceIdSet(mergeItems);
+  
   const uploadTitleHints = resolveUploadPartTitles(mergeItems, sourceVideos);
   const quickFillPageSize = 10;
   
@@ -680,12 +677,7 @@ export default function SubmissionSection({
   };
 
   
-  const closeUpdateModal = () => {
-    setSubmissionView("list");
-    resetUpdateState();
-    setMessage("");
-  };
-
+  
   
   
   
@@ -1633,12 +1625,7 @@ export default function SubmissionSection({
     setSourceVideos((prev) => [...prev, emptySource(prev.length)]);
   };
 
-  const openSourceRemotePicker = (target, index) => {
-    setSourceRemotePickerTarget(target);
-    setSourceRemotePickerIndex(index);
-    setSourceRemotePickerOpen(true);
-  };
-
+  
   const closeSourceRemotePicker = () => {
     setSourceRemotePickerOpen(false);
     setSourceRemotePickerIndex(-1);
@@ -1743,16 +1730,7 @@ export default function SubmissionSection({
     );
   };
 
-  const updateMergeGroupTitle = (groupId, value) => {
-    setMergeItems((prev) =>
-      prev.map((item) =>
-        item.type === "GROUP" && item.id === groupId
-          ? applyUploadTitle(item, value)
-          : item,
-      ),
-    );
-  };
-
+  
   const updateSourceTime = (index, field, value) => {
     setSourceVideos((prev) =>
       prev.map((item, idx) => {
@@ -1826,110 +1804,10 @@ export default function SubmissionSection({
     return next;
   };
 
-  const toggleMergeSelection = (sourceId, checked, items = mergeItems) => {
-    const grouped = buildGroupedSourceIdSet(items);
-    if (grouped.has(sourceId)) {
-      return;
-    }
-    const item = items.find((i) => i.type === "SOURCE" && i.sourceId === sourceId);
-    if (item?.standalone) {
-      return;
-    }
-    setMergeSelection((prev) => {
-      const next = new Set(prev);
-      if (checked) {
-        next.add(sourceId);
-      } else {
-        next.delete(sourceId);
-      }
-      return next;
-    });
-  };
-
-  const toggleMergeStandalone = (sourceId) => {
-    setMergeItems((prev) =>
-      prev.map((item) => {
-        if (item.type !== "SOURCE" || item.sourceId !== sourceId) {
-          return item;
-        }
-        const next = { ...item, standalone: !item.standalone };
-        if (next.standalone) {
-          setMergeSelection((sel) => {
-            const s = new Set(sel);
-            s.delete(sourceId);
-            return s;
-          });
-        }
-        return next;
-      }),
-    );
-  };
-
-  const createMergeGroup = () => {
-    const selected = Array.from(mergeSelection);
-    if (selected.length < 2) {
-      setMessage("请至少选择两个源视频进行合并");
-      return;
-    }
-    const selectedSet = new Set(selected);
-    const orderedSelected = sourceVideos
-      .map((item) => item.localId)
-      .filter((id) => selectedSet.has(id));
-    if (orderedSelected.length < 2) {
-      setMessage("请选择有效的源视频进行合并");
-      return;
-    }
-    const groupId = buildMergeGroupId();
-    setMergeItems((prev) => {
-      const next = [];
-      let inserted = false;
-      for (const item of prev) {
-        if (item.type === "SOURCE" && selectedSet.has(item.sourceId)) {
-          if (!inserted) {
-            next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected });
-            inserted = true;
-          }
-          continue;
-        }
-        next.push(item);
-      }
-      if (!inserted) {
-        next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected });
-      }
-      return next;
-    });
-    setMergeSelection(new Set());
-  };
-
-  const releaseMergeGroup = (groupId) => {
-    const normalizedGroupId = String(groupId || "").trim();
-    if (!normalizedGroupId) {
-      return;
-    }
-    setMergeItems((prev) => {
-      const next = [];
-      const releasedIds = [];
-      for (const item of prev) {
-        if (item.id !== normalizedGroupId || item.type !== "GROUP") {
-          next.push(item);
-          continue;
-        }
-        (item.sourceIds || []).forEach((sourceId) => {
-          releasedIds.push(sourceId);
-          next.push({ id: sourceId, type: "SOURCE", sourceId, standalone: false });
-        });
-      }
-      if (releasedIds.length > 0) {
-        setMergeSelection((selection) => {
-          const filtered = new Set(selection);
-          releasedIds.forEach((id) => filtered.delete(id));
-          return filtered;
-        });
-      }
-      return syncMergeItemsWithSources(sourceVideos, next);
-    });
-  };
-
+  
+  
+  
+  
   const reorderMergeItems = (sourceId, targetId) => {
     const normalizedSourceId = String(sourceId || "").trim();
     const normalizedTargetId = String(targetId || "").trim();
@@ -1949,23 +1827,7 @@ export default function SubmissionSection({
     });
   };
 
-  const handleMergeItemPointerDown = (event, itemId) => {
-    if (event.button !== 0) {
-      return;
-    }
-    const normalizedId = String(itemId || "").trim();
-    if (!normalizedId) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.currentTarget?.setPointerCapture) {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    }
-    mergeDragStateRef.current = { activeId: normalizedId, overId: normalizedId };
-    setDraggingMergeItemId(normalizedId);
-  };
-
+  
   const trackPointerOverMergeItem = (event) => {
     const { activeId } = mergeDragStateRef.current;
     if (!activeId) {
@@ -2025,28 +1887,7 @@ export default function SubmissionSection({
     );
   };
 
-  const handleMergeGroupSourcePointerDown = (event, groupId, sourceId) => {
-    if (event.button !== 0) {
-      return;
-    }
-    const normalizedGroupId = String(groupId || "").trim();
-    const normalizedSourceId = String(sourceId || "").trim();
-    if (!normalizedGroupId || !normalizedSourceId) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.currentTarget?.setPointerCapture) {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    }
-    mergeGroupDragStateRef.current = {
-      groupId: normalizedGroupId,
-      activeId: normalizedSourceId,
-      overId: normalizedSourceId,
-    };
-    setDraggingMergeGroupSource({ groupId: normalizedGroupId, sourceId: normalizedSourceId });
-  };
-
+  
   const trackPointerOverMergeGroupSource = (event) => {
     const { groupId, activeId } = mergeGroupDragStateRef.current;
     if (!groupId || !activeId) {
@@ -2183,472 +2024,21 @@ export default function SubmissionSection({
     return groups;
   };
 
-  const toggleUpdateMergeSelection = (sourceId, checked) => {
-    const grouped = buildGroupedSourceIdSet(updateMergeItems);
-    if (grouped.has(sourceId)) {
-      return;
-    }
-    const item = updateMergeItems.find(
-      (candidate) => candidate.type === "SOURCE" && candidate.sourceId === sourceId,
-    );
-    if (item?.standalone) {
-      return;
-    }
-    setUpdateMergeSelection((prev) => {
-      const next = new Set(prev);
-      if (checked) {
-        next.add(sourceId);
-      } else {
-        next.delete(sourceId);
-      }
-      return next;
-    });
-  };
-
-  const toggleUpdateMergeStandalone = (sourceId) => {
-    setUpdateMergeItems((prev) =>
-      prev.map((item) => {
-        if (item.type !== "SOURCE" || item.sourceId !== sourceId) {
-          return item;
-        }
-        const next = { ...item, standalone: !item.standalone };
-        if (next.standalone) {
-          setUpdateMergeSelection((selection) => {
-            const nextSelection = new Set(selection);
-            nextSelection.delete(sourceId);
-            return nextSelection;
-          });
-        }
-        return next;
-      }),
-    );
-  };
-
-  const createUpdateMergeGroup = () => {
-    const selected = Array.from(updateMergeSelection);
-    if (selected.length < 2) {
-      setMessage("请至少选择两个源视频进行合并");
-      return;
-    }
-    const selectedSet = new Set(selected);
-    const orderedSelected = updateSourceVideos
-      .map((item) => item.localId)
-      .filter((id) => selectedSet.has(id));
-    if (orderedSelected.length < 2) {
-      setMessage("请选择有效的源视频进行合并");
-      return;
-    }
-    const groupId = buildMergeGroupId();
-    setUpdateMergeItems((prev) => {
-      const next = [];
-      let inserted = false;
-      for (const item of prev) {
-        if (item.type === "SOURCE" && selectedSet.has(item.sourceId)) {
-          if (!inserted) {
-            next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected });
-            inserted = true;
-          }
-          continue;
-        }
-        next.push(item);
-      }
-      if (!inserted) {
-        next.push({ id: groupId, type: "GROUP", sourceIds: orderedSelected });
-      }
-      return next;
-    });
-    setUpdateMergeSelection(new Set());
-  };
-
-  const releaseUpdateMergeGroup = (groupId) => {
-    const normalizedGroupId = String(groupId || "").trim();
-    if (!normalizedGroupId) {
-      return;
-    }
-    setUpdateMergeItems((prev) => {
-      const next = [];
-      const releasedIds = [];
-      for (const item of prev) {
-        if (item.id !== normalizedGroupId || item.type !== "GROUP") {
-          next.push(item);
-          continue;
-        }
-        (item.sourceIds || []).forEach((sourceId) => {
-          releasedIds.push(sourceId);
-          next.push({ id: sourceId, type: "SOURCE", sourceId, standalone: false });
-        });
-      }
-      if (releasedIds.length > 0) {
-        setUpdateMergeSelection((selection) => {
-          const filtered = new Set(selection);
-          releasedIds.forEach((id) => filtered.delete(id));
-          return filtered;
-        });
-      }
-      return syncMergeItemsWithSources(updateSourceVideos, next);
-    });
-  };
-
-  const resolveSourceIndexById = (sourceId) =>
-    sourceVideos.findIndex((item) => item.localId === sourceId);
-
-  const renderMergeSourceRow = ({
-    sourceId,
-    displayIndex,
-    groupId = "",
-    mergeItemId = "",
-  }) => {
-    const sourceIndex = resolveSourceIndexById(sourceId);
-    if (sourceIndex < 0) {
-      return null;
-    }
-    const source = sourceVideos[sourceIndex];
-    const isGroupedRow = Boolean(groupId);
-    const activeMergeId = mergeItemId || sourceId;
-    const mergeItem = !isGroupedRow ? mergeItems.find((i) => i.type === "SOURCE" && i.sourceId === sourceId) : null;
-    const isStandalone = mergeItem?.standalone ?? false;
-    const isDragging =
-      isGroupedRow
-        ? draggingMergeGroupSource.groupId === groupId &&
-          draggingMergeGroupSource.sourceId === sourceId
-        : draggingMergeItemId === activeMergeId;
-    const dragHandle = isReadOnly ? null : (
-      <span
-        className="cursor-grab select-none text-[var(--muted)]"
-        onPointerDown={(event) => {
-          if (isGroupedRow) {
-            handleMergeGroupSourcePointerDown(event, groupId, sourceId);
-            return;
-          }
-          handleMergeItemPointerDown(event, activeMergeId);
-        }}
-        style={{ touchAction: "none" }}
-      >
-        ≡
-      </span>
-    );
-
-    return (
-      <tr
-        key={`${groupId || "single"}-${sourceId}`}
-        data-merge-item-id={!isGroupedRow ? activeMergeId : undefined}
-        data-merge-group-id={isGroupedRow ? groupId : undefined}
-        data-merge-source-id={isGroupedRow ? sourceId : undefined}
-        className={`border-t border-black/5 ${isDragging ? "bg-black/5" : ""}`}
-      >
-        <td className="px-4 py-2 text-[var(--muted)]">
-          <div className="flex items-center gap-2">
-            {dragHandle}
-            <span>{displayIndex}</span>
-          </div>
-        </td>
-        <td className="px-4 py-2">
-          <input
-            type="checkbox"
-            checked={mergeSelection.has(sourceId)}
-            onChange={(event) => toggleMergeSelection(sourceId, event.target.checked)}
-            disabled={isReadOnly || groupedSourceIds.has(sourceId) || isStandalone}
-          />
-        </td>
-        <td className="px-4 py-2">
-          {!isGroupedRow ? (
-            <input
-              type="checkbox"
-              title="独立分组"
-              checked={isStandalone}
-              onChange={() => toggleMergeStandalone(sourceId)}
-              disabled={isReadOnly}
-            />
-          ) : (
-            <input type="checkbox" disabled checked={false} title="合并组内不可独立分组" />
-          )}
-        </td>
-        <td className="px-4 py-2">
-          <div className="flex flex-wrap gap-2">
-            <input
-              value={source.sourceFilePath}
-              onChange={(event) => updateSource(sourceIndex, "sourceFilePath", event.target.value)}
-              placeholder="请输入视频文件路径（必填）"
-              readOnly={isReadOnly}
-              className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-            />
-            {!isReadOnly ? (
-              <>
-                <button
-                  className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
-                  onClick={() => openFileDialog(sourceIndex)}
-                >
-                  本地
-                </button>
-                <button
-                  type="button"
-                  className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
-                  onClick={() => openSourceRemotePicker("create", sourceIndex)}
-                >
-                  网盘
-                </button>
-              </>
-            ) : null}
-          </div>
-        </td>
-        <td className="px-4 py-2">
-          <div className="space-y-2">
-            <div className="flex flex-wrap gap-2">
-              <input
-                value={resolveSourceRemoteInput(source)}
-                onChange={(event) => updateSource(sourceIndex, "remoteBvid", event.target.value)}
-                placeholder="可选，填写源视频 BV 号或下载链接"
-                readOnly={isReadOnly}
-                className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-              />
-              {!isReadOnly ? (
-                <button
-                  type="button"
-                  className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
-                  onClick={() =>
-                    isDirectSourceInput(resolveSourceRemoteInput(source))
-                      ? applySourceDownloadUrlBinding("create", sourceIndex)
-                      : handleChooseSourceRemotePart("create", sourceIndex)
-                  }
-                  disabled={sourcePartPickerLoadingId === source.localId}
-                >
-                  {sourcePartPickerLoadingId === source.localId
-                    ? "查询中"
-                    : isDirectSourceInput(resolveSourceRemoteInput(source))
-                      ? "保存"
-                      : "选择分P"}
-                </button>
-              ) : null}
-            </div>
-            {formatSourceBindingSummary(source) ? (
-              <div className="text-xs text-[var(--muted)]">
-                {formatSourceBindingSummary(source)}
-              </div>
-            ) : null}
-          </div>
-        </td>
-        <td className="px-4 py-2 text-[var(--muted)]">
-          {source.sourceType === "BAIDU"
-            ? source.remotePath || "网盘视频"
-            : source.remotePartTitle ||
-            (source.remoteBvid
-              ? "未指定分P"
-              : source.remoteVideoUrl
-                ? "下载链接"
-                : "-")}
-        </td>
-        <td className="px-4 py-2">
-          {isGroupedRow ? (
-            <span className="text-xs text-[var(--muted)]">见合并组标题</span>
-          ) : (
-            <input
-              value={source.uploadPartTitleMode === "CUSTOM" ? source.uploadPartTitle || "" : ""}
-              onChange={(event) => updateSourceUploadTitle(sourceIndex, event.target.value)}
-              maxLength={80}
-              placeholder={
-                segmentationEnabled
-                  ? "分段开启时自动分P"
-                  : uploadTitleHints.sourceTitleMap.get(sourceId) || "P1"
-              }
-              title={segmentationEnabled ? "分段开启时使用自动分P标题" : ""}
-              readOnly={isReadOnly}
-              disabled={segmentationEnabled}
-              className="w-32 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
-            />
-          )}
-        </td>
-        <td className="px-4 py-2">
-          <input
-            value={source.startTime}
-            onChange={(event) => updateSourceTime(sourceIndex, "startTime", event.target.value)}
-            onBlur={() => normalizeSourceTime(sourceIndex, "startTime")}
-            placeholder="00:00:00"
-            readOnly={isReadOnly}
-            className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-          />
-        </td>
-        <td className="px-4 py-2">
-          <input
-            value={source.endTime}
-            onChange={(event) => updateSourceTime(sourceIndex, "endTime", event.target.value)}
-            onBlur={() => normalizeSourceTime(sourceIndex, "endTime")}
-            placeholder="00:00:00"
-            readOnly={isReadOnly}
-            className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-          />
-        </td>
-        <td className="px-4 py-2 text-[var(--muted)]">
-          {groupedSourceIds.has(sourceId) ? "已合并" : "未合并"}
-        </td>
-        <td className="px-4 py-2">
-          {!isReadOnly ? (
-            <div className="flex flex-wrap gap-2">
-              <button
-                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                onClick={() => duplicateSource(sourceIndex)}
-              >
-                复制
-              </button>
-              <button
-                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                onClick={() => removeSource(sourceIndex)}
-              >
-                删除
-              </button>
-            </div>
-          ) : null}
-        </td>
-      </tr>
-    );
-  };
-
-  const addUpdateSource = () => {
-    setUpdateSourceVideos((prev) => {
-      const next = [...prev, emptySource(prev.length)];
-      setUpdateMergeItems((items) => syncMergeItemsWithSources(next, items));
-      return next;
-    });
-  };
-
-  const duplicateUpdateSource = (index) => {
-    setUpdateSourceVideos((prev) => {
-      const target = prev[index];
-      if (!target) {
-        return prev;
-      }
-      const next = insertSourceBelow(prev, index, target);
-      const clonedSource = next[index + 1];
-      setUpdateMergeItems((items) => {
-        let merged = syncMergeItemsWithSources(next, items);
-        if (clonedSource?.localId && target.localId) {
-          merged = insertMergeItemClone(merged, target.localId, clonedSource.localId);
-        }
-        return merged;
-      });
-      setUpdateMergeSelection((selection) => {
-        const nextSelection = new Set(selection);
-        if (clonedSource?.localId) {
-          nextSelection.delete(clonedSource.localId);
-        }
-        return nextSelection;
-      });
-      return next;
-    });
-  };
-
-  const updateUpdateSource = (index, field, value) => {
-    setUpdateSourceVideos((prev) =>
-      prev.map((item, idx) => {
-        if (idx !== index) {
-          return item;
-        }
-        if (field === "remoteBvid") {
-          if (isDownloadUrlInput(value)) {
-            return {
-              ...item,
-              remoteVideoUrl: value,
-              remoteBvid: "",
-              remoteAid: 0,
-              remoteCid: 0,
-              remotePartTitle: "",
-            };
-          }
-          return {
-            ...item,
-            remoteVideoUrl: "",
-            remoteBvid: value,
-            remoteAid: 0,
-            remoteCid: 0,
-            remotePartTitle: "",
-          };
-        }
-        return { ...item, [field]: value };
-      }),
-    );
-  };
-
-  const updateUpdateSourceUploadTitle = (index, value) => {
-    setUpdateSourceVideos((prev) =>
-      prev.map((item, idx) => (idx === index ? applyUploadTitle(item, value) : item)),
-    );
-  };
-
-  const updateUpdateSourceTime = (index, field, value) => {
-    setUpdateSourceVideos((prev) =>
-      prev.map((item, idx) => {
-        if (idx !== index) {
-          return item;
-        }
-        return { ...item, [field]: value };
-      }),
-    );
-  };
-
-  const normalizeUpdateSourceTime = (index, field) => {
-    setUpdateSourceVideos((prev) =>
-      prev.map((item, idx) => {
-        if (idx !== index) {
-          return item;
-        }
-        const normalized = normalizeTimeValue(item[field], item.durationSeconds);
-        if (!normalized) {
-          return { ...item, [field]: formatDurationHms(0) };
-        }
-        return { ...item, [field]: normalized };
-      }),
-    );
-  };
-
-  const removeUpdateSource = (index) => {
-    setUpdateSourceVideos((prev) => {
-      const next = prev
-        .filter((_, idx) => idx !== index)
-        .map((item, idx) => ({ ...item, sortOrder: idx + 1 }));
-      const removed = prev[index];
-      setUpdateMergeItems((items) => syncMergeItemsWithSources(next, items));
-      if (removed?.localId) {
-        setUpdateMergeSelection((selection) => {
-          const nextSelection = new Set(selection);
-          nextSelection.delete(removed.localId);
-          return nextSelection;
-        });
-      }
-      return next;
-    });
-  };
-
-  const buildWorkflowConfig = (mergeGroups) => {
-    const config = {
-      enableSegmentation: segmentationEnabled,
-      segmentationConfig: {
-        enabled: segmentationEnabled,
-        segmentDurationSeconds: workflowConfig.segmentationConfig.segmentDurationSeconds,
-        preserveOriginal: workflowConfig.segmentationConfig.preserveOriginal,
-      },
-    };
-    if (Array.isArray(mergeGroups) && mergeGroups.length > 0) {
-      config.mergeGroups = mergeGroups;
-    }
-    return config;
-  };
-
-  const buildUpdateWorkflowConfig = (mergeGroups = []) => {
-    const prefix = updateSegmentPrefix.trim();
-    const config = {
-      enableSegmentation: updateSegmentationEnabled,
-      segmentationConfig: {
-        enabled: updateSegmentationEnabled,
-        segmentDurationSeconds: updateWorkflowConfig.segmentationConfig.segmentDurationSeconds,
-        preserveOriginal: updateWorkflowConfig.segmentationConfig.preserveOriginal,
-      },
-      segmentPrefix: prefix ? prefix : null,
-    };
-    if (Array.isArray(mergeGroups) && mergeGroups.length > 0) {
-      config.mergeGroups = mergeGroups;
-    }
-    return config;
-  };
-
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
   const addTag = (value) => {
     const nextTag = value.trim();
     if (!nextTag) {
@@ -2681,207 +2071,8 @@ export default function SubmissionSection({
     setTagInput("");
   };
 
-  const handleCreate = async () => {
-    if (createSubmitting) {
-      return;
-    }
-    setMessage("");
-    if (!taskForm.title.trim()) {
-      setMessage("请输入投稿标题");
-      return;
-    }
-    if (taskForm.title.length > 80) {
-      setMessage("投稿标题不能超过 80 个字符");
-      return;
-    }
-    if (!taskForm.partitionId) {
-      setMessage("请选择B站分区");
-      return;
-    }
-    if (!taskForm.videoType) {
-      setMessage("请选择视频类型");
-      return;
-    }
-    if (taskForm.description && taskForm.description.length > 2000) {
-      setMessage("视频描述不能超过 2000 个字符");
-      return;
-    }
-    const normalizedTags = [...tags];
-    if (tagInput.trim()) {
-      normalizedTags.push(tagInput.trim());
-    }
-    const uniqueTags = Array.from(new Set(normalizedTags));
-    if (uniqueTags.length === 0) {
-      setMessage("请填写至少一个投稿标签");
-      return;
-    }
-    if (segmentationEnabled) {
-      const segmentDuration = workflowConfig.segmentationConfig.segmentDurationSeconds;
-      if (segmentDuration < 30 || segmentDuration > 600) {
-        setMessage("分段时长必须在 30-600 秒之间");
-        return;
-      }
-    }
-    const sourceValidation = validateSourceVideos({
-      items: sourceVideos,
-      parseHmsToSeconds,
-      isVideoFilePath,
-    });
-    if (!sourceValidation.valid) {
-      setMessage(sourceValidation.message);
-      return;
-    }
-    const validSources = sourceValidation.validSources;
-    try {
-      const auth = await invokeCommand("auth_status");
-      if (!auth?.loggedIn) {
-        setMessage("请先登录B站账号");
-        return;
-      }
-      const targetBilibiliUid = Number(selectedBilibiliUid || auth?.activeAccount?.userId || 0);
-      if (!Number.isFinite(targetBilibiliUid) || targetBilibiliUid <= 0) {
-        setMessage("请选择投稿账号");
-        return;
-      }
-      if (taskForm.baiduSyncEnabled) {
-        const binding = await invokeCommand("account_binding_get", {
-          bilibiliUid: targetBilibiliUid,
-        });
-        if (!binding?.baiduUid) {
-          setMessage("当前投稿账号未绑定网盘账号");
-          return;
-        }
-      }
-    } catch (error) {
-      setMessage(error.message || "登录状态校验失败");
-      return;
-    }
-    setCreateSubmitting(true);
-    try {
-      const selectedCollectionId = (() => {
-        const raw = String(taskForm.collectionId || "").trim();
-        if (!raw) {
-          return null;
-        }
-        const exists = collections.some(
-          (collection) => String(collection.seasonId) === raw,
-        );
-        if (!exists) {
-          return null;
-        }
-        const parsed = Number(raw);
-        return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-      })();
-      const selectedCollectionSectionId = (() => {
-        if (!selectedCollectionId) {
-          return null;
-        }
-        const raw = String(taskForm.collectionSectionId || "").trim();
-        if (!raw) {
-          return null;
-        }
-        const collection = collections.find(
-          (item) => Number(item.seasonId) === selectedCollectionId,
-        );
-        const exists = (collection?.sections || []).some(
-          (section) => String(section.sectionId) === raw,
-        );
-        if (!exists) {
-          return null;
-        }
-        const parsed = Number(raw);
-        return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-      })();
-      const mergeGroups = buildMergeGroupsPayload(validSources);
-      const payload = {
-        request: {
-            task: {
-              title: taskForm.title,
-              description: taskForm.description || null,
-            coverUrl: taskForm.coverUrl || null,
-            coverDataUrl: taskForm.coverDataUrl || null,
-            partitionId: Number(taskForm.partitionId),
-            collectionId: selectedCollectionId,
-            collectionSectionId: selectedCollectionSectionId,
-            tags: uniqueTags.join(","),
-            topicId: taskForm.activityTopicId ? Number(taskForm.activityTopicId) : null,
-            missionId: taskForm.activityMissionId ? Number(taskForm.activityMissionId) : null,
-            activityTitle: taskForm.activityTitle || null,
-            videoType: taskForm.videoType,
-            bilibiliUid: selectedBilibiliUid ? Number(selectedBilibiliUid) : null,
-            segmentPrefix: taskForm.segmentPrefix || null,
-            immediateSubmit: Boolean(taskForm.immediateSubmit),
-            priority: Boolean(taskForm.priority),
-            baiduSyncEnabled: Boolean(taskForm.baiduSyncEnabled),
-            baiduSyncPath: taskForm.baiduSyncPath || null,
-            baiduSyncFilename: taskForm.baiduSyncFilename || null,
-          },
-          sourceVideos: validSources.map(buildSourceVideoPayload),
-          workflowConfig: buildWorkflowConfig(mergeGroups),
-        },
-      };
-      await invokeCommand("submission_create", payload);
-      await loadTasks();
-      setSubmissionView("list");
-      setMessage("");
-    } catch (error) {
-      setMessage(error.message);
-      await showErrorDialog(error);
-    } finally {
-      setCreateSubmitting(false);
-    }
-  };
-
-  const handleUpdateSubmit = async () => {
-    if (updateSubmitting) {
-      return;
-    }
-    setMessage("");
-    const taskId = updateTaskId.trim();
-    if (!taskId) {
-      setMessage("任务ID无效");
-      return;
-    }
-    if (updateSegmentationEnabled) {
-      const segmentDuration = updateWorkflowConfig.segmentationConfig.segmentDurationSeconds;
-      if (segmentDuration < 30 || segmentDuration > 600) {
-        setMessage("分段时长必须在 30-600 秒之间");
-        return;
-      }
-    }
-    const sourceValidation = validateSourceVideos({
-      items: updateSourceVideos,
-      parseHmsToSeconds,
-      isVideoFilePath,
-    });
-    if (!sourceValidation.valid) {
-      setMessage(sourceValidation.message);
-      return;
-    }
-    const validSources = sourceValidation.validSources;
-    const mergeGroups = buildMergeGroupsPayload(validSources, updateMergeItems);
-    setUpdateSubmitting(true);
-    try {
-      const payload = {
-        request: {
-          taskId,
-          baiduSyncEnabled: Boolean(updateBaiduSync.enabled),
-          baiduSyncPath: updateBaiduSync.path || null,
-          baiduSyncFilename: updateBaiduSync.filename || null,
-          sourceVideos: validSources.map(buildSourceVideoPayload),
-          workflowConfig: buildUpdateWorkflowConfig(mergeGroups),
-        },
-      };
-      await invokeCommand("submission_update", payload);
-      closeUpdateModal();
-      await loadTasks(statusFilter, currentPage, pageSize);
-    } catch (error) {
-      setMessage(error.message);
-    } finally {
-      setUpdateSubmitting(false);
-    }
-  };
-
+  
+  
   const handleSelectSourceFile = async (index) => {
     setMessage("");
     try {
@@ -2925,49 +2116,7 @@ export default function SubmissionSection({
     }
   };
 
-  const handleUpdateSelectSourceFile = async (index) => {
-    setMessage("");
-    try {
-      const selected = await openDialog({
-        multiple: false,
-        directory: false,
-        filters: [
-          {
-            name: "视频文件",
-            extensions: ["mp4", "mkv", "mov", "flv", "avi", "webm"],
-          },
-        ],
-      });
-      if (typeof selected !== "string") {
-        return;
-      }
-      const duration = await invokeCommand("video_duration", { path: selected });
-      const durationSeconds = Number(duration) || 0;
-      setUpdateSourceVideos((prev) =>
-        prev.map((item, idx) => {
-          if (idx !== index) {
-            return item;
-          }
-          const endTime = durationSeconds
-            ? formatDurationHms(durationSeconds)
-            : item.endTime;
-          const startTime = normalizeTimeValue(item.startTime, durationSeconds) || "00:00:00";
-          return {
-            ...item,
-            sourceType: "LOCAL",
-            sourceFilePath: selected,
-            remotePath: "",
-            durationSeconds,
-            startTime,
-            endTime,
-          };
-        }),
-      );
-    } catch (error) {
-      setMessage(error.message);
-    }
-  };
-
+  
   const buildUpdateImportedSourcePath = (preview, page) =>
     preview?.sourceType === "DIRECT"
       ? (() => {
@@ -2985,23 +2134,7 @@ export default function SubmissionSection({
         })()
       : buildIntegratedSourceFilePath(updateTaskDir, preview, page);
 
-  const openUpdateImportModal = () => {
-    if (!String(updateTaskId || "").trim()) {
-      setMessage("任务ID无效");
-      return;
-    }
-    if (!String(updateTaskDir || "").trim()) {
-      setMessage("任务目录未就绪，请重新进入视频更新页面后重试");
-      return;
-    }
-    setUpdateImportOpen(true);
-    setUpdateImportInput("");
-    setUpdateImportLoading(false);
-    setUpdateImportResults([]);
-    setUpdateImportSelection(new Set());
-    setMessage("");
-  };
-
+  
   const closeUpdateImportModal = () => {
     if (updateImportLoading) {
       return;
@@ -3225,17 +2358,7 @@ export default function SubmissionSection({
     setActivityDropdownOpen(false);
   };
 
-  const openQuickFill = () => {
-    if (isReadOnly) {
-      return;
-    }
-    setMessage("");
-    setQuickFillTasks([]);
-    setQuickFillTotal(0);
-    setQuickFillPage(1);
-    setQuickFillOpen(true);
-  };
-
+  
   const closeQuickFill = () => {
     setQuickFillOpen(false);
   };
@@ -3911,20 +3034,9 @@ export default function SubmissionSection({
     segmentationEnabled && segmentDurationSeconds > 0
       ? Math.ceil(totalClipSeconds / segmentDurationSeconds)
       : 0;
-  const updateTotalClipSeconds = updateSourceVideos.reduce((acc, item) => {
-    const start = parseHmsToSeconds(item.startTime) ?? 0;
-    const endRaw = parseHmsToSeconds(item.endTime) ?? 0;
-    const end = clampTimeSeconds(endRaw, item.durationSeconds);
-    const clipped = Math.max(0, end - clampTimeSeconds(start, item.durationSeconds));
-    return acc + clipped;
-  }, 0);
-  const updateSegmentDurationSeconds =
-    Number(updateWorkflowConfig.segmentationConfig.segmentDurationSeconds) || 0;
-  const updateEstimatedSegments =
-    updateSegmentationEnabled && updateSegmentDurationSeconds > 0
-      ? Math.ceil(updateTotalClipSeconds / updateSegmentDurationSeconds)
-      : 0;
-
+  
+  
+  
   
   
   
@@ -4360,563 +3472,83 @@ export default function SubmissionSection({
 
   return (
     <div className="space-y-6">
-      {isCreateView ? (
-        <>
-          <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">
-                  视频投稿
-                </p>
-                <h2 className="text-2xl font-semibold text-[var(--ink)]">新增投稿任务</h2>
-              </div>
-              <button
-                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
-                onClick={backToList}
-              >
-                返回列表
-              </button>
-            </div>
-            <div className="mt-4 space-y-3">
-              <div className="rounded-xl bg-white/70 px-3 py-2 text-sm text-[var(--content-color)]">
-                当前投稿账号：
-                <span className="ml-2 font-semibold">
-                  {currentUpProfile?.name || "未选择"}
-                </span>
-                <span className="ml-2 text-xs text-[var(--muted)]">
-                  UID {currentUpProfile?.uid || "—"}
-                </span>
-              </div>
-              <div className="space-y-1">
-                <div className="flex items-center justify-between text-xs text-[var(--muted)]">
-                  <div>
-                    投稿标题<span className="ml-1 text-rose-500">必填</span>
-                  </div>
-                  {!isReadOnly ? (
-                    <button
-                      className="rounded-full border border-black/10 bg-white px-2 py-1 text-[10px] font-semibold text-[var(--ink)]"
-                      onClick={openQuickFill}
-                    >
-                      一键填写
-                    </button>
-                  ) : null}
-                </div>
-                <input
-                  value={taskForm.title}
-                  onChange={(event) =>
-                    setTaskForm((prev) => ({ ...prev, title: event.target.value }))
-                  }
-                  placeholder="请输入投稿标题"
-                  readOnly={isReadOnly}
-                  className="w-full rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
-                />
-              </div>
-              <div className="space-y-1">
-                <div className="text-xs text-[var(--muted)]">视频描述（可选）</div>
-                <textarea
-                  value={taskForm.description}
-                  onChange={(event) =>
-                    setTaskForm((prev) => ({ ...prev, description: event.target.value }))
-                  }
-                  placeholder="视频描述"
-                  rows={2}
-                  readOnly={isReadOnly}
-                  className="w-full rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
-	                />
-	              </div>
-	              <div className="space-y-2">
-	                <div className="text-xs text-[var(--muted)]">视频封面（本地裁剪上传）</div>
-	                <div className="flex flex-wrap items-center gap-3">
-	                  <div className="h-[120px] w-[192px] overflow-hidden rounded-lg border border-black/10 bg-black/5">
-	                    {coverPreviewSrc ? (
-	                      <img
-	                        src={coverPreviewSrc}
-	                        alt="封面预览"
-	                        className="h-full w-full object-cover"
-	                      />
-	                    ) : (
-	                      <div className="flex h-full items-center justify-center text-xs text-[var(--muted)]">
-	                        暂无封面
-	                      </div>
-	                    )}
-	                  </div>
-	                  <div className="flex flex-wrap gap-2">
-	                    <button
-	                      type="button"
-	                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
-	                      onClick={handleSelectCoverFile}
-	                    >
-	                      选择封面
-	                    </button>
-	                    <button
-	                      type="button"
-	                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:opacity-60"
-	                      onClick={handleClearCover}
-	                      disabled={!coverPreviewSrc}
-	                    >
-	                      清空封面
-	                    </button>
-	                  </div>
-	                </div>
-	                <div className="text-xs text-[var(--muted)]">
-	                  裁剪比例固定 16:10，建议最小尺寸 960x600
-	                </div>
-	              </div>
-			          <div className="grid gap-2 lg:grid-cols-3">
-            <div className="space-y-1">
-              <div className="text-xs text-[var(--muted)]">
-                B站分区<span className="ml-1 text-rose-500">必填</span>
-              </div>
-              <select
-                value={partitionSelectValue}
-                onChange={(event) => handlePartitionChange(event.target.value)}
-                disabled={isReadOnly}
-                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-              >
-                <option value="">请选择分区</option>
-                {partitionOptions.map((partition) => (
-                  <option
-                    key={partition.tid}
-                    value={buildPartitionOptionValue(partition)}
-                  >
-                    {partition.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="space-y-1">
-              <div className="text-xs text-[var(--muted)]">合集（可选）</div>
-              <select
-                value={collectionTreeValue}
-                onChange={(event) => handleCollectionTreeChange(event.target.value)}
-                disabled={isReadOnly}
-                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-              >
-                <option value="">请选择合集</option>
-                {collectionOptions.flatMap((collection) => [
-                  <option
-                    key={`collection-${collection.seasonId}`}
-                    value={buildCollectionTreeValue(collection.seasonId)}
-                  >
-                    {collection.name}
-                  </option>,
-                  ...collectionTreeSections(collection).map((section) => (
-                    <option
-                      key={`section-${collection.seasonId}-${section.sectionId}`}
-                      value={buildCollectionTreeValue(collection.seasonId, section.sectionId)}
-                    >
-                      {`　└ ${section.title || `子合集${section.sectionId}`}`}
-                    </option>
-                  )),
-                ])}
-              </select>
-            </div>
-            <div className="space-y-1">
-              <div className="text-xs text-[var(--muted)]">
-                视频类型<span className="ml-1 text-rose-500">必填</span>
-              </div>
-              <select
-                value={taskForm.videoType}
-                onChange={(event) =>
-                  setTaskForm((prev) => ({ ...prev, videoType: event.target.value }))
-                }
-                disabled={isReadOnly}
-                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-              >
-                <option value="ORIGINAL">原创</option>
-                <option value="REPOST">转载</option>
-              </select>
-            </div>
-          </div>
-          <div className="grid gap-2 lg:grid-cols-2">
-            <div className="space-y-1">
-              <div className="text-xs text-[var(--muted)]">
-                投稿标签<span className="ml-1 text-rose-500">必填</span>
-              </div>
-              <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus-within:border-[var(--accent)]">
-                <div className="flex flex-wrap gap-2">
-                  {tags.map((tag) => (
-                    <span
-                      key={tag}
-                      className={resolveTagClassName(tag)}
-                    >
-                      {isActivityTag(tag) ? `#话题 ${tag}` : tag}
-                      {!isReadOnly ? (
-                        <button
-                          className={resolveTagRemoveClassName(tag)}
-                          onClick={() => removeTag(tag)}
-                          title="删除标签"
-                        >
-                          ×
-                        </button>
-                      ) : null}
-                    </span>
-                  ))}
-                  {isReadOnly ? null : (
-                    <input
-                      value={tagInput}
-                      onChange={(event) => setTagInput(event.target.value)}
-                      onKeyDown={handleTagKeyDown}
-                      placeholder="回车添加标签"
-                      className="min-w-[120px] flex-1 bg-transparent text-sm text-[var(--ink)] focus:outline-none"
-                    />
-                  )}
-                </div>
-              </div>
-              {isReadOnly ? null : renderActivityTopicSelector()}
-            </div>
-            <div className="space-y-1">
-              <div className="text-xs text-[var(--muted)]">分段前缀（可选）</div>
-              <input
-                value={taskForm.segmentPrefix}
-                onChange={(event) =>
-                  setTaskForm((prev) => ({ ...prev, segmentPrefix: event.target.value }))
-                }
-                placeholder="分段前缀"
-                readOnly={isReadOnly}
-                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-              />
-            </div>
-          </div>
-          <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
-            <input
-              type="checkbox"
-              checked={taskForm.priority}
-              onChange={(event) =>
-                setTaskForm((prev) => ({
-                  ...prev,
-                  priority: event.target.checked,
-                }))
-              }
-              disabled={isReadOnly}
-            />
-            优先投稿（按最近设置时间参与队列优先级）
-          </label>
-          {!isReadOnly ? (
-            <div className="space-y-2 rounded-xl border border-black/5 bg-white/80 p-3">
-              <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                是否立即投稿
-              </div>
-              <div className="flex flex-wrap gap-4 text-sm text-[var(--muted)]">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    checked={taskForm.immediateSubmit}
-                    onChange={() =>
-                      setTaskForm((prev) => ({ ...prev, immediateSubmit: true }))
-                    }
-                  />
-                  立即投稿
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    checked={!taskForm.immediateSubmit}
-                    onChange={() =>
-                      setTaskForm((prev) => ({ ...prev, immediateSubmit: false }))
-                    }
-                  />
-                  暂不投稿
-                </label>
-              </div>
-            </div>
-          ) : null}
-          <div className="text-xs text-[var(--muted)]">
-            分段前缀会作为分段文件名的前缀（可选）
-          </div>
-          <div className="rounded-xl border border-black/5 bg-white/80 p-3">
-            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-              百度网盘同步
-            </div>
-            <label className="mt-2 flex items-center gap-2 text-sm text-[var(--muted)]">
-              <input
-                type="checkbox"
-                checked={taskForm.baiduSyncEnabled}
-                onChange={(event) =>
-                  setTaskForm((prev) => ({
-                    ...prev,
-                    baiduSyncEnabled: event.target.checked,
-                  }))
-                }
-                disabled={isReadOnly}
-              />
-              投稿完成后同步上传到百度网盘
-            </label>
-            {taskForm.baiduSyncEnabled ? (
-              <div className="mt-3 grid gap-2 lg:grid-cols-2">
-                <div>
-                  <div className="text-xs text-[var(--muted)]">远端路径</div>
-                  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                    <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
-                      {taskForm.baiduSyncPath || defaultBaiduSyncPath || "/录播"}
-                    </div>
-                    <button
-                      className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
-                      onClick={() => handleOpenSyncPicker("create")}
-                      disabled={isReadOnly}
-                    >
-                      选择目录
-                    </button>
-                  </div>
-                </div>
-                <div>
-                  <div className="text-xs text-[var(--muted)]">上传文件名</div>
-                  <input
-                    value={taskForm.baiduSyncFilename}
-                    onChange={(event) =>
-                      setTaskForm((prev) => ({
-                        ...prev,
-                        baiduSyncFilename: event.target.value,
-                      }))
-                    }
-                    placeholder="文件名"
-                    readOnly={isReadOnly}
-                    className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                  />
-                </div>
-              </div>
-            ) : null}
-          </div>
-          <div className="rounded-xl border border-black/5 bg-white/80 p-3">
-            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-              工作流配置
-            </div>
-            <div className="mt-2 space-y-3 text-sm text-[var(--ink)]">
-              <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                是否分段
-              </div>
-              <div className="flex flex-wrap gap-4 text-xs text-[var(--muted)]">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    checked={segmentationEnabled}
-                    onChange={() => setSegmentationEnabled(true)}
-                    disabled={isReadOnly}
-                  />
-                  需要分段
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    checked={!segmentationEnabled}
-                    onChange={() => setSegmentationEnabled(false)}
-                    disabled={isReadOnly}
-                  />
-                  不需要分段
-                </label>
-              </div>
-
-              {segmentationEnabled ? (
-                <div className="grid gap-2 lg:grid-cols-2">
-                  <input
-                    type="number"
-                    value={workflowConfig.segmentationConfig.segmentDurationSeconds}
-                    onChange={(event) =>
-                      setWorkflowConfig((prev) => ({
-                        ...prev,
-                        segmentationConfig: {
-                          ...prev.segmentationConfig,
-                          segmentDurationSeconds: Number(event.target.value),
-                        },
-                      }))
-                    }
-                    placeholder="分段时长（秒）"
-                    readOnly={isReadOnly}
-                    className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                  />
-                  <label className="flex items-center gap-2 text-xs text-[var(--muted)]">
-                    <input
-                      type="checkbox"
-                      checked={workflowConfig.segmentationConfig.preserveOriginal}
-                      onChange={(event) =>
-                        setWorkflowConfig((prev) => ({
-                          ...prev,
-                          segmentationConfig: {
-                            ...prev.segmentationConfig,
-                            preserveOriginal: event.target.checked,
-                          },
-                        }))
-                      }
-                      disabled={isReadOnly}
-                    />
-                    保留合并视频
-                  </label>
-                </div>
-              ) : null}
-              <div className="text-xs text-[var(--muted)]">
-                预计分段数：{segmentationEnabled ? estimatedSegments : "不分段"}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="rounded-2xl bg-white/80 p-6 shadow-sm ring-1 ring-black/5">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">源视频配置</div>
-          {!isReadOnly ? (
-            <div className="flex flex-wrap gap-2">
-              <button
-                className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
-                onClick={addSource}
-              >
-                添加视频
-              </button>
-              <button
-                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
-                onClick={createMergeGroup}
-                disabled={mergeSelection.size < 2}
-              >
-                创建合并组
-              </button>
-            </div>
-          ) : null}
-        </div>
-        <div className="mt-3 overflow-hidden rounded-xl border border-black/5">
-          <table className="w-full text-left text-sm whitespace-nowrap">
-            <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-              <tr>
-                <th className="px-4 py-2">序号</th>
-                <th className="px-4 py-2">选择</th>
-                <th className="px-4 py-2">独立分组</th>
-                          <th className="px-4 py-2">视频文件/网盘路径</th>
-                <th className="px-4 py-2">BV号或下载链接</th>
-                <th className="px-4 py-2">分P标题</th>
-                <th className="px-4 py-2">上传分P标题</th>
-                <th className="px-4 py-2">开始时间</th>
-                <th className="px-4 py-2">结束时间</th>
-                <th className="px-4 py-2">合并状态</th>
-                <th className="px-4 py-2">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {mergeItems.length === 0 ? (
-                <tr>
-                  <td className="px-4 py-3 text-[var(--muted)]" colSpan={11}>
-                    暂无配置
-                  </td>
-                </tr>
-              ) : (
-                mergeItems.map((item, index) => {
-                  if (item.type === "GROUP") {
-                    const groupSources = (item.sourceIds || []).filter(
-                      (sourceId) => resolveSourceIndexById(sourceId) >= 0,
-                    );
-                    if (groupSources.length === 0) {
-                      return null;
-                    }
-                    return (
-                      <tr
-                        key={`merge-group-${item.id}`}
-                        data-merge-item-id={item.id}
-                        className="border-t border-black/5"
-                      >
-                        <td className="p-0" colSpan={11}>
-                          <div className="m-2 overflow-hidden rounded-xl border-2 border-[var(--accent)]/40 bg-white/70">
-                            <div
-                              className={`flex items-center justify-between border-b border-[var(--accent)]/30 bg-[var(--accent)]/10 px-3 py-2 text-xs text-[var(--muted)] ${
-                                isReadOnly ? "" : "cursor-grab"
-                              }`}
-                              onPointerDown={
-                                isReadOnly
-                                  ? undefined
-                                  : (event) => handleMergeItemPointerDown(event, item.id)
-                              }
-                              style={{ touchAction: "none" }}
-                            >
-                              <div className="flex items-center gap-2">
-                                {!isReadOnly ? (
-                                  <span className="select-none text-[var(--ink)]">≡</span>
-                                ) : null}
-                                <span className="uppercase tracking-[0.2em]">
-                                  合并组 {index + 1}
-                                </span>
-                                <span>{groupSources.length} 个视频</span>
-                                <span className="text-[var(--muted)]">上传分P标题</span>
-                                <input
-                                  value={
-                                    item.uploadPartTitleMode === "CUSTOM"
-                                      ? item.uploadPartTitle || ""
-                                      : ""
-                                  }
-                                  onChange={(event) =>
-                                    updateMergeGroupTitle(item.id, event.target.value)
-                                  }
-                                  onPointerDown={(event) => event.stopPropagation()}
-                                  maxLength={80}
-                                  placeholder={
-                                    segmentationEnabled
-                                      ? "分段开启时自动分P"
-                                      : uploadTitleHints.groupTitleMap.get(item.id) || "P1"
-                                  }
-                                  title={
-                                    segmentationEnabled ? "分段开启时使用自动分P标题" : ""
-                                  }
-                                  readOnly={isReadOnly}
-                                  disabled={segmentationEnabled}
-                                  className="w-32 rounded-lg border border-black/10 bg-white/80 px-2 py-1 text-xs text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
-                                />
-                              </div>
-                              {!isReadOnly ? (
-                                <button
-                                  type="button"
-                                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                                  onPointerDown={(event) => event.stopPropagation()}
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    releaseMergeGroup(item.id);
-                                  }}
-                                >
-                                  解绑
-                                </button>
-                              ) : null}
-                            </div>
-                            <table className="w-full text-left text-sm whitespace-nowrap">
-                              <tbody>
-                                {groupSources.map((sourceId, innerIndex) =>
-                                  renderMergeSourceRow({
-                                    sourceId,
-                                    displayIndex: `${index + 1}.${innerIndex + 1}`,
-                                    groupId: item.id,
-                                  }),
-                                )}
-                              </tbody>
-                            </table>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  }
-                  return renderMergeSourceRow({
-                    sourceId: item.sourceId,
-                    displayIndex: index + 1,
-                    mergeItemId: item.id,
-                  });
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-        {!isReadOnly ? (
-          <div className="mt-4 flex flex-wrap gap-2">
-            <LoadingButton
-              className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-110"
-              onClick={handleCreate}
-              loading={createSubmitting}
-              loadingLabel="处理中"
-            >
-              创建任务
-            </LoadingButton>
-          </div>
-        ) : null}
-        {message ? (
-          <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
-            {message}
-          </div>
-        ) : null}
-      </div>
-        </>
-      ) : null}
+      <SubmissionCreateView
+        addSource={addSource}
+        applySourceDownloadUrlBinding={applySourceDownloadUrlBinding}
+        applyUploadTitle={applyUploadTitle}
+        backToList={backToList}
+        buildGroupedSourceIdSet={buildGroupedSourceIdSet}
+        buildMergeGroupsPayload={buildMergeGroupsPayload}
+        buildPartitionOptionValue={buildPartitionOptionValue}
+        collectionOptions={collectionOptions}
+        collectionTreeSections={collectionTreeSections}
+        collectionTreeValue={collectionTreeValue}
+        collections={collections}
+        coverPreviewSrc={coverPreviewSrc}
+        currentUpProfile={currentUpProfile}
+        defaultBaiduSyncPath={defaultBaiduSyncPath}
+        draggingMergeGroupSource={draggingMergeGroupSource}
+        draggingMergeItemId={draggingMergeItemId}
+        duplicateSource={duplicateSource}
+        estimatedSegments={estimatedSegments}
+        handleChooseSourceRemotePart={handleChooseSourceRemotePart}
+        handleClearCover={handleClearCover}
+        handleCollectionTreeChange={handleCollectionTreeChange}
+        handleOpenSyncPicker={handleOpenSyncPicker}
+        handlePartitionChange={handlePartitionChange}
+        handleSelectCoverFile={handleSelectCoverFile}
+        handleTagKeyDown={handleTagKeyDown}
+        isActivityTag={isActivityTag}
+        isCreateView={isCreateView}
+        isDetailView={isDetailView}
+        isVideoFilePath={isVideoFilePath}
+        loadTasks={loadTasks}
+        mergeDragStateRef={mergeDragStateRef}
+        mergeGroupDragStateRef={mergeGroupDragStateRef}
+        mergeItems={mergeItems}
+        mergeSelection={mergeSelection}
+        message={message}
+        normalizeSourceTime={normalizeSourceTime}
+        openFileDialog={openFileDialog}
+        parseHmsToSeconds={parseHmsToSeconds}
+        partitionOptions={partitionOptions}
+        partitionSelectValue={partitionSelectValue}
+        removeSource={removeSource}
+        removeTag={removeTag}
+        renderActivityTopicSelector={renderActivityTopicSelector}
+        resolveTagClassName={resolveTagClassName}
+        resolveTagRemoveClassName={resolveTagRemoveClassName}
+        segmentationEnabled={segmentationEnabled}
+        selectedBilibiliUid={selectedBilibiliUid}
+        setDraggingMergeGroupSource={setDraggingMergeGroupSource}
+        setDraggingMergeItemId={setDraggingMergeItemId}
+        setMergeItems={setMergeItems}
+        setMergeSelection={setMergeSelection}
+        setMessage={setMessage}
+        setQuickFillOpen={setQuickFillOpen}
+        setQuickFillPage={setQuickFillPage}
+        setQuickFillTasks={setQuickFillTasks}
+        setQuickFillTotal={setQuickFillTotal}
+        setSegmentationEnabled={setSegmentationEnabled}
+        setSourceRemotePickerIndex={setSourceRemotePickerIndex}
+        setSourceRemotePickerOpen={setSourceRemotePickerOpen}
+        setSourceRemotePickerTarget={setSourceRemotePickerTarget}
+        setSubmissionView={setSubmissionView}
+        setTagInput={setTagInput}
+        setTaskForm={setTaskForm}
+        setWorkflowConfig={setWorkflowConfig}
+        sourcePartPickerLoadingId={sourcePartPickerLoadingId}
+        sourceVideos={sourceVideos}
+        syncMergeItemsWithSources={syncMergeItemsWithSources}
+        tagInput={tagInput}
+        tags={tags}
+        taskForm={taskForm}
+        updateSource={updateSource}
+        updateSourceTime={updateSourceTime}
+        updateSourceUploadTitle={updateSourceUploadTitle}
+        uploadTitleHints={uploadTitleHints}
+        workflowConfig={workflowConfig}
+      />
 
       {quickFillOpen && isCreateView ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
@@ -5001,437 +3633,55 @@ export default function SubmissionSection({
         </div>
       ) : null}
 
-      {isUpdateView ? (
-        <div className="rounded-2xl bg-white/80 p-6 shadow-sm ring-1 ring-black/5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <div className="text-sm font-semibold uppercase tracking-[0.2em] text-[var(--muted)]">
-                视频更新
-              </div>
-              <div className="mt-1 text-xs text-[var(--muted)]">
-                支持本地文件与远程分P混合配置，远程源视频会在下载完成后自动继续更新流程。
-              </div>
-            </div>
-            <button
-              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
-              onClick={backToList}
-            >
-              返回列表
-            </button>
-          </div>
-          <div className="mt-4">
-            {message ? (
-              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
-                {message}
-              </div>
-            ) : null}
-            <div className="mt-4 grid gap-4">
-              <div className="rounded-xl border border-black/5 bg-white/80 p-3">
-                <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                  更新配置
-                </div>
-                <div className="mt-3 space-y-3 text-sm text-[var(--ink)]">
-                  <div className="grid gap-2 lg:grid-cols-2">
-                    <div className="space-y-1">
-                      <div className="text-xs text-[var(--muted)]">分段前缀（可选）</div>
-                      <input
-                        value={updateSegmentPrefix}
-                        onChange={(event) => setUpdateSegmentPrefix(event.target.value)}
-                        placeholder="分段前缀"
-                        className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                      />
-                    </div>
-                  </div>
-                  <div className="rounded-lg border border-black/5 bg-white/80 p-3">
-                    <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                      百度网盘同步
-                    </div>
-                    <label className="mt-2 flex items-center gap-2 text-sm text-[var(--muted)]">
-                      <input
-                        type="checkbox"
-                        checked={updateBaiduSync.enabled}
-                        onChange={(event) =>
-                          setUpdateBaiduSync((prev) => ({
-                            ...prev,
-                            enabled: event.target.checked,
-                          }))
-                        }
-                      />
-                      同步上传到百度网盘
-                    </label>
-                    {updateBaiduSync.enabled ? (
-                      <div className="mt-3 grid gap-2 lg:grid-cols-2">
-                        <div>
-                          <div className="text-xs text-[var(--muted)]">远端路径</div>
-                          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                            <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
-                              {updateBaiduSync.path || defaultBaiduSyncPath || "/录播"}
-                            </div>
-                            <button
-                              className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
-                              onClick={() => handleOpenSyncPicker("update")}
-                            >
-                              选择目录
-                            </button>
-                          </div>
-                        </div>
-                        <div>
-                          <div className="text-xs text-[var(--muted)]">上传文件名</div>
-                          <input
-                            value={updateBaiduSync.filename}
-                            onChange={(event) =>
-                              setUpdateBaiduSync((prev) => ({
-                                ...prev,
-                                filename: event.target.value,
-                              }))
-                            }
-                            placeholder="文件名"
-                            className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                          />
-                        </div>
-                      </div>
-                    ) : null}
-                  </div>
-                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                    是否分段
-                  </div>
-                  <div className="flex flex-wrap gap-4 text-xs text-[var(--muted)]">
-                    <label className="flex items-center gap-2">
-                      <input
-                        type="radio"
-                        checked={updateSegmentationEnabled}
-                        onChange={() => setUpdateSegmentationEnabled(true)}
-                      />
-                      需要分段
-                    </label>
-                    <label className="flex items-center gap-2">
-                      <input
-                        type="radio"
-                        checked={!updateSegmentationEnabled}
-                        onChange={() => setUpdateSegmentationEnabled(false)}
-                      />
-                      不需要分段
-                    </label>
-                  </div>
-                  {updateSegmentationEnabled ? (
-                    <div className="grid gap-2 lg:grid-cols-2">
-                      <input
-                        type="number"
-                        value={updateWorkflowConfig.segmentationConfig.segmentDurationSeconds}
-                        onChange={(event) =>
-                          setUpdateWorkflowConfig((prev) => ({
-                            ...prev,
-                            segmentationConfig: {
-                              ...prev.segmentationConfig,
-                              segmentDurationSeconds: Number(event.target.value),
-                            },
-                          }))
-                        }
-                        placeholder="分段时长（秒）"
-                        className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                      />
-                      <label className="flex items-center gap-2 text-xs text-[var(--muted)]">
-                        <input
-                          type="checkbox"
-                          checked={updateWorkflowConfig.segmentationConfig.preserveOriginal}
-                          onChange={(event) =>
-                            setUpdateWorkflowConfig((prev) => ({
-                              ...prev,
-                              segmentationConfig: {
-                                ...prev.segmentationConfig,
-                                preserveOriginal: event.target.checked,
-                              },
-                            }))
-                          }
-                        />
-                        保留合并视频
-                      </label>
-                    </div>
-                  ) : null}
-                  <div className="text-xs text-[var(--muted)]">
-                    预计分段数：
-                    {updateSegmentationEnabled ? updateEstimatedSegments : "不分段"}
-                  </div>
-                </div>
-              </div>
-              <div className="rounded-xl border border-black/5 bg-white/80 p-3">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                    源视频配置
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
-                      onClick={openUpdateImportModal}
-                    >
-                      导入视频
-                    </button>
-                    <button
-                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
-                      onClick={createUpdateMergeGroup}
-                    >
-                      创建合并组
-                    </button>
-                    <button
-                      className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
-                      onClick={addUpdateSource}
-                    >
-                      添加视频
-                    </button>
-                  </div>
-                </div>
-                <div className="mt-3 overflow-hidden rounded-xl border border-black/5">
-                  <table className="w-full text-left text-sm">
-                    <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                      <tr>
-                        <th className="px-4 py-2">序号</th>
-                        <th className="px-4 py-2">视频文件（必填）</th>
-                        <th className="px-4 py-2">BV号或下载链接</th>
-                        <th className="px-4 py-2">分P标题</th>
-                        <th className="px-4 py-2">上传分P标题</th>
-                        <th className="px-4 py-2">开始时间</th>
-                        <th className="px-4 py-2">结束时间</th>
-                        <th className="px-4 py-2">合并</th>
-                        <th className="px-4 py-2">独立分组</th>
-                        <th className="px-4 py-2">合并状态</th>
-                        <th className="px-4 py-2">操作</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {updateSourceVideos.map((item, index) => (
-                        <tr
-                          key={item.localId || `update-source-${index}`}
-                          className="border-t border-black/5"
-                        >
-                          <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
-                          <td className="px-4 py-2">
-                            <div className="flex flex-wrap gap-2">
-                              <input
-                                value={item.sourceFilePath}
-                                onChange={(event) =>
-                                  updateUpdateSource(index, "sourceFilePath", event.target.value)
-                                }
-                                placeholder="请输入视频文件路径（必填）"
-                                className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                              />
-                              <button
-                                className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
-                                onClick={() => handleUpdateSelectSourceFile(index)}
-                              >
-                                选择
-                              </button>
-                            </div>
-                          </td>
-                          <td className="px-4 py-2">
-                            <div className="space-y-2">
-                              <div className="flex flex-wrap gap-2">
-                                <input
-                                  value={resolveSourceRemoteInput(item)}
-                                  onChange={(event) =>
-                                    updateUpdateSource(index, "remoteBvid", event.target.value)
-                                  }
-                                  placeholder="可选，填写源视频 BV 号或下载链接"
-                                  className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                                />
-                                <button
-                                  type="button"
-                                  className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
-                                  onClick={() =>
-                                    isDirectSourceInput(resolveSourceRemoteInput(item))
-                                      ? applySourceDownloadUrlBinding("update", index)
-                                      : handleChooseSourceRemotePart("update", index)
-                                  }
-                                  disabled={sourcePartPickerLoadingId === item.localId}
-                                >
-                                  {sourcePartPickerLoadingId === item.localId
-                                    ? "查询中"
-                                    : isDirectSourceInput(resolveSourceRemoteInput(item))
-                                      ? "保存"
-                                      : "选择分P"}
-                                </button>
-                              </div>
-                              {formatSourceBindingSummary(item) ? (
-                                <div className="text-xs text-[var(--muted)]">
-                                  {formatSourceBindingSummary(item)}
-                                </div>
-                              ) : null}
-                            </div>
-                          </td>
-                          <td className="px-4 py-2 text-[var(--muted)]">
-                            {item.remotePartTitle ||
-                              (item.remoteBvid
-                                ? "未指定分P"
-                                : item.remoteVideoUrl
-                                  ? "下载链接"
-                                  : "-")}
-                          </td>
-                          <td className="px-4 py-2">
-                            <input
-                              value={
-                                item.uploadPartTitleMode === "CUSTOM"
-                                  ? item.uploadPartTitle || ""
-                                  : ""
-                              }
-                              onChange={(event) =>
-                                updateUpdateSourceUploadTitle(index, event.target.value)
-                              }
-                              maxLength={80}
-                              placeholder={
-                                updateSegmentationEnabled ? "分段开启时自动分P" : `P${index + 1}`
-                              }
-                              title={
-                                updateSegmentationEnabled ? "分段开启时使用自动分P标题" : ""
-                              }
-                              disabled={updateSegmentationEnabled}
-                              className="w-32 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
-                            />
-                          </td>
-                          <td className="px-4 py-2">
-                            <input
-                              value={item.startTime}
-                              onChange={(event) =>
-                                updateUpdateSourceTime(index, "startTime", event.target.value)
-                              }
-                              onBlur={() => normalizeUpdateSourceTime(index, "startTime")}
-                              placeholder="00:00:00"
-                              className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                            />
-                          </td>
-                          <td className="px-4 py-2">
-                            <input
-                              value={item.endTime}
-                              onChange={(event) =>
-                                updateUpdateSourceTime(index, "endTime", event.target.value)
-                              }
-                              onBlur={() => normalizeUpdateSourceTime(index, "endTime")}
-                              placeholder="00:00:00"
-                              className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                            />
-                          </td>
-                          <td className="px-4 py-2">
-                            <input
-                              type="checkbox"
-                              checked={updateMergeSelection.has(item.localId)}
-                              onChange={(event) =>
-                                toggleUpdateMergeSelection(item.localId, event.target.checked)
-                              }
-                              disabled={
-                                buildGroupedSourceIdSet(updateMergeItems).has(item.localId) ||
-                                updateMergeItems.some(
-                                  (candidate) =>
-                                    candidate.type === "SOURCE" &&
-                                    candidate.sourceId === item.localId &&
-                                    candidate.standalone,
-                                )
-                              }
-                            />
-                          </td>
-                          <td className="px-4 py-2">
-                            <input
-                              type="checkbox"
-                              title="独立分组"
-                              checked={
-                                updateMergeItems.find(
-                                  (candidate) =>
-                                    candidate.type === "SOURCE" &&
-                                    candidate.sourceId === item.localId,
-                                )?.standalone || false
-                              }
-                              onChange={() => toggleUpdateMergeStandalone(item.localId)}
-                              disabled={buildGroupedSourceIdSet(updateMergeItems).has(item.localId)}
-                            />
-                          </td>
-                          <td className="px-4 py-2 text-[var(--muted)]">
-                            {buildGroupedSourceIdSet(updateMergeItems).has(item.localId)
-                              ? "已加入合并组"
-                              : updateMergeItems.find(
-                                    (candidate) =>
-                                      candidate.type === "SOURCE" &&
-                                      candidate.sourceId === item.localId &&
-                                      candidate.standalone,
-                                  )?.standalone
-                                ? "独立分组"
-                                : "未配置"}
-                          </td>
-                          <td className="px-4 py-2">
-                            <div className="flex flex-wrap gap-2">
-                              <button
-                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                                onClick={() => duplicateUpdateSource(index)}
-                              >
-                                复制
-                              </button>
-                              <button
-                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                                onClick={() => removeUpdateSource(index)}
-                              >
-                                删除
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <div className="mt-3 rounded-xl border border-black/5 bg-white/80 p-3">
-                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                    合并配置
-                  </div>
-                  <div className="mt-2 space-y-2 text-xs text-[var(--ink)]">
-                    {updateMergeItems.filter((item) => item.type === "GROUP").length === 0 ? (
-                      <div className="text-[var(--muted)]">当前未创建合并组</div>
-                    ) : (
-                      updateMergeItems
-                        .filter((item) => item.type === "GROUP")
-                        .map((group, groupIndex) => {
-                          const sourceNames = (group.sourceIds || [])
-                            .map((sourceId) => {
-                              const source = updateSourceVideos.find((item) => item.localId === sourceId);
-                              return (
-                                String(source?.remotePartTitle || "").trim() ||
-                                String(source?.sourceFilePath || "").split(/[\\/]/).pop() ||
-                                sourceId
-                              );
-                            })
-                            .join("，");
-                          return (
-                            <div
-                              key={group.id}
-                              className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-black/10 bg-white px-3 py-2"
-                            >
-                              <div>
-                                <div className="font-semibold text-[var(--ink)]">
-                                  合并组 {groupIndex + 1}
-                                </div>
-                                <div className="text-[var(--muted)]">{sourceNames || "-"}</div>
-                              </div>
-                              <button
-                                className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
-                                onClick={() => releaseUpdateMergeGroup(group.id)}
-                              >
-                                解除合并
-                              </button>
-                            </div>
-                          );
-                        })
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
-            <div className="mt-4 flex flex-wrap gap-2">
-              <button
-                className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
-                onClick={handleUpdateSubmit}
-                disabled={updateSubmitting}
-              >
-                {updateSubmitting ? "提交中" : "提交更新"}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <SubmissionUpdateView
+        applySourceDownloadUrlBinding={applySourceDownloadUrlBinding}
+        applyUploadTitle={applyUploadTitle}
+        backToList={backToList}
+        buildGroupedSourceIdSet={buildGroupedSourceIdSet}
+        buildMergeGroupsPayload={buildMergeGroupsPayload}
+        clampTimeSeconds={clampTimeSeconds}
+        currentPage={currentPage}
+        defaultBaiduSyncPath={defaultBaiduSyncPath}
+        formatDurationHms={formatDurationHms}
+        handleChooseSourceRemotePart={handleChooseSourceRemotePart}
+        handleOpenSyncPicker={handleOpenSyncPicker}
+        isVideoFilePath={isVideoFilePath}
+        loadTasks={loadTasks}
+        message={message}
+        normalizeTimeValue={normalizeTimeValue}
+        pageSize={pageSize}
+        parseHmsToSeconds={parseHmsToSeconds}
+        resetUpdateState={resetUpdateState}
+        setMessage={setMessage}
+        setSubmissionView={setSubmissionView}
+        setUpdateBaiduSync={setUpdateBaiduSync}
+        setUpdateImportInput={setUpdateImportInput}
+        setUpdateImportLoading={setUpdateImportLoading}
+        setUpdateImportOpen={setUpdateImportOpen}
+        setUpdateImportResults={setUpdateImportResults}
+        setUpdateImportSelection={setUpdateImportSelection}
+        setUpdateMergeItems={setUpdateMergeItems}
+        setUpdateMergeSelection={setUpdateMergeSelection}
+        setUpdateSegmentPrefix={setUpdateSegmentPrefix}
+        setUpdateSegmentationEnabled={setUpdateSegmentationEnabled}
+        setUpdateSourceVideos={setUpdateSourceVideos}
+        setUpdateSubmitting={setUpdateSubmitting}
+        setUpdateWorkflowConfig={setUpdateWorkflowConfig}
+        sourcePartPickerLoadingId={sourcePartPickerLoadingId}
+        statusFilter={statusFilter}
+        submissionView={submissionView}
+        syncMergeItemsWithSources={syncMergeItemsWithSources}
+        updateBaiduSync={updateBaiduSync}
+        updateMergeItems={updateMergeItems}
+        updateMergeSelection={updateMergeSelection}
+        updateSegmentPrefix={updateSegmentPrefix}
+        updateSegmentationEnabled={updateSegmentationEnabled}
+        updateSourceVideos={updateSourceVideos}
+        updateSubmitting={updateSubmitting}
+        updateTaskDir={updateTaskDir}
+        updateTaskId={updateTaskId}
+        updateWorkflowConfig={updateWorkflowConfig}
+      />
       {updateImportOpen ? (
         <div className="fixed inset-0 z-[55] flex items-center justify-center bg-black/40 px-4">
           <div className="w-full max-w-5xl rounded-2xl bg-white p-5 shadow-lg">
