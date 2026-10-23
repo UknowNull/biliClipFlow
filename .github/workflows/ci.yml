@@ -22,3 +22,7 @@ jobs:
         run: pnpm build
       - name: Build backend
         run: cargo build --manifest-path src-tauri/Cargo.toml
+      - name: Test backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml

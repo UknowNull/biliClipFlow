@@ -24,3 +24,8 @@ docs
 *.njsproj
 *.sln
 *.sw?
+
+# Rust build outputs and local databases
+src-tauri/target*/
+*.db
+*.sqlite3

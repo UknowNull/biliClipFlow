@@ -110,6 +110,7 @@ BIN_DOWNLOAD=1 pnpm exec tauri build --bundles nsis,msi
 
 - 数据目录：`~/Library/Application Support/com.tbw.biliclipflow/`
 - 数据库：`bili-clip-flow.sqlite3`
+  - 数据库使用 WAL 模式，备份时需同时拷贝同目录下的 `-wal` 与 `-shm` 文件，或先退出应用再拷贝
 - 日志：`app_debug.log` / `auth_debug.log` / `panic_debug.log`
 
 ## 界面预览

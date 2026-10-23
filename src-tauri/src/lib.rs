@@ -137,7 +137,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     utils::append_log(&heartbeat_path, "heartbeat");
-                    sleep(Duration::from_secs(30)).await;
+                    sleep(Duration::from_secs(300)).await;
                 }
             });
             let state = AppState {
