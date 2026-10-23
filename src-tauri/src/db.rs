@@ -500,6 +500,10 @@ impl Db {
             [],
         );
 
+        conn.update_hook(Some(|_action, _db: &str, table: &str, _rowid: i64| {
+            crate::change_events::mark_table(table);
+        }));
+
         Ok(Self {
             conn: Mutex::new(conn),
         })

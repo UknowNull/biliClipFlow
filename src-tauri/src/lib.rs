@@ -12,6 +12,7 @@ mod api;
 mod app_log;
 mod baidu_sync;
 mod bilibili;
+mod change_events;
 mod commands;
 mod config;
 mod db;
@@ -200,6 +201,7 @@ pub fn run() {
                 toolbox_season_backup_receiver,
             );
             commands::toolbox::start_bilibili_season_backup_scheduler(app.handle().clone());
+            change_events::start_emit_loop(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

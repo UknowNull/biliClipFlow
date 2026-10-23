@@ -16,6 +16,7 @@ import BaiduRemoteFilePicker from "../components/BaiduRemoteFilePicker";
 import CoverCropModal from "../components/CoverCropModal";
 import RemoteImportTaskView from "../components/RemoteImportTaskView";
 import useSubmissionCover from "../hooks/useSubmissionCover";
+import useAppDataChanged from "../lib/useAppDataChanged";
 import {
   buildEditBaselineFromDetail,
   collectCurrentTags,
@@ -2623,15 +2624,11 @@ export default function SubmissionSection({
     setSelectedTaskIds(new Set());
   }, [submissionView, statusFilter, sourceFilter, taskSearch, selectedBilibiliUid]);
 
-  useEffect(() => {
-    if (submissionView !== "list") {
-      return undefined;
-    }
-    const timer = setInterval(() => {
-      loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter);
-    }, 3000);
-    return () => clearInterval(timer);
-  }, [submissionView, statusFilter, sourceFilter, currentPage, pageSize, taskSearch, selectedBilibiliUid]);
+  useAppDataChanged(
+    "submission",
+    () => loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, sourceFilter),
+    { enabled: submissionView === "list", minGapMs: 2000 },
+  );
 
   useEffect(() => {
     if (!quickFillOpen) {
@@ -2661,54 +2658,65 @@ export default function SubmissionSection({
       }
     };
     refreshDetail();
-    const timer = setInterval(refreshDetail, 3000);
     return () => {
       active = false;
-      clearInterval(timer);
     };
   }, [submissionView, selectedTask?.task?.taskId, isDetailView]);
 
-  useEffect(() => {
-    if (!isEditView || !selectedTask?.task?.taskId || pendingEditUploads === 0) {
-      return undefined;
-    }
-    let active = true;
-    const taskId = selectedTask.task.taskId;
-    const refreshStatus = async () => {
-      const pendingIds = (editSegmentsRef.current || [])
-        .filter(
-          (segment) =>
-            segment.uploadStatus === "UPLOADING" ||
-            segment.uploadStatus === "RATE_LIMITED",
-        )
-        .map((segment) => segment.segmentId);
-      if (!pendingIds.length) {
+  useAppDataChanged(
+    "submission",
+    async () => {
+      const taskId = selectedTask?.task?.taskId;
+      if (!taskId) {
         return;
       }
       try {
-        const updates = await invokeCommand("submission_edit_upload_status", {
-          request: {
-            taskId,
-            segmentIds: pendingIds,
-          },
-        });
-        if (!active) {
-          return;
-        }
-        setEditSegments((prev) => mergeEditUploadStatus(prev, updates || []));
+        const detail = await fetchTaskDetail(taskId, { log: false });
+        setSelectedTask((prev) => (prev?.task?.taskId === taskId ? detail : prev));
       } catch (error) {
-        if (active) {
-          setMessage(error.message);
-        }
+        setMessage(error.message);
       }
-    };
-    refreshStatus();
-    const timer = setInterval(refreshStatus, 2000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
-  }, [isEditView, pendingEditUploads, selectedTask?.task?.taskId]);
+    },
+    { enabled: isDetailView && Boolean(selectedTask?.task?.taskId), minGapMs: 1000 },
+  );
+
+  const refreshEditUploadStatus = async () => {
+    const taskId = selectedTask?.task?.taskId;
+    if (!taskId) {
+      return;
+    }
+    const pendingIds = (editSegmentsRef.current || [])
+      .filter(
+        (segment) =>
+          segment.uploadStatus === "UPLOADING" ||
+          segment.uploadStatus === "RATE_LIMITED",
+      )
+      .map((segment) => segment.segmentId);
+    if (!pendingIds.length) {
+      return;
+    }
+    try {
+      const updates = await invokeCommand("submission_edit_upload_status", {
+        request: {
+          taskId,
+          segmentIds: pendingIds,
+        },
+      });
+      setEditSegments((prev) => mergeEditUploadStatus(prev, updates || []));
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const editUploadPolling = isEditView && Boolean(selectedTask?.task?.taskId) && pendingEditUploads > 0;
+
+  useEffect(() => {
+    if (editUploadPolling) {
+      refreshEditUploadStatus();
+    }
+  }, [editUploadPolling, selectedTask?.task?.taskId]);
+
+  useAppDataChanged("editUpload", refreshEditUploadStatus, { enabled: editUploadPolling });
 
   const openFileDialog = async (index) => {
     await handleSelectSourceFile(index);

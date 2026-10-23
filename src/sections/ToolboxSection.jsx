@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { confirm as dialogConfirm, open, save } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../lib/tauri";
+import useAppDataChanged from "../lib/useAppDataChanged";
 import VideoMaskWorkspace from "./toolbox/VideoMaskProjectTool";
 
 const toolboxTabs = [
@@ -927,25 +928,25 @@ function MediaTaskRecords({ taskType, refreshKey }) {
   const [loadError, setLoadError] = useState("");
   const [openError, setOpenError] = useState("");
 
+  const taskTypeRef = useRef(taskType);
+  taskTypeRef.current = taskType;
+
+  const loadTasks = async () => {
+    try {
+      const data = await invokeCommand("toolbox_media_task_list");
+      // 按响应到达时的类型过滤，避免切换类型后旧请求覆盖列表。
+      setTasks((Array.isArray(data) ? data : []).filter((task) => task.taskType === taskTypeRef.current));
+      setLoadError("");
+    } catch (error) {
+      setLoadError(error?.message || "读取任务记录失败");
+    }
+  };
+
   useEffect(() => {
-    let active = true;
-    const loadTasks = async () => {
-      try {
-        const data = await invokeCommand("toolbox_media_task_list");
-        if (!active) return;
-        setTasks((Array.isArray(data) ? data : []).filter((task) => task.taskType === taskType));
-        setLoadError("");
-      } catch (error) {
-        if (active) setLoadError(error?.message || "读取任务记录失败");
-      }
-    };
     loadTasks();
-    const timer = window.setInterval(loadTasks, 1000);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
   }, [taskType, refreshKey]);
+
+  useAppDataChanged("toolbox", loadTasks);
 
   const handleOpenTaskFolder = async (task) => {
     const folderPath = parentDirectory(task?.targetPath);

@@ -951,6 +951,7 @@ fn upsert_edit_upload_segment(
         state
             .segments
             .insert(segment.segment_id.clone(), segment.clone());
+        crate::change_events::mark_edit_upload();
         segment
     })
 }
@@ -970,6 +971,7 @@ fn update_edit_upload_segment(
     with_edit_upload_state(context, |state| {
         if let Some(segment) = state.segments.get_mut(segment_id) {
             updater(segment);
+            crate::change_events::mark_edit_upload();
             return true;
         }
         false
@@ -1006,6 +1008,7 @@ fn clear_edit_upload_segments_by_task(
         state
             .segments
             .retain(|_, segment| segment.task_id != task_id);
+        crate::change_events::mark_edit_upload();
     })
 }
 
@@ -12353,71 +12356,47 @@ fn load_tasks(
     bilibili_uid: i64,
     source_type: Option<String>,
 ) -> Result<PaginatedSubmissionTasks, String> {
+    let non_empty = |value: String| {
+        let trimmed = value.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    };
+    let like_query = query.and_then(non_empty).map(|value| format!("%{}%", value));
+    let source_type = source_type
+        .and_then(non_empty)
+        .map(|value| value.to_ascii_uppercase());
+
+    // 按筛选条件动态拼 WHERE，占位符编号与参数下标一一对应。
+    let mut params: Vec<rusqlite::types::Value> = vec![bilibili_uid.into()];
+    let mut conditions = vec!["st.bilibili_uid = ?1".to_string()];
+    if let Some(status) = status {
+        params.push(status.into());
+        conditions.push(format!("st.status = ?{}", params.len()));
+    }
+    if let Some(source_type) = source_type {
+        params.push(source_type.into());
+        conditions.push(format!(
+            "COALESCE(st.source_type, 'NORMAL') = ?{}",
+            params.len()
+        ));
+    }
+    if let Some(pattern) = like_query {
+        params.push(pattern.into());
+        conditions.push(format!(
+            "(st.title LIKE ?{0} COLLATE NOCASE OR st.bvid LIKE ?{0} COLLATE NOCASE)",
+            params.len()
+        ));
+    }
+    let where_clause = conditions.join(" AND ");
+    let offset = (page - 1).saturating_mul(page_size);
+
     context
     .db
     .with_conn(|conn| {
-      let query = query.and_then(|value| {
-        let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-          None
-        } else {
-          Some(trimmed)
-        }
-      });
-      let like_query = query.as_ref().map(|value| format!("%{}%", value));
-      let source_type = source_type
-        .and_then(|value| {
-          let trimmed = value.trim().to_string();
-          if trimmed.is_empty() {
-            None
-          } else {
-            Some(trimmed)
-          }
-        })
-        .map(|value| value.to_ascii_uppercase());
-      let total = match (status.as_ref(), like_query.as_ref(), source_type.as_ref()) {
-        (Some(status), Some(pattern), Some(source_type)) => conn.query_row(
-          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND status = ?2 AND COALESCE(source_type, 'NORMAL') = ?3 AND (title LIKE ?4 COLLATE NOCASE OR bvid LIKE ?4 COLLATE NOCASE)",
-          (bilibili_uid, status, source_type, pattern),
-          |row| row.get(0),
-        )?,
-        (Some(status), Some(pattern), None) => conn.query_row(
-          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND status = ?2 AND (title LIKE ?3 COLLATE NOCASE OR bvid LIKE ?3 COLLATE NOCASE)",
-          (bilibili_uid, status, pattern),
-          |row| row.get(0),
-        )?,
-        (Some(status), None, Some(source_type)) => conn.query_row(
-          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND status = ?2 AND COALESCE(source_type, 'NORMAL') = ?3",
-          (bilibili_uid, status, source_type),
-          |row| row.get(0),
-        )?,
-        (Some(status), None, None) => conn.query_row(
-          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND status = ?2",
-          (bilibili_uid, status),
-          |row| row.get(0),
-        )?,
-        (None, Some(pattern), Some(source_type)) => conn.query_row(
-          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND COALESCE(source_type, 'NORMAL') = ?2 AND (title LIKE ?3 COLLATE NOCASE OR bvid LIKE ?3 COLLATE NOCASE)",
-          (bilibili_uid, source_type, pattern),
-          |row| row.get(0),
-        )?,
-        (None, Some(pattern), None) => conn.query_row(
-          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND (title LIKE ?2 COLLATE NOCASE OR bvid LIKE ?2 COLLATE NOCASE)",
-          (bilibili_uid, pattern),
-          |row| row.get(0),
-        )?,
-        (None, None, Some(source_type)) => conn.query_row(
-          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1 AND COALESCE(source_type, 'NORMAL') = ?2",
-          (bilibili_uid, source_type),
-          |row| row.get(0),
-        )?,
-        (None, None, None) => conn.query_row(
-          "SELECT COUNT(*) FROM submission_task WHERE bilibili_uid = ?1",
-          [bilibili_uid],
-          |row| row.get(0),
-        )?,
-      };
-      let offset = (page - 1).saturating_mul(page_size);
+      let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM submission_task st WHERE {}", where_clause),
+        rusqlite::params_from_iter(params.iter()),
+        |row| row.get(0),
+      )?;
       let order_by = "ORDER BY \
         CASE \
           WHEN st.status <> 'COMPLETED' THEN 0 \
@@ -12458,150 +12437,30 @@ fn load_tasks(
           ELSE NULL \
         END ASC, \
         st.created_at DESC";
-      let sql = match (status.as_ref(), like_query.as_ref(), source_type.as_ref()) {
-        (Some(_), Some(_), Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
-                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
-           FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
-             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
-             WHERE latest_wi.task_id = st.task_id \
-             ORDER BY latest_wi.created_at DESC LIMIT 1 \
-           ) \
-           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-           WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND COALESCE(st.source_type, 'NORMAL') = ?3 AND (st.title LIKE ?4 COLLATE NOCASE OR st.bvid LIKE ?4 COLLATE NOCASE) {} LIMIT ?5 OFFSET ?6",
-          order_by
-        ),
-        (Some(_), Some(_), None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
-                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
-           FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
-             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
-             WHERE latest_wi.task_id = st.task_id \
-             ORDER BY latest_wi.created_at DESC LIMIT 1 \
-           ) \
-           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-           WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND (st.title LIKE ?3 COLLATE NOCASE OR st.bvid LIKE ?3 COLLATE NOCASE) {} LIMIT ?4 OFFSET ?5",
-          order_by
-        ),
-        (Some(_), None, Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
-                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
-           FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
-             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
-             WHERE latest_wi.task_id = st.task_id \
-             ORDER BY latest_wi.created_at DESC LIMIT 1 \
-           ) \
-           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-           WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND COALESCE(st.source_type, 'NORMAL') = ?3 {} LIMIT ?4 OFFSET ?5",
-          order_by
-        ),
-        (Some(_), None, None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
-                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
-           FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
-             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
-             WHERE latest_wi.task_id = st.task_id \
-             ORDER BY latest_wi.created_at DESC LIMIT 1 \
-           ) \
-           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-           WHERE st.bilibili_uid = ?1 AND st.status = ?2 {} LIMIT ?3 OFFSET ?4",
-          order_by
-        ),
-        (None, Some(_), Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
-                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
-           FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
-             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
-             WHERE latest_wi.task_id = st.task_id \
-             ORDER BY latest_wi.created_at DESC LIMIT 1 \
-           ) \
-           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-           WHERE st.bilibili_uid = ?1 AND COALESCE(st.source_type, 'NORMAL') = ?2 AND (st.title LIKE ?3 COLLATE NOCASE OR st.bvid LIKE ?3 COLLATE NOCASE) {} LIMIT ?4 OFFSET ?5",
-          order_by
-        ),
-        (None, Some(_), None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
-                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
-           FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
-             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
-             WHERE latest_wi.task_id = st.task_id \
-             ORDER BY latest_wi.created_at DESC LIMIT 1 \
-           ) \
-           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-           WHERE st.bilibili_uid = ?1 AND (st.title LIKE ?2 COLLATE NOCASE OR st.bvid LIKE ?2 COLLATE NOCASE) {} LIMIT ?3 OFFSET ?4",
-          order_by
-        ),
-        (None, None, Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
-                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
-           FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
-             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
-             WHERE latest_wi.task_id = st.task_id \
-             ORDER BY latest_wi.created_at DESC LIMIT 1 \
-           ) \
-           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-           WHERE st.bilibili_uid = ?1 AND COALESCE(st.source_type, 'NORMAL') = ?2 {} LIMIT ?3 OFFSET ?4",
-          order_by
-        ),
-        (None, None, None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
-                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
-           FROM submission_task st \
-           LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
-             SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
-             WHERE latest_wi.task_id = st.task_id \
-             ORDER BY latest_wi.created_at DESC LIMIT 1 \
-           ) \
-           LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-           WHERE st.bilibili_uid = ?1 {} LIMIT ?2 OFFSET ?3",
-          order_by
-        ),
-      };
-
+      let sql = format!(
+        "SELECT st.task_id, st.status, st.priority, st.priority_at, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, st.source_type, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, COALESCE(st.remote_status_ignored, 0), \
+                CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
+                wi.status, wi.current_step, wi.progress, wi.error_message, st.collection_section_id, st.remote_state_desc \
+         FROM submission_task st \
+         LEFT JOIN workflow_instances wi ON wi.instance_id = ( \
+           SELECT latest_wi.instance_id FROM workflow_instances latest_wi \
+           WHERE latest_wi.task_id = st.task_id \
+           ORDER BY latest_wi.created_at DESC LIMIT 1 \
+         ) \
+         LEFT JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
+         WHERE {} {} LIMIT ?{} OFFSET ?{}",
+        where_clause,
+        order_by,
+        params.len() + 1,
+        params.len() + 2
+      );
+      let mut query_params = params.clone();
+      query_params.push(page_size.into());
+      query_params.push(offset.into());
       let mut stmt = conn.prepare(&sql)?;
-      let rows = match (status, like_query, source_type) {
-        (Some(status), Some(pattern), Some(source_type)) => stmt.query_map(
-          (bilibili_uid, status, source_type, pattern, page_size, offset),
-          map_submission_task,
-        )?,
-        (Some(status), Some(pattern), None) => {
-          stmt.query_map((bilibili_uid, status, pattern, page_size, offset), map_submission_task)?
-        }
-        (Some(status), None, Some(source_type)) => {
-          stmt.query_map((bilibili_uid, status, source_type, page_size, offset), map_submission_task)?
-        }
-        (Some(status), None, None) => {
-          stmt.query_map((bilibili_uid, status, page_size, offset), map_submission_task)?
-        }
-        (None, Some(pattern), Some(source_type)) => stmt.query_map(
-          (bilibili_uid, source_type, pattern, page_size, offset),
-          map_submission_task,
-        )?,
-        (None, Some(pattern), None) => {
-          stmt.query_map((bilibili_uid, pattern, page_size, offset), map_submission_task)?
-        }
-        (None, None, Some(source_type)) => {
-          stmt.query_map((bilibili_uid, source_type, page_size, offset), map_submission_task)?
-        }
-        (None, None, None) => stmt.query_map((bilibili_uid, page_size, offset), map_submission_task)?,
-      };
-
-      let list = rows.collect::<Result<Vec<_>, _>>()?;
+      let list = stmt
+        .query_map(rusqlite::params_from_iter(query_params.iter()), map_submission_task)?
+        .collect::<Result<Vec<_>, _>>()?;
       Ok(PaginatedSubmissionTasks {
         items: list,
         total,
@@ -23563,6 +23422,53 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use serde_json::json;
+
+    #[test]
+    fn load_tasks_applies_filter_combinations() {
+        let db = Arc::new(Db::new(PathBuf::from(":memory:")).expect("init db"));
+        db.with_conn(|conn| {
+            for (id, uid, status, source, title) in [
+                ("a", 1, "PENDING", Some("NORMAL"), "Alpha"),
+                ("b", 1, "COMPLETED", None, "beta"),
+                ("c", 1, "PENDING", Some("LIVE"), "alpha live"),
+                ("d", 2, "PENDING", Some("NORMAL"), "alpha"),
+            ] {
+                conn.execute(
+                    "INSERT INTO submission_task (task_id, bilibili_uid, status, source_type, title, partition_id, video_type, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 21, 'ORIGINAL', '2026-01-01', '2026-01-01')",
+                    (id, uid, status, source, title),
+                )?;
+            }
+            Ok(())
+        })
+        .expect("seed tasks");
+        let context = SubmissionContext {
+            db,
+            app_log_path: Arc::new(PathBuf::new()),
+            edit_upload_state: Arc::new(Mutex::new(EditUploadState::default())),
+            local_path_prefix: PathBuf::new(),
+        };
+        let total = |status: Option<&str>, query: Option<&str>, source: Option<&str>| {
+            load_tasks(
+                &context,
+                status.map(str::to_string),
+                1,
+                20,
+                query.map(str::to_string),
+                1,
+                source.map(str::to_string),
+            )
+            .expect("load tasks")
+            .total
+        };
+        assert_eq!(total(None, None, None), 3);
+        assert_eq!(total(Some("PENDING"), None, None), 2);
+        assert_eq!(total(None, None, Some("normal")), 2);
+        assert_eq!(total(None, Some(" ALPHA "), None), 2);
+        assert_eq!(total(Some("PENDING"), Some("alpha"), Some("NORMAL")), 1);
+        let page = load_tasks(&context, None, 2, 2, None, 1, None).expect("page 2");
+        assert_eq!((page.total, page.items.len()), (3, 1));
+    }
 
     fn build_test_task(import_mode: &str, enable_segmentation: bool) -> SubmissionTaskRecord {
         SubmissionTaskRecord {

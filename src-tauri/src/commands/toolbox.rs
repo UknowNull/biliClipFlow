@@ -170,7 +170,9 @@ impl ToolboxMediaTaskRuntime {
         let text = serde_json::to_string_pretty(tasks)
             .map_err(|err| format!("序列化工具箱任务记录失败: {}", err))?;
         fs::write(&self.storage_path, text)
-            .map_err(|err| format!("写入工具箱任务记录失败: {}", err))
+            .map_err(|err| format!("写入工具箱任务记录失败: {}", err))?;
+        crate::change_events::mark_toolbox();
+        Ok(())
     }
 
     fn persist(&self) -> Result<(), String> {

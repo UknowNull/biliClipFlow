@@ -24,7 +24,7 @@ tauri-plugin-dialog = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 base64 = "0.22"
 md5 = "0.7"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 thiserror = "1"
 tokio = { version = "1", features = ["sync", "time", "net", "io-util", "macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
