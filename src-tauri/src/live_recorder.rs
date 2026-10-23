@@ -2636,6 +2636,19 @@ fn open_segment(
     })
 }
 
+// 录完后的转封装与兜底重编码限制并发：多个分段同时结束时，同时跑多个 x264 重编码会占满 CPU，
+// 拖慢仍在进行的录制并引发读超时重连。
+static LIVE_REMUX_COPY_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+static LIVE_REMUX_TRANSCODE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+async fn run_live_ffmpeg_limited(
+    limit: &'static tokio::sync::Semaphore,
+    args: Vec<String>,
+) -> Result<Result<(), String>, tauri::Error> {
+    let _permit = limit.acquire().await;
+    tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&args)).await
+}
+
 fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) {
     let source_path = PathBuf::from(file_path);
     let ext = source_path
@@ -2663,7 +2676,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
             ),
         );
         let copy_args = build_live_remux_copy_args(&source, &target);
-        let copy_result = tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&copy_args))
+        let copy_result = run_live_ffmpeg_limited(&LIVE_REMUX_COPY_LIMIT, copy_args)
             .await
             .map_err(|_| "转封装执行失败".to_string());
 
@@ -2685,7 +2698,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
                 used_fallback_transcode = true;
                 let fallback_args = build_live_remux_transcode_args(&source, &target);
                 let fallback_result =
-                    tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&fallback_args))
+                    run_live_ffmpeg_limited(&LIVE_REMUX_TRANSCODE_LIMIT, fallback_args)
                         .await
                         .map_err(|_| "兜底转码执行失败".to_string());
                 remux_ok = matches!(fallback_result, Ok(Ok(())));
@@ -2719,7 +2732,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
             used_fallback_transcode = true;
             let fallback_args = build_live_remux_transcode_args(&source, &target);
             let fallback_result =
-                tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&fallback_args))
+                run_live_ffmpeg_limited(&LIVE_REMUX_TRANSCODE_LIMIT, fallback_args)
                     .await
                     .map_err(|_| "兜底转码执行失败".to_string());
             remux_ok = matches!(fallback_result, Ok(Ok(())));
