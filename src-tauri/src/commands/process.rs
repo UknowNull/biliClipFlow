@@ -96,7 +96,7 @@ pub async fn process_create(
     Ok(ApiResponse::success(task_id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn process_status(state: State<'_, AppState>, task_id: i64) -> ApiResponse<VideoProcessTask> {
     match state.db.with_conn(|conn| {
     conn.query_row(

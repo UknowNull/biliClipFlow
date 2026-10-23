@@ -21,7 +21,7 @@ fn default_base_path() -> String {
     default_download_dir().to_string_lossy().to_string()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn validate_directory(path: String) -> ApiResponse<bool> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -40,7 +40,7 @@ pub fn validate_directory(path: String) -> ApiResponse<bool> {
     ApiResponse::success(true)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn scan_path(path: Option<String>) -> ApiResponse<Vec<FileEntry>> {
     let scan_path = path
         .filter(|value| !value.trim().is_empty())
@@ -94,7 +94,7 @@ pub fn scan_path(path: Option<String>) -> ApiResponse<Vec<FileEntry>> {
     ApiResponse::success(entries)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn video_duration(path: String) -> ApiResponse<i64> {
     let trimmed = path.trim();
     if trimmed.is_empty() {

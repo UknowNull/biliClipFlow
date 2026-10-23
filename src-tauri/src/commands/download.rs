@@ -431,7 +431,7 @@ pub async fn download_video(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn download_get(state: State<'_, AppState>, task_id: i64) -> ApiResponse<VideoDownloadRecord> {
     let prefix = load_local_path_prefix(&state.db);
     match state.db.with_conn(|conn| {
@@ -475,7 +475,7 @@ pub fn download_get(state: State<'_, AppState>, task_id: i64) -> ApiResponse<Vid
   }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(non_snake_case)]
 pub fn download_list_by_status(
     state: State<'_, AppState>,
@@ -550,7 +550,7 @@ pub fn download_list_by_status(
   }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn download_delete(
     state: State<'_, AppState>,
     task_id: i64,

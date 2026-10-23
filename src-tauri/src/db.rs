@@ -26,6 +26,10 @@ impl Db {
         }
 
         let conn = Connection::open(db_path)?;
+        // WAL 让后台写入不阻塞前端读取；busy_timeout 避免偶发锁竞争直接报错。
+        let _ = conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
+        );
         let _ = conn.execute(
             "ALTER TABLE task_output_segment ADD COLUMN merged_id INTEGER",
             [],

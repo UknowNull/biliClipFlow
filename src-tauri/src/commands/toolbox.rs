@@ -805,7 +805,7 @@ fn start_toolbox_media_task(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toolbox_media_task_list(
     state: State<'_, AppState>,
 ) -> ApiResponse<Vec<ToolboxMediaTaskRecord>> {
@@ -1705,7 +1705,7 @@ pub async fn toolbox_bilibili_season_list(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toolbox_bilibili_season_backups(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1720,7 +1720,7 @@ pub fn toolbox_bilibili_season_backups(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toolbox_bilibili_season_backup_schedules(
     app: AppHandle,
 ) -> ApiResponse<Vec<SeasonBackupSchedule>> {
@@ -1730,7 +1730,7 @@ pub fn toolbox_bilibili_season_backup_schedules(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toolbox_bilibili_season_backup_schedule_set(
     app: AppHandle,
     payload: SeasonBackupScheduleSetPayload,
@@ -1770,7 +1770,7 @@ pub fn toolbox_bilibili_season_backup_schedule_set(
     ApiResponse::success(schedule)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toolbox_bilibili_season_backup_schedule_delete(
     app: AppHandle,
     payload: SeasonBackupScheduleDeletePayload,
@@ -1790,7 +1790,7 @@ pub fn toolbox_bilibili_season_backup_schedule_delete(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toolbox_bilibili_season_backup_export(
     app: AppHandle,
     payload: SeasonBackupFilePayload,
@@ -1838,7 +1838,7 @@ pub fn toolbox_bilibili_season_backup_export(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toolbox_bilibili_season_backup_import(
     app: AppHandle,
     payload: SeasonBackupFilePayload,
@@ -1889,7 +1889,7 @@ pub fn toolbox_bilibili_season_backup_import(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toolbox_bilibili_season_backup_delete(
     app: AppHandle,
     payload: SeasonBackupDeletePayload,

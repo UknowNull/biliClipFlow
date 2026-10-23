@@ -92,7 +92,7 @@ pub struct CacheItemInfo {
     pub exists: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_download_settings(state: State<'_, AppState>) -> ApiResponse<DownloadSettings> {
     match load_download_settings_from_db(&state.db) {
         Ok(settings) => ApiResponse::success(settings),
@@ -100,7 +100,7 @@ pub fn get_download_settings(state: State<'_, AppState>) -> ApiResponse<Download
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_live_settings(state: State<'_, AppState>) -> ApiResponse<LiveSettings> {
     match load_live_settings_from_db(&state.db) {
         Ok(settings) => ApiResponse::success(settings),
@@ -108,7 +108,7 @@ pub fn get_live_settings(state: State<'_, AppState>) -> ApiResponse<LiveSettings
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn settings_cache_overview(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
@@ -119,7 +119,7 @@ pub fn settings_cache_overview(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn settings_cache_clear(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
@@ -137,7 +137,7 @@ pub fn settings_cache_clear(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn settings_cache_open(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
@@ -157,7 +157,7 @@ pub fn settings_cache_open(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_download_settings(
     state: State<'_, AppState>,
     threads: i64,
@@ -306,7 +306,7 @@ pub fn update_download_settings(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_live_settings(
     state: State<'_, AppState>,
     payload: LiveSettings,

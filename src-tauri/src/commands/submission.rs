@@ -7232,7 +7232,7 @@ fn resolve_task_dir_for_open(
     Ok(normalize_dir_for_open(&dir))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_task_dir(state: State<'_, AppState>, task_id: String) -> ApiResponse<String> {
     let trimmed = task_id.trim();
     if trimmed.is_empty() {
@@ -7246,7 +7246,7 @@ pub fn submission_task_dir(state: State<'_, AppState>, task_id: String) -> ApiRe
     ApiResponse::success(dir.to_string_lossy().to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_open_task_dir(
     state: State<'_, AppState>,
     task_id: String,
@@ -7296,7 +7296,7 @@ pub fn submission_open_task_dir(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_delete_preview(
     state: State<'_, AppState>,
     task_id: String,
@@ -7400,7 +7400,7 @@ pub async fn submission_detail(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_bind_merged_remote_file(
     state: State<'_, AppState>,
     request: SubmissionBindMergedRemoteRequest,
@@ -7489,7 +7489,7 @@ pub fn submission_bind_merged_remote_file(
     ApiResponse::success("OK".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_clear_merged_remote_file(
     state: State<'_, AppState>,
     request: SubmissionClearMergedRemoteRequest,
@@ -7559,7 +7559,7 @@ pub fn submission_clear_merged_remote_file(
     ApiResponse::success("OK".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_batch_bind_segments_merged(
     state: State<'_, AppState>,
     request: SubmissionBatchBindSegmentsMergedRequest,
@@ -7684,7 +7684,7 @@ pub fn submission_batch_bind_segments_merged(
     ApiResponse::success(format!("已更新{}个分段绑定", updated))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_reorder_source_videos(
     state: State<'_, AppState>,
     request: SubmissionReorderSourceVideosRequest,
@@ -7773,7 +7773,7 @@ pub fn submission_reorder_source_videos(
     ApiResponse::success("源视频排序已更新".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_reorder_merged_videos(
     state: State<'_, AppState>,
     request: SubmissionReorderMergedVideosRequest,
@@ -7858,7 +7858,7 @@ pub fn submission_reorder_merged_videos(
     ApiResponse::success("合并视频排序已更新".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_bind_merged_sources(
     state: State<'_, AppState>,
     request: SubmissionBindMergedSourcesRequest,
@@ -7962,7 +7962,7 @@ pub fn submission_bind_merged_sources(
     ApiResponse::success(format!("已更新{}条源视频绑定", bound_sources.len()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_delete_merged_video(
     state: State<'_, AppState>,
     request: SubmissionDeleteMergedRequest,
@@ -8500,7 +8500,7 @@ pub async fn submission_edit_reupload_segment(
     Ok(ApiResponse::success(segment))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_edit_update_sources(
     state: State<'_, AppState>,
     request: SubmissionEditUpdateSourcesRequest,
@@ -8571,7 +8571,7 @@ pub async fn submission_upload_cover(
     Ok(ApiResponse::success(cover_url))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_cover_local_preview(
     request: SubmissionCoverLocalPreviewRequest,
 ) -> Result<ApiResponse<String>, String> {
@@ -8599,7 +8599,7 @@ pub fn submission_cover_local_preview(
     Ok(ApiResponse::success(data_url))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_edit_upload_status(
     state: State<'_, AppState>,
     request: SubmissionEditUploadStatusRequest,
@@ -8622,7 +8622,7 @@ pub fn submission_edit_upload_status(
     Ok(ApiResponse::success(segments))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_edit_upload_clear(
     state: State<'_, AppState>,
     request: SubmissionEditUploadClearRequest,
@@ -8917,7 +8917,7 @@ pub async fn submission_edit_submit(
     Ok(ApiResponse::success("编辑投稿成功".to_string()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_delete(
     state: State<'_, AppState>,
     request: SubmissionDeleteRequest,
@@ -9968,7 +9968,7 @@ async fn reconcile_unknown_submission_by_listing(
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_confirm_remote_missing(
     state: State<'_, AppState>,
     task_id: String,
@@ -10044,7 +10044,7 @@ pub fn submission_confirm_remote_missing(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_reupload_all_segments(
     state: State<'_, AppState>,
     task_id: String,
@@ -10351,7 +10351,7 @@ pub async fn submission_retry_segment_upload(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn workflow_status(
     state: State<'_, AppState>,
     task_id: String,
@@ -10363,7 +10363,7 @@ pub fn workflow_status(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn workflow_pause(state: State<'_, AppState>, task_id: String) -> ApiResponse<String> {
     let context = SubmissionContext::new(&state);
     match load_workflow_status(&context, &task_id) {
@@ -10381,7 +10381,7 @@ pub fn workflow_pause(state: State<'_, AppState>, task_id: String) -> ApiRespons
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn workflow_resume(state: State<'_, AppState>, task_id: String) -> ApiResponse<String> {
     let context = SubmissionContext::new(&state);
     match load_workflow_status(&context, &task_id) {
@@ -10399,7 +10399,7 @@ pub fn workflow_resume(state: State<'_, AppState>, task_id: String) -> ApiRespon
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn workflow_cancel(state: State<'_, AppState>, task_id: String) -> ApiResponse<String> {
     let context = SubmissionContext::new(&state);
     match set_workflow_instance_status(&context, &task_id, "CANCELLED") {
@@ -11150,7 +11150,7 @@ fn import_submission_task_bundle(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_export(
     state: State<'_, AppState>,
     request: SubmissionExportRequest,
@@ -11236,7 +11236,7 @@ pub fn submission_export(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_import(
     state: State<'_, AppState>,
     request: SubmissionImportRequest,
@@ -11873,7 +11873,7 @@ pub async fn submission_remote_video_preview(
     Ok(ApiResponse::success(preview))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submission_remote_import_save(
     state: State<'_, AppState>,
     request: SubmissionRemoteImportSaveRequest,
@@ -14333,7 +14333,7 @@ async fn run_submission_workflow(
 async fn run_submission_workflow_guarded(context: SubmissionContext, task_id: String) {
     if let Err(err) = run_submission_workflow(context.clone(), task_id.clone()).await {
         if err == "Workflow cancelled" {
-            if let Err(cleanup_err) = terminate_submission_ffmpeg_processes(&context, &task_id) {
+            if let Err(cleanup_err) = terminate_submission_ffmpeg_processes_async(&context, &task_id).await {
                 append_log(
                     &context.app_log_path,
                     &format!(
@@ -14351,7 +14351,7 @@ async fn run_submission_workflow_guarded(context: SubmissionContext, task_id: St
             );
             return;
         }
-        if let Err(cleanup_err) = terminate_submission_ffmpeg_processes(&context, &task_id) {
+        if let Err(cleanup_err) = terminate_submission_ffmpeg_processes_async(&context, &task_id).await {
             append_log(
                 &context.app_log_path,
                 &format!(
@@ -17405,7 +17405,7 @@ async fn recover_submission_tasks(context: SubmissionQueueContext) {
                 );
             }
         }
-        if let Err(err) = terminate_submission_ffmpeg_processes(&submission_context, &task_id) {
+        if let Err(err) = terminate_submission_ffmpeg_processes_async(&submission_context, &task_id).await {
             append_log(
                 &context.app_log_path,
                 &format!(
@@ -23072,6 +23072,20 @@ fn send_signal_to_process(pid: u32, signal: &str) -> Result<(), String> {
         "发送 {} 信号失败 pid={} status={}",
         signal, pid, status
     ))
+}
+
+// 清理过程含轮询等待进程退出的阻塞 sleep，异步上下文中必须放到阻塞线程池执行。
+async fn terminate_submission_ffmpeg_processes_async(
+    context: &SubmissionContext,
+    task_id: &str,
+) -> Result<(), String> {
+    let context = context.clone();
+    let task_id = task_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        terminate_submission_ffmpeg_processes(&context, &task_id)
+    })
+    .await
+    .map_err(|err| format!("ffmpeg cleanup task failed: {}", err))?
 }
 
 fn terminate_submission_ffmpeg_processes(

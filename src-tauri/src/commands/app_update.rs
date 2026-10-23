@@ -53,7 +53,7 @@ fn update_repo() -> &'static str {
     option_env!("REACTION_CUT_UPDATE_REPO").unwrap_or(DEFAULT_UPDATE_REPO)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn app_version() -> ApiResponse<AppVersionInfo> {
     ApiResponse::success(AppVersionInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),

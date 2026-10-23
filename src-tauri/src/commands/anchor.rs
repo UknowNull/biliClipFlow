@@ -159,7 +159,7 @@ pub async fn anchor_subscribe(
     Ok(anchor_list(state))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
     match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
@@ -202,7 +202,7 @@ pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
   }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_unsubscribe(state: State<'_, AppState>, uid: String) -> ApiResponse<String> {
     let context = LiveContext {
         db: state.db.clone(),
@@ -325,7 +325,7 @@ struct ClipInterval {
     peak_count: i64,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_record_list(
     state: State<'_, AppState>,
     room_id: String,
@@ -361,7 +361,7 @@ pub fn anchor_record_list(
   }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_submission_config_get(
     state: State<'_, AppState>,
     room_id: String,
@@ -402,7 +402,7 @@ pub fn anchor_submission_config_get(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_submission_config_save(
     state: State<'_, AppState>,
     config: AnchorSubmissionConfigInput,
@@ -485,7 +485,7 @@ pub fn anchor_submission_config_save(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_open_record_dir(file_path: String) -> ApiResponse<String> {
     let path = Path::new(file_path.trim());
     let dir = path.parent().unwrap_or(path);
@@ -524,7 +524,7 @@ pub fn anchor_open_record_dir(file_path: String) -> ApiResponse<String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_open_record_file(file_path: String) -> ApiResponse<String> {
     let path = Path::new(file_path.trim());
     match tauri_plugin_opener::open_path(path, None::<&str>)
@@ -607,7 +607,7 @@ pub async fn anchor_analyze_clips(
     Ok(ApiResponse::success(task_id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_clip_task_status(
     state: State<'_, AppState>,
     task_id: i64,
@@ -634,7 +634,7 @@ pub fn anchor_clip_task_status(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_clip_update_time(
     state: State<'_, AppState>,
     clip_id: i64,
@@ -685,7 +685,7 @@ pub fn anchor_clip_update_time(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_clip_reclip(state: State<'_, AppState>, clip_id: i64) -> ApiResponse<String> {
     if clip_id <= 0 {
         return ApiResponse::error("clip_id 无效");
@@ -795,7 +795,7 @@ pub fn anchor_clip_reclip(state: State<'_, AppState>, clip_id: i64) -> ApiRespon
     ApiResponse::success("已开始重新剪辑".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_clip_delete(state: State<'_, AppState>, clip_id: i64) -> ApiResponse<String> {
     if clip_id <= 0 {
         return ApiResponse::error("clip_id 无效");
@@ -846,7 +846,7 @@ pub fn anchor_clip_delete(state: State<'_, AppState>, clip_id: i64) -> ApiRespon
     ApiResponse::success("删除成功".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn anchor_clip_list(
     state: State<'_, AppState>,
     room_id: String,
