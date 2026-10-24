@@ -1838,14 +1838,31 @@ export default function AnchorSection() {
       parts.pop();
       return parts.join(sep);
     };
-    // 按天分组
-    const grouped = recordList.reduce((acc, record) => {
-      const day = toLocalDateStr(record.startTime);
-      if (!acc[day]) acc[day] = { day, records: [] };
-      acc[day].records.push(record);
-      return acc;
-    }, {});
-    const days = Object.values(grouped);
+    // 按场次分组：相邻分段间隔不超过 30 分钟视为同一场（跨午夜不拆开），与自动切片的场次规则一致
+    const SESSION_GAP_MS = 30 * 60 * 1000;
+    const sessions = [];
+    [...recordList]
+      .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))
+      .forEach((record) => {
+        const start = new Date(record.startTime).getTime();
+        const last = sessions[sessions.length - 1];
+        if (last && start - last.endMs <= SESSION_GAP_MS) {
+          last.records.push(record);
+          last.endMs = Math.max(last.endMs, new Date(record.endTime || record.startTime).getTime());
+        } else {
+          sessions.push({ records: [record], endMs: new Date(record.endTime || record.startTime).getTime() });
+        }
+      });
+    const dayCount = {};
+    sessions.forEach((s) => {
+      s.date = toLocalDateStr(s.records[0].startTime);
+      dayCount[s.date] = (dayCount[s.date] || 0) + 1;
+    });
+    // 同一天有多场时附上开播时间区分
+    const days = sessions.reverse().map((s) => ({
+      day: dayCount[s.date] > 1 ? `${s.date} ${toLocalTimeStr(s.records[0].startTime).slice(0, 5)}` : s.date,
+      records: s.records,
+    }));
     return (
       <div className="space-y-6">
         <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">

@@ -96,6 +96,19 @@ pub fn enqueue(task_id: i64) {
 /// 新建切片任务并入队。同一批录播的旧切片会在任务运行时清理。
 pub fn create_task(db: &Db, room_id: &str, record_ids: &[i64], trigger: &str, session_key: Option<&str>) -> Result<i64, String> {
     let ids_json = serde_json::to_string(record_ids).unwrap_or_else(|_| "[]".into());
+    // 同一批录播已有排队或运行中的任务时直接复用，避免重复点击产生重复任务
+    let active: Option<i64> = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT id FROM live_clip_task WHERE room_id = ?1 AND record_ids = ?2 AND status IN ('QUEUED', 'RUNNING') ORDER BY id LIMIT 1",
+                (room_id, &ids_json),
+                |row| row.get(0),
+            )
+        })
+        .ok();
+    if let Some(id) = active {
+        return Ok(id);
+    }
     let first_start: String = db
         .with_conn(|conn| {
             conn.query_row(
