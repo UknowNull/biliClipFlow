@@ -356,10 +356,15 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
     let asr_segs = pass.as_ref().map(|p| &p.segments).unwrap_or(&empty);
     let mut picked: Vec<Picked> = Vec::new();
     let mut dropped_ratio = 0;
+    let llm_failed = statuses.iter().filter(|s| **s == "ERROR").count();
+    if llm_failed > 0 {
+        warnings.push(format!("{} 个候选大模型精排失败，未生成切片", llm_failed));
+    }
     for (i, cand) in candidates.iter().enumerate() {
+        // 精排失败的候选质量不可控，不出片
         let factor = match statuses[i] {
             "KEPT" | "SIGNAL_ONLY" => 1.0,
-            "REJECTED" => 0.0,
+            "REJECTED" | "ERROR" => 0.0,
             _ => 0.6,
         };
         if factor == 0.0 {
@@ -370,7 +375,10 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
             Some(j) if statuses[i] == "KEPT" && j.end > j.start => Range { start: j.start.max(cand.start - 60.0), end: j.end.min(cand.end + 60.0) },
             _ => Range { start: cand.start, end: cand.end },
         };
-        let range = boundary::finalize(proposed, cand.peak, span, asr_segs, cfg.clip.min_duration_secs as f64, cfg.clip.max_duration_secs as f64);
+        let mut range = boundary::finalize(proposed, cand.peak, span, asr_segs, cfg.clip.min_duration_secs as f64, cfg.clip.max_duration_secs as f64);
+        if let Some(j) = judgements[i].as_ref().filter(|_| statuses[i] == "KEPT") {
+            range = boundary::cover(range, &locate_evidence(&j.evidence, asr_segs, cand.start, cand.end), span, cfg.clip.max_duration_secs as f64);
+        }
         let ratio = pass.as_ref().map(|p| boundary::streamer_ratio(range, &p.segments));
         if profile == Profile::Reaction {
             if let Some(r) = ratio {
@@ -425,6 +433,20 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
 fn hms(secs: f64, sep: &str) -> String {
     let s = secs.max(0.0) as i64;
     format!("{:02}{sep}{:02}{sep}{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// 在候选窗口内找出每条证据所在的句子，返回其起止秒；找不到的证据忽略
+fn locate_evidence(evidence: &[String], segments: &[asr::AsrSegment], start: f64, end: f64) -> Vec<(f64, f64)> {
+    let window: Vec<&asr::AsrSegment> = segments.iter().filter(|s| s.end > start && s.start < end).collect();
+    evidence
+        .iter()
+        .filter_map(|e| {
+            window
+                .iter()
+                .find(|s| llm::evidence_valid(std::slice::from_ref(e), &format!("{}{}", s.best_text(), s.text)))
+                .map(|s| (s.start, s.end))
+        })
+        .collect()
 }
 
 /// 每行：[起止秒][说话方|情绪/事件] 文本；同时返回纯文本用于证据校验

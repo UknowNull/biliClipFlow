@@ -134,7 +134,7 @@ async fn chat_json_inner(settings: &LlmSettings, mode: &str, system: &str, user:
         "model": settings.model,
         "temperature": settings.temperature,
         // 推理类模型会把思考过程计入输出长度，上限过小会截断 JSON
-        "max_tokens": 4096,
+        "max_tokens": 16384,
     });
     match mode {
         "json_schema" => {

@@ -6,6 +6,8 @@ use super::signals::Span;
 const SNAP_LOOKBACK_SECS: f64 = 15.0;
 const TAIL_SECS: f64 = 2.0;
 const LAUGH_EXTEND_SECS: f64 = 10.0;
+/// 句间停顿不超过该秒数视为同一段话，终点不在其中断开
+const CONTINUE_GAP_SECS: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Range {
@@ -47,6 +49,9 @@ pub fn finalize(
     if let Some(seg) = inside.iter().find(|s| s.start < end && s.end >= end) {
         end = seg.end;
     }
+    while let Some(seg) = inside.iter().find(|s| s.start >= end && s.start - end <= CONTINUE_GAP_SECS && s.end - start <= max_secs) {
+        end = seg.end;
+    }
     if let Some(seg) = inside.iter().find(|s| s.event == "Laughter" && s.start >= end && s.start - end <= LAUGH_EXTEND_SECS) {
         end = seg.end;
     }
@@ -86,6 +91,14 @@ pub fn finalize(
         end = e.max(s + min_secs.min(max_secs)).min(span.end);
     }
     Range { start, end }
+}
+
+/// 扩展区间以包含证据所在的句子（`located` 为证据句的起止），扩展后超过上限则保持原区间。
+pub fn cover(range: Range, located: &[(f64, f64)], span: Span, max_secs: f64) -> Range {
+    let Some(start) = located.iter().map(|l| l.0).reduce(f64::min) else { return range };
+    let end = located.iter().map(|l| l.1).fold(f64::MIN, f64::max);
+    let r = Range { start: range.start.min(start), end: range.end.max((end + TAIL_SECS).min(span.end)) };
+    if r.len() > max_secs { range } else { r }
 }
 
 /// 主播中文说话时长占区间的比例

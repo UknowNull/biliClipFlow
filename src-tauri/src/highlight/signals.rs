@@ -13,6 +13,8 @@ const PEAK_MIN_GAP_SECS: f64 = 180.0;
 const WINDOW_BEFORE_SECS: f64 = 90.0;
 const WINDOW_AFTER_SECS: f64 = 60.0;
 const MIN_PEAK_SCORE: f64 = 0.12;
+/// 短场次也至少召回这么多候选，给大模型淘汰留余量
+const MIN_CANDIDATES: usize = 5;
 
 /// 主播内容类型，决定信号权重与提示词
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,7 +285,7 @@ pub fn pick_candidates(
     let score = moving_average(&raw, 1);
 
     let hours = session_secs / 3600.0;
-    let k = ((hours * settings.candidates_per_hour).ceil() as usize).clamp(1, settings.max_candidates);
+    let k = ((hours * settings.candidates_per_hour).ceil() as usize).max(MIN_CANDIDATES).min(settings.max_candidates);
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|a, b| score[*b].total_cmp(&score[*a]));
     let gap_bins = (PEAK_MIN_GAP_SECS / BIN_SECS) as usize;
