@@ -377,7 +377,6 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
     let empty = Vec::new();
     let asr_segs = pass.as_ref().map(|p| &p.segments).unwrap_or(&empty);
     let mut picked: Vec<Picked> = Vec::new();
-    let mut dropped_ratio = 0;
     let llm_failed = statuses.iter().filter(|s| **s == "ERROR").count();
     if llm_failed > 0 {
         warnings.push(format!("{} 个候选大模型精排失败，未生成切片", llm_failed));
@@ -402,14 +401,6 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
             range = boundary::cover(range, &locate_evidence(&j.evidence, asr_segs, cand.start, cand.end), span, cfg.clip.max_duration_secs as f64);
         }
         let ratio = pass.as_ref().map(|p| boundary::streamer_ratio(range, &p.segments));
-        if profile == Profile::Reaction {
-            if let Some(r) = ratio {
-                if r * 100.0 < cfg.clip.min_streamer_speech_percent {
-                    dropped_ratio += 1;
-                    continue;
-                }
-            }
-        }
         picked.push(Picked {
             cand: cand.clone(),
             judgement: if statuses[i] == "KEPT" { judgements[i].clone() } else { None },
@@ -418,9 +409,6 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
             score: cand.score * factor + rank_bonus[i],
             streamer_ratio: ratio,
         });
-    }
-    if dropped_ratio > 0 {
-        warnings.push(format!("{} 个候选主播解说占比不足被淘汰", dropped_ratio));
     }
     let keep_idx = boundary::dedupe(&picked.iter().map(|p| (p.range, p.score)).collect::<Vec<_>>());
     let picked: Vec<Picked> = keep_idx.into_iter().map(|i| picked[i].clone()).collect();

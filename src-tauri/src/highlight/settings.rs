@@ -20,8 +20,6 @@ pub struct ClipSettings {
     pub max_duration_secs: i64,
     /// 候选窗口起点前移秒数，补偿弹幕滞后
     pub danmaku_lag_secs: i64,
-    /// reaction 主播：切片内主播中文说话时长占比下限（百分比）
-    pub min_streamer_speech_percent: f64,
     /// 相邻分段间隔不超过该分钟数视为同一场次
     pub session_gap_minutes: i64,
     pub use_llm: bool,
@@ -38,7 +36,6 @@ impl Default for ClipSettings {
             min_duration_secs: 45,
             max_duration_secs: 300,
             danmaku_lag_secs: 30,
-            min_streamer_speech_percent: 30.0,
             session_gap_minutes: 30,
             use_llm: true,
             title_candidates: 3,
@@ -184,7 +181,6 @@ fn sanitize(s: &mut AutoClipSettings) {
     c.min_duration_secs = c.min_duration_secs.clamp(15, 600);
     c.max_duration_secs = c.max_duration_secs.clamp(c.min_duration_secs + 15, 1200);
     c.danmaku_lag_secs = c.danmaku_lag_secs.clamp(0, 120);
-    c.min_streamer_speech_percent = c.min_streamer_speech_percent.clamp(0.0, 100.0);
     c.session_gap_minutes = c.session_gap_minutes.clamp(5, 240);
     c.title_candidates = c.title_candidates.clamp(1, 5);
     let l = &mut s.llm;

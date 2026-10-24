@@ -149,7 +149,6 @@ export default function AutoClipSettings({ visible }) {
       minDurationSecs: Number(clip.minDurationSecs),
       maxDurationSecs: Number(clip.maxDurationSecs),
       danmakuLagSecs: Number(clip.danmakuLagSecs),
-      minStreamerSpeechPercent: Number(clip.minStreamerSpeechPercent),
       sessionGapMinutes: Number(clip.sessionGapMinutes),
       titleCandidates: Number(clip.titleCandidates),
     },
@@ -251,9 +250,6 @@ export default function AutoClipSettings({ visible }) {
           </Field>
           <Field label="弹幕滞后补偿（秒）" hint="弹幕晚于画面，候选窗口起点前移的秒数">
             <input type="number" className={inputClass} value={clip.danmakuLagSecs} onChange={(e) => update("clip", "danmakuLagSecs", e.target.value)} />
-          </Field>
-          <Field label="主播解说最低占比（%）" hint="仅对内容类型为 reaction 的主播生效，需要语音识别">
-            <input type="number" className={inputClass} value={clip.minStreamerSpeechPercent} onChange={(e) => update("clip", "minStreamerSpeechPercent", e.target.value)} />
           </Field>
           <Field label="场次间隔（分钟）" hint="相邻录播分段间隔不超过该值视为同一场直播">
             <input type="number" className={inputClass} value={clip.sessionGapMinutes} onChange={(e) => update("clip", "sessionGapMinutes", e.target.value)} />
