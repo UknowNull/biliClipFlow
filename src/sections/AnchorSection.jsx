@@ -64,6 +64,10 @@ export default function AnchorSection() {
   const [reclipLoading, setReclipLoading] = useState({});
   const [clipExpanded, setClipExpanded] = useState({});
   const [clipProfile, setClipProfile] = useState("reaction");
+  // 主播声纹：null 为未登记，否则为来源说明；voiceprintForm 非空时显示登记表单
+  const [voiceprint, setVoiceprint] = useState(null);
+  const [voiceprintForm, setVoiceprintForm] = useState(null);
+  const [voiceprintBusy, setVoiceprintBusy] = useState(false);
   const [clipSubmitView, setClipSubmitView] = useState(null);
   const [clipSubmitMessage, setClipSubmitMessage] = useState("");
   const [clipSubmitSubmitting, setClipSubmitSubmitting] = useState(false);
@@ -890,6 +894,10 @@ export default function AnchorSection() {
       setClipView({ dateLabel: day, records: items, recordIds, task: data });
       invokeCommand("anchor_clip_profile_get", { roomId: recordView.uid })
         .then((value) => setClipProfile(value || "reaction"))
+        .catch(() => {});
+      setVoiceprintForm(null);
+      invokeCommand("anchor_voiceprint_get", { roomId: recordView.uid })
+        .then((value) => setVoiceprint(value || null))
         .catch(() => {});
     } catch (error) {
       setClipListError(error?.message || "加载切片记录失败");
@@ -2058,6 +2066,82 @@ export default function AnchorSection() {
                     ))}
                   </select>
                 </label>
+                <div
+                  className="mr-3 flex items-center gap-2 text-xs text-[var(--muted)]"
+                  title="原片也是中文时，靠主播声纹区分主播解说与原片对白；选一段只有主播说话的位置，取其后 120 秒"
+                >
+                  主播声纹
+                  {voiceprintForm ? (
+                    <>
+                      <select
+                        className="rounded-lg border border-black/10 bg-white px-2 py-1 text-xs text-[var(--ink)]"
+                        value={voiceprintForm.recordId}
+                        onChange={(event) => setVoiceprintForm((prev) => ({ ...prev, recordId: Number(event.target.value) }))}
+                      >
+                        {recordList
+                          .filter((record) => clipView.recordIds.includes(record.id))
+                          .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))
+                          .map((record, index) => (
+                            <option key={record.id} value={record.id}>
+                              {`分段 ${index + 1}（${new Date(record.startTime).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })} 开始）`}
+                            </option>
+                          ))}
+                      </select>
+                      <input
+                        className="w-20 rounded-lg border border-black/10 bg-white px-2 py-1 text-xs text-[var(--ink)]"
+                        placeholder="00:04:03"
+                        value={voiceprintForm.time}
+                        onChange={(event) => setVoiceprintForm((prev) => ({ ...prev, time: event.target.value }))}
+                      />
+                      <button
+                        className="rounded-full border border-black/10 bg-white px-2 py-0.5 text-xs font-semibold text-[var(--ink)] hover:border-black/20 disabled:opacity-50"
+                        disabled={voiceprintBusy}
+                        onClick={async () => {
+                          const startSecs = voiceprintForm.time
+                            .split(":")
+                            .map(Number)
+                            .reduce((acc, part) => acc * 60 + (Number.isFinite(part) ? part : 0), 0);
+                          setVoiceprintBusy(true);
+                          try {
+                            const source = await invokeCommand("anchor_voiceprint_enroll", {
+                              roomId: recordView.uid,
+                              recordId: voiceprintForm.recordId,
+                              startSecs,
+                            });
+                            setVoiceprint(source);
+                            setVoiceprintForm(null);
+                            setClipListMessage("主播声纹已登记，下次分析生效");
+                          } catch (error) {
+                            setClipListError(error?.message || "登记主播声纹失败");
+                          } finally {
+                            setVoiceprintBusy(false);
+                          }
+                        }}
+                      >
+                        {voiceprintBusy ? "登记中..." : "确定"}
+                      </button>
+                      <button className="text-xs hover:underline" onClick={() => setVoiceprintForm(null)}>
+                        取消
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      {voiceprint ? (
+                        <span className="text-[var(--ink)]" title={voiceprint}>
+                          已登记
+                        </span>
+                      ) : (
+                        <span className="text-amber-700">未登记</span>
+                      )}
+                      <button
+                        className="text-xs text-blue-600 hover:underline"
+                        onClick={() => setVoiceprintForm({ recordId: clipView.recordIds[0], time: "" })}
+                      >
+                        {voiceprint ? "重新登记" : "登记"}
+                      </button>
+                    </>
+                  )}
+                </div>
             <button
               className="rounded-full border border-black/10 bg-white px-3 py-1 text-sm font-semibold text-[var(--ink)] hover:border-black/20"
               onClick={() => {

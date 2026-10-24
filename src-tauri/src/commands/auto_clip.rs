@@ -128,3 +128,61 @@ pub fn anchor_clip_profile_set(state: State<'_, AppState>, room_id: String, prof
         Err(err) => ApiResponse::error(format!("保存内容类型失败: {}", err)),
     }
 }
+
+const VOICEPRINT_SECS: f64 = 120.0;
+
+/// 房间主播声纹登记情况：未登记时返回 None，已登记返回来源说明
+#[tauri::command(async)]
+pub fn anchor_voiceprint_get(state: State<'_, AppState>, room_id: String) -> ApiResponse<Option<String>> {
+    let raw = state
+        .db
+        .with_conn(|c| c.query_row("SELECT voiceprint FROM live_room_settings WHERE room_id = ?1", [room_id.trim()], |r| r.get::<_, Option<String>>(0)))
+        .ok()
+        .flatten();
+    let note = raw
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+        .and_then(|v| v.get("source").and_then(|s| s.as_str()).map(String::from));
+    ApiResponse::success(note)
+}
+
+/// 从录播指定位置起取 120 秒（应只有主播在说话）登记主播声纹
+#[tauri::command(async)]
+pub fn anchor_voiceprint_enroll(state: State<'_, AppState>, app: tauri::AppHandle, room_id: String, record_id: i64, start_secs: f64) -> ApiResponse<String> {
+    let room_id = room_id.trim().to_string();
+    let cfg = settings::load(&state.db);
+    let dir = hl::model_dir(&app.path().app_data_dir().unwrap_or_default(), &cfg.asr);
+    if !hl::speaker::model_ready(&dir) {
+        return ApiResponse::error("未下载声纹模型，请在设置 > 自动切片中下载模型");
+    }
+    let row = state.db.with_conn(|c| {
+        c.query_row(
+            "SELECT file_path FROM live_record_task WHERE id = ?1 AND room_id = ?2",
+            (record_id, &room_id),
+            |r| r.get::<_, String>(0),
+        )
+    });
+    let Ok(file_path) = row else { return ApiResponse::error("录播记录不存在") };
+    let Some(path) = crate::commands::anchor::resolve_existing_record_path(&file_path) else {
+        return ApiResponse::error("录播文件不存在");
+    };
+    let result = asr::decode_range(&path, start_secs.max(0.0), VOICEPRINT_SECS)
+        .and_then(|audio| hl::speaker::enroll(&dir, cfg.asr.threads, &audio));
+    let embedding = match result {
+        Ok(e) => e,
+        Err(err) => return ApiResponse::error(err),
+    };
+    let secs = start_secs.max(0.0) as i64;
+    let source = format!("录播 #{} {:02}:{:02}:{:02} 起 {} 秒", record_id, secs / 3600, secs % 3600 / 60, secs % 60, VOICEPRINT_SECS as i64);
+    let value = serde_json::json!({ "embedding": embedding, "recordId": record_id, "startSecs": start_secs, "source": source }).to_string();
+    let saved = state.db.with_conn(|c| {
+        c.execute(
+            "INSERT INTO live_room_settings (room_id, voiceprint, update_time) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(room_id) DO UPDATE SET voiceprint = excluded.voiceprint, update_time = excluded.update_time",
+            (&room_id, &value, &now_rfc3339()),
+        )
+    });
+    match saved {
+        Ok(_) => ApiResponse::success(source),
+        Err(err) => ApiResponse::error(format!("保存主播声纹失败: {}", err)),
+    }
+}

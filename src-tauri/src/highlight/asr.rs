@@ -67,6 +67,13 @@ const MODEL_FILES: &[ModelFile] = &[
             "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
         ],
     },
+    // 声纹模型（可选）：缺失时按语种区分主播与原片
+    ModelFile {
+        rel_path: super::speaker::MODEL_REL,
+        remote: "csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+        size: 28_281_138,
+        sha256: &["f682b514c05d947ee3fa91cd6ec6c5c7543479a128373fa29b1faedccd21fd11"],
+    },
 ];
 
 fn source_base(source: &str) -> &'static str {
@@ -120,8 +127,9 @@ pub fn model_status(dir: &Path) -> Vec<ModelFileStatus> {
         .collect()
 }
 
+/// 语音识别必需的模型是否就绪（声纹模型可选，不计入）
 pub fn models_ready(dir: &Path) -> bool {
-    model_status(dir).iter().all(|s| s.ready)
+    model_status(dir).iter().filter(|s| s.path != super::speaker::MODEL_REL).all(|s| s.ready)
 }
 
 /// 下载缺失的模型文件（支持断点续传），完成后校验 SHA256。阻塞执行。
@@ -334,11 +342,22 @@ pub struct AsrSegment {
     /// Paraformer 二次识别的中文文本
     #[serde(default)]
     pub zh_text: Option<String>,
+    /// 声纹判定的主播说话秒数；为空时按语种判断（中文视为主播）
+    #[serde(default)]
+    pub streamer_secs: Option<f64>,
 }
 
 impl AsrSegment {
     pub fn is_streamer(&self) -> bool {
-        matches!(self.lang.as_str(), "zh" | "yue")
+        self.streamer_seconds() * 2.0 >= self.end - self.start
+    }
+
+    pub fn streamer_seconds(&self) -> f64 {
+        match self.streamer_secs {
+            Some(secs) => secs,
+            None if matches!(self.lang.as_str(), "zh" | "yue") => self.end - self.start,
+            None => 0.0,
+        }
     }
 
     pub fn best_text(&self) -> &str {
@@ -440,6 +459,7 @@ pub fn full_pass(
                                 event: tag(&json, "event"),
                                 text,
                                 zh_text: None,
+                                streamer_secs: None,
                             });
                         }
                     }
@@ -506,6 +526,41 @@ pub fn refine_chinese(
         return Ok(());
     }
     let recognizer = Recognizer::paraformer(model_dir, threads)?;
+    let mut texts = Vec::new();
+    for_each_segment_audio(files, segments, targets, |i, audio| {
+        if let Some(json) = recognizer.decode(audio) {
+            let text = json.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            if !text.is_empty() {
+                texts.push((i, text));
+            }
+        }
+    })?;
+    for (i, text) in texts {
+        segments[i].zh_text = Some(text);
+    }
+    Ok(())
+}
+
+/// 解码文件中一段音频为 16kHz 单声道
+pub fn decode_range(path: &str, start: f64, duration: f64) -> Result<Vec<f32>, String> {
+    let mut child = spawn_pcm(path, Some(start), Some(duration))?;
+    let mut bytes = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_end(&mut bytes).map_err(|e| format!("读取音频失败: {}", e))?;
+    }
+    let _ = child.wait();
+    let mut audio = Vec::new();
+    pcm_to_f32(&bytes, &mut audio);
+    Ok(audio)
+}
+
+/// 按文件位置把相邻分段合并解码，逐个回调分段下标与其音频（16kHz 单声道）
+pub fn for_each_segment_audio(
+    files: &[AudioFile],
+    segments: &[AsrSegment],
+    targets: &[usize],
+    mut f: impl FnMut(usize, &[f32]),
+) -> Result<(), String> {
     let mut order = targets.to_vec();
     order.sort_by(|&a, &b| {
         (segments[a].file_idx, segments[a].file_start)
@@ -529,26 +584,13 @@ pub fn refine_chinese(
         let Some(file) = files.get(first.file_idx) else { continue };
         let span_start = first.file_start;
         let span_end = last.file_start + (last.end - last.start);
-        let mut child = spawn_pcm(file.path, Some(span_start), Some(span_end - span_start + 0.5))?;
-        let mut bytes = Vec::new();
-        if let Some(mut out) = child.stdout.take() {
-            out.read_to_end(&mut bytes).map_err(|e| format!("读取音频失败: {}", e))?;
-        }
-        let _ = child.wait();
-        let mut audio = Vec::new();
-        pcm_to_f32(&bytes, &mut audio);
+        let audio = decode_range(file.path, span_start, span_end - span_start + 0.5)?;
         for &i in &group {
             let seg = &segments[i];
             let from = ((seg.file_start - span_start) * SAMPLE_RATE as f64) as usize;
             let to = (from + ((seg.end - seg.start) * SAMPLE_RATE as f64) as usize).min(audio.len());
-            if from >= to {
-                continue;
-            }
-            if let Some(json) = recognizer.decode(&audio[from..to]) {
-                let text = json.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                if !text.is_empty() {
-                    segments[i].zh_text = Some(text);
-                }
+            if from < to {
+                f(i, &audio[from..to]);
             }
         }
     }

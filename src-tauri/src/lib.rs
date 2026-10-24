@@ -257,6 +257,8 @@ pub fn run() {
             commands::anchor::anchor_clip_mark,
             commands::auto_clip::anchor_clip_profile_get,
             commands::auto_clip::anchor_clip_profile_set,
+            commands::auto_clip::anchor_voiceprint_get,
+            commands::auto_clip::anchor_voiceprint_enroll,
             commands::auto_clip::auto_clip_settings_get,
             commands::auto_clip::auto_clip_settings_save,
             commands::auto_clip::auto_clip_llm_test,

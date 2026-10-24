@@ -106,10 +106,11 @@ pub fn streamer_ratio(range: Range, segments: &[AsrSegment]) -> f64 {
     if range.len() <= 0.0 {
         return 0.0;
     }
+    // 分段内主播说话时长按与区间的重叠比例折算
     let speech: f64 = segments
         .iter()
-        .filter(|s| s.is_streamer())
-        .map(|s| (s.end.min(range.end) - s.start.max(range.start)).max(0.0))
+        .filter(|s| s.end > s.start)
+        .map(|s| s.streamer_seconds() * (s.end.min(range.end) - s.start.max(range.start)).max(0.0) / (s.end - s.start))
         .sum();
     speech / range.len()
 }
@@ -148,6 +149,7 @@ mod tests {
             event: event.into(),
             text: "x".into(),
             zh_text: None,
+            streamer_secs: None,
         }
     }
 

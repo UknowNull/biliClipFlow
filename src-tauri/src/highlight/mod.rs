@@ -10,6 +10,7 @@ pub mod danmaku;
 pub mod llm;
 pub mod settings;
 pub mod signals;
+pub mod speaker;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -264,6 +265,7 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
         let windows: Vec<(f64, f64)> = candidates.iter().map(|c| (c.start, c.end)).collect();
         let files: Vec<(String, f64)> = segs.iter().map(|s| (s.file_path.clone(), s.offset_start as f64)).collect();
         let (mdir2, threads) = (mdir.clone(), cfg.asr.threads);
+        let voiceprint = room_voiceprint(&db, &room_id).filter(|_| speaker::model_ready(&mdir));
         pass = Some(
             blocking(move || {
                 let mut p = p;
@@ -275,6 +277,13 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
                     .collect();
                 let audio: Vec<AudioFile> = files.iter().map(|(path, o)| AudioFile { path, offset_start: *o }).collect();
                 asr::refine_chinese(&mdir2, threads, &audio, &mut p.segments, &targets)?;
+                // 已登记主播声纹时，按声纹判定候选窗口内每句的主播说话时长
+                if let Some(vp) = voiceprint.as_deref() {
+                    let all: Vec<usize> = (0..p.segments.len())
+                        .filter(|&i| windows.iter().any(|(a, b)| p.segments[i].end > *a && p.segments[i].start < *b))
+                        .collect();
+                    speaker::label_streamer(&mdir2, threads, &audio, &mut p.segments, &all, vp)?;
+                }
                 Ok(p)
             })
             .await?,
@@ -479,6 +488,16 @@ fn window_transcript(segments: &[asr::AsrSegment], start: f64, end: f64) -> (Str
         plain.push_str(&s.text);
     }
     (lines.join("\n"), plain)
+}
+
+/// 房间登记的主播声纹
+pub fn room_voiceprint(db: &Db, room_id: &str) -> Option<Vec<f32>> {
+    let raw = db
+        .with_conn(|c| c.query_row("SELECT voiceprint FROM live_room_settings WHERE room_id = ?1", [room_id], |r| r.get::<_, Option<String>>(0)))
+        .ok()
+        .flatten()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    serde_json::from_value(value.get("embedding")?.clone()).ok()
 }
 
 fn room_meta(db: &Db, room_id: &str, first_record: Option<i64>) -> (String, Profile) {

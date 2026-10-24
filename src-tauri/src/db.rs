@@ -299,6 +299,7 @@ impl Db {
             "ALTER TABLE live_room_settings ADD COLUMN clip_profile TEXT NOT NULL DEFAULT 'reaction'",
             [],
         );
+        let _ = conn.execute("ALTER TABLE live_room_settings ADD COLUMN voiceprint TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE live_record_task ADD COLUMN remux_status TEXT",
             [],
