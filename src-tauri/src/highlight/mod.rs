@@ -247,8 +247,9 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
         warnings.push("未下载语音识别模型，已跳过语音信号与 AI 精排，可在设置 > 自动切片中下载".into());
     }
     // 已登记主播声纹：整场逐句判定主播说话时长（带缓存），供候选召回、主播占比与转写标注使用
-    let voiceprint = room_voiceprint(&db, &room_id).filter(|_| speaker::model_ready(&mdir));
-    if let (Some(vp), Some(p)) = (voiceprint, pass.take()) {
+    let voiceprint = room_voiceprint(&db, &room_id).filter(|_| speaker::model_ready(&mdir) && pass.is_some());
+    if let Some(vp) = voiceprint {
+        let p = pass.take().unwrap();
         set_stage(&db, task_id, "SPEAKER", 60.0);
         let ids_key = record_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("-");
         let cache = clips_dir.join(".cache").join(format!("speaker_{}_{}.json", speaker::voiceprint_key(&vp), ids_key));
