@@ -31,8 +31,8 @@ impl Default for ClipSettings {
         Self {
             enabled: false,
             enabled_since: String::new(),
-            candidates_per_hour: 2.0,
-            max_candidates: 15,
+            candidates_per_hour: 6.0,
+            max_candidates: 30,
             min_duration_secs: 45,
             max_duration_secs: 300,
             danmaku_lag_secs: 30,
