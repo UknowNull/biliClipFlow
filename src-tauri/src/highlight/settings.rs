@@ -55,6 +55,8 @@ pub struct LlmSettings {
     pub model: String,
     /// auto | json_schema | json_object | prompt
     pub structured_output: String,
+    /// 思考档位，作为 reasoning_effort 发送；为空不发送，由服务端决定
+    pub reasoning_effort: String,
     pub temperature: f64,
     pub timeout_secs: u64,
     pub max_concurrency: usize,
@@ -69,6 +71,7 @@ impl Default for LlmSettings {
             api_key: String::new(),
             model: String::new(),
             structured_output: "auto".to_string(),
+            reasoning_effort: String::new(),
             temperature: 0.3,
             timeout_secs: 120,
             max_concurrency: 1,
@@ -187,6 +190,9 @@ fn sanitize(s: &mut AutoClipSettings) {
     let l = &mut s.llm;
     l.base_url = l.base_url.trim().trim_end_matches('/').to_string();
     l.model = l.model.trim().to_string();
+    if !["", "off", "low", "medium", "high"].contains(&l.reasoning_effort.as_str()) {
+        l.reasoning_effort = String::new();
+    }
     l.temperature = l.temperature.clamp(0.0, 1.5);
     l.timeout_secs = l.timeout_secs.clamp(10, 900);
     l.max_concurrency = l.max_concurrency.clamp(1, 16);

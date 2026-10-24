@@ -136,6 +136,9 @@ async fn chat_json_inner(settings: &LlmSettings, mode: &str, system: &str, user:
         // 推理类模型会把思考过程计入输出长度，上限过小会截断 JSON
         "max_tokens": 16384,
     });
+    if !settings.reasoning_effort.is_empty() {
+        body["reasoning_effort"] = json!(settings.reasoning_effort);
+    }
     match mode {
         "json_schema" => {
             body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "result", "schema": schema}});

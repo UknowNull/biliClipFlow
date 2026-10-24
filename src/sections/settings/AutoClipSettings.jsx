@@ -21,6 +21,14 @@ const STRUCTURED_OPTIONS = [
   { value: "prompt", label: "仅提示词" },
 ];
 
+const REASONING_OPTIONS = [
+  { value: "", label: "不指定" },
+  { value: "off", label: "关闭（off）" },
+  { value: "low", label: "低（low）" },
+  { value: "medium", label: "中（medium）" },
+  { value: "high", label: "高（high）" },
+];
+
 const MODEL_LABELS = {
   "sensevoice/model.int8.onnx": "SenseVoice 模型（语种/情绪/事件）",
   "sensevoice/tokens.txt": "SenseVoice 词表",
@@ -315,6 +323,15 @@ export default function AutoClipSettings({ visible }) {
           <Field label="结构化输出" hint="自动检测会在测试连接时选出服务支持的方式">
             <select className={inputClass} value={llm.structuredOutput} onChange={(e) => update("llm", "structuredOutput", e.target.value)}>
               {STRUCTURED_OPTIONS.map((item) => (
+                <option key={item.value} value={item.value}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="思考档位" hint="推理模型的思考过程计入输出 token，关闭可大幅节省；不指定时由服务端决定">
+            <select className={inputClass} value={llm.reasoningEffort || ""} onChange={(e) => update("llm", "reasoningEffort", e.target.value)}>
+              {REASONING_OPTIONS.map((item) => (
                 <option key={item.value} value={item.value}>
                   {item.label}
                 </option>
