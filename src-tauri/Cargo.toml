@@ -28,6 +28,8 @@ rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 thiserror = "1"
 tokio = { version = "1", features = ["sync", "time", "net", "io-util", "macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+# 弹幕 wss 需要 rustls 有且只有一个加密后端，否则 connect_async 时 panic
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 flate2 = "1"
 brotli = "6"
