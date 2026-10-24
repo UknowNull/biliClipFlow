@@ -246,6 +246,33 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
     } else if cfg.asr.mode == "local" {
         warnings.push("未下载语音识别模型，已跳过语音信号与 AI 精排，可在设置 > 自动切片中下载".into());
     }
+    // 已登记主播声纹：整场逐句判定主播说话时长（带缓存），供候选召回、主播占比与转写标注使用
+    let voiceprint = room_voiceprint(&db, &room_id).filter(|_| speaker::model_ready(&mdir));
+    if let (Some(vp), Some(p)) = (voiceprint, pass.take()) {
+        set_stage(&db, task_id, "SPEAKER", 60.0);
+        let ids_key = record_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("-");
+        let cache = clips_dir.join(".cache").join(format!("speaker_{}_{}.json", speaker::voiceprint_key(&vp), ids_key));
+        let files: Vec<(String, f64)> = segs.iter().map(|s| (s.file_path.clone(), s.offset_start as f64)).collect();
+        let (mdir2, threads) = (mdir.clone(), cfg.asr.threads);
+        pass = Some(
+            blocking(move || {
+                let mut p = p;
+                let cached = std::fs::read(&cache).ok().and_then(|b| serde_json::from_slice::<Vec<Option<f64>>>(&b).ok());
+                match cached.filter(|c| c.len() == p.segments.len()) {
+                    Some(secs) => p.segments.iter_mut().zip(secs).for_each(|(s, v)| s.streamer_secs = v),
+                    None => {
+                        let audio: Vec<AudioFile> = files.iter().map(|(path, o)| AudioFile { path, offset_start: *o }).collect();
+                        let all: Vec<usize> = (0..p.segments.len()).collect();
+                        speaker::label_streamer(&mdir2, threads, &audio, &mut p.segments, &all, &vp)?;
+                        let secs: Vec<Option<f64>> = p.segments.iter().map(|s| s.streamer_secs).collect();
+                        let _ = std::fs::write(&cache, serde_json::to_vec(&secs).unwrap_or_default());
+                    }
+                }
+                Ok(p)
+            })
+            .await?,
+        );
+    }
     if pass.is_none() && !has_danmaku {
         return Err("既没有弹幕也没有可用的语音识别模型，无法分析".into());
     }
@@ -265,7 +292,6 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
         let windows: Vec<(f64, f64)> = candidates.iter().map(|c| (c.start, c.end)).collect();
         let files: Vec<(String, f64)> = segs.iter().map(|s| (s.file_path.clone(), s.offset_start as f64)).collect();
         let (mdir2, threads) = (mdir.clone(), cfg.asr.threads);
-        let voiceprint = room_voiceprint(&db, &room_id).filter(|_| speaker::model_ready(&mdir));
         pass = Some(
             blocking(move || {
                 let mut p = p;
@@ -277,13 +303,6 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
                     .collect();
                 let audio: Vec<AudioFile> = files.iter().map(|(path, o)| AudioFile { path, offset_start: *o }).collect();
                 asr::refine_chinese(&mdir2, threads, &audio, &mut p.segments, &targets)?;
-                // 已登记主播声纹时，按声纹判定候选窗口内每句的主播说话时长
-                if let Some(vp) = voiceprint.as_deref() {
-                    let all: Vec<usize> = (0..p.segments.len())
-                        .filter(|&i| windows.iter().any(|(a, b)| p.segments[i].end > *a && p.segments[i].start < *b))
-                        .collect();
-                    speaker::label_streamer(&mdir2, threads, &audio, &mut p.segments, &all, vp)?;
-                }
                 Ok(p)
             })
             .await?,

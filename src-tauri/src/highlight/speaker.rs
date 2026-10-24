@@ -91,6 +91,13 @@ pub fn enroll(model_dir: &Path, threads: i32, audio: &[f32]) -> Result<Vec<f32>,
     Ok(mean(&kept))
 }
 
+/// 声纹的短摘要，用作判定结果缓存的键（重新登记后缓存自动失效）
+pub fn voiceprint_key(voiceprint: &[f32]) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes: Vec<u8> = voiceprint.iter().flat_map(|v| v.to_le_bytes()).collect();
+    Sha256::digest(&bytes).iter().take(6).map(|b| format!("{:02x}", b)).collect()
+}
+
 /// 给目标分段写入主播说话秒数：按 2 秒小块计入像主播的部分；不足 1 秒的短句整句判定
 pub fn label_streamer(model_dir: &Path, threads: i32, files: &[AudioFile], segments: &mut [AsrSegment], targets: &[usize], voiceprint: &[f32]) -> Result<(), String> {
     let ex = extractor(model_dir, threads)?;

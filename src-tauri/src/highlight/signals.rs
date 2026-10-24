@@ -15,6 +15,10 @@ const WINDOW_AFTER_SECS: f64 = 60.0;
 const MIN_PEAK_SCORE: f64 = 0.12;
 /// 短场次也至少召回这么多候选，给大模型淘汰留余量
 const MIN_CANDIDATES: usize = 5;
+/// 有声纹标注时「主播说话密度」信号的权重，其余信号按比例缩小
+const STREAMER_DENSITY_WEIGHT: f64 = 0.25;
+/// 有声纹标注时，峰值前后一分钟主播说话不足该秒数的不出候选（纯原片片段）
+const MIN_STREAMER_SECS_NEAR_PEAK: f64 = 3.0;
 
 /// 主播内容类型，决定信号权重与提示词
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,8 +235,10 @@ fn build_features(n: usize, events: &[DanmakuEvent], asr: Option<&FullPass>) -> 
             if seg.event == "Laughter" {
                 add_overlap(&mut laugh, seg.start, seg.end, 1.0);
             }
+            if seg.end > seg.start {
+                add_overlap(&mut streamer, seg.start, seg.end, (seg.streamer_seconds() / (seg.end - seg.start)).min(1.0));
+            }
             if seg.is_streamer() {
-                add_overlap(&mut streamer, seg.start, seg.end, 1.0);
                 if matches!(seg.emotion.as_str(), "HAPPY" | "SURPRISED" | "ANGRY") {
                     add_overlap(&mut emo, seg.start, seg.end, 1.0);
                 }
@@ -281,7 +287,13 @@ pub fn pick_candidates(
     let heat_excess: Vec<f64> = f.heat_ratio.iter().zip(&f.heat).map(|(r, h)| if *h >= 2.0 { (r - 1.0).max(0.0) } else { 0.0 }).collect();
     let laugh_emo: Vec<f64> = f.laugh.iter().zip(&f.emo).map(|(l, e)| l * 2.0 + e).collect();
     let scaled = [scale(&heat_excess), scale(&f.spam), scale(&f.paid), scale(&f.loud), scale(&laugh_emo)];
-    let raw: Vec<f64> = (0..n).map(|b| (0..5).map(|k| w[k] * scaled[k][b]).sum()).collect();
+    // 登记了主播声纹时才知道谁在说话，此时主播说话多的时段也作为高光信号
+    let labeled = asr.is_some_and(|p| p.segments.iter().any(|s| s.streamer_secs.is_some()));
+    let density = if labeled { STREAMER_DENSITY_WEIGHT } else { 0.0 };
+    let streamer_density = scale(&moving_average(&f.streamer, (60.0 / BIN_SECS) as usize));
+    let raw: Vec<f64> = (0..n)
+        .map(|b| (1.0 - density) * (0..5).map(|k| w[k] * scaled[k][b]).sum::<f64>() + density * streamer_density[b])
+        .collect();
     let score = moving_average(&raw, 1);
 
     let hours = session_secs / 3600.0;
@@ -301,6 +313,9 @@ pub fn pick_candidates(
         // 主播离开或长时间静音：前后一分钟既没人说话也没有弹幕
         let activity = sum_range(&f.any_speech, t - 60.0, t + 60.0) + sum_range(&f.dm_count, t - 60.0, t + 60.0);
         if asr.is_some() && activity < 5.0 {
+            continue;
+        }
+        if labeled && sum_range(&f.streamer, t - 60.0, t + 60.0) < MIN_STREAMER_SECS_NEAR_PEAK {
             continue;
         }
         picked.push(b);

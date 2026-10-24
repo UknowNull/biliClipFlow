@@ -7,6 +7,7 @@ const CLIP_ACTIVE_STATUSES = ["RUNNING", "QUEUED"];
 const CLIP_STAGE_LABELS = {
   PREPARE: "准备",
   ASR: "语音识别",
+  SPEAKER: "声纹判定",
   CANDIDATES: "挑选候选",
   TRANSCRIBE: "转写",
   AI: "AI 精排",
