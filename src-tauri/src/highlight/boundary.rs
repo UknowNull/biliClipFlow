@@ -93,12 +93,17 @@ pub fn finalize(
     Range { start, end }
 }
 
-/// 扩展区间以包含证据所在的句子（`located` 为证据句的起止），扩展后超过上限则保持原区间。
-pub fn cover(range: Range, located: &[(f64, f64)], span: Span, max_secs: f64) -> Range {
-    let Some(start) = located.iter().map(|l| l.0).reduce(f64::min) else { return range };
-    let end = located.iter().map(|l| l.1).fold(f64::MIN, f64::max);
-    let r = Range { start: range.start.min(start), end: range.end.max((end + TAIL_SECS).min(span.end)) };
-    if r.len() > max_secs { range } else { r }
+/// 只把起止对齐到句子边界：起点在句中退到句首，终点在句中延到句末，不改变话题范围
+pub fn snap(proposed: Range, span: Span, segments: &[AsrSegment]) -> Range {
+    let mut start = proposed.start.clamp(span.start, span.end);
+    let mut end = proposed.end.clamp(span.start, span.end);
+    if let Some(seg) = segments.iter().find(|s| s.start <= start && s.end > start) {
+        start = seg.start;
+    }
+    if let Some(seg) = segments.iter().find(|s| s.start < end && s.end >= end) {
+        end = seg.end;
+    }
+    Range { start, end: (end + TAIL_SECS).min(span.end) }
 }
 
 /// 主播中文说话时长占区间的比例

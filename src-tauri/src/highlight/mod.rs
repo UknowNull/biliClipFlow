@@ -1,6 +1,6 @@
 //! 录播自动精品切片流水线（方案见 docs/录播自动精品切片-需求与开发方案.md）。
 //!
-//! 召回靠信号（弹幕、付费、响度、语音事件），精排靠理解（文本大模型），边界靠代码，结果靠人工标记。
+//! 有大模型时整场转写按话题切分、弹幕作标注、多维打分；没有时按信号峰值切。边界只对齐句子，结果靠人工挑选。
 //! 任务单线程串行执行，避免与录制争抢 CPU。
 
 pub mod asr;
@@ -29,8 +29,8 @@ use crate::utils::{append_log, now_rfc3339, sanitize_filename};
 
 use asr::{AudioFile, FullPass};
 use boundary::Range;
-use danmaku::DanmakuSource;
-use llm::{Judgement, WindowInput};
+use danmaku::{DanmakuEvent, DanmakuSource};
+use llm::{ChunkInput, TopicClip};
 use signals::{Candidate, Profile, Span};
 
 const ASR_CACHE_VERSION: &str = "sv20240717-v1";
@@ -171,12 +171,14 @@ async fn run_task_guarded(ctx: &Arc<ClipContext>, task_id: i64) {
 
 #[derive(Clone)]
 struct Picked {
-    cand: Candidate,
-    judgement: Option<Judgement>,
-    ai_status: &'static str,
     range: Range,
+    clip: Option<TopicClip>,
+    ai_status: &'static str,
     score: f64,
-    streamer_ratio: Option<f64>,
+    /// 重叠切片去重时保留该值大的
+    dedupe_key: f64,
+    signals: serde_json::Value,
+    peak_count: i64,
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
@@ -248,6 +250,7 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
     }
     // 已登记主播声纹：整场逐句判定主播说话时长（带缓存），供候选召回、主播占比与转写标注使用
     let voiceprint = room_voiceprint(&db, &room_id).filter(|_| speaker::model_ready(&mdir) && pass.is_some());
+    let speaker_key = voiceprint.as_deref().map(speaker::voiceprint_key).unwrap_or_else(|| "lang".into());
     if let Some(vp) = voiceprint {
         let p = pass.take().unwrap();
         set_stage(&db, task_id, "SPEAKER", 60.0);
@@ -278,159 +281,56 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
         return Err("既没有弹幕也没有可用的语音识别模型，无法分析".into());
     }
 
-    // 候选召回
-    set_stage(&db, task_id, "CANDIDATES", 60.0);
-    let candidates = signals::pick_candidates(session_secs, &spans, &events, has_danmaku, pass.as_ref(), profile, &cfg.clip);
-    append_log(&ctx.app_log_path, &format!("auto_clip_candidates task_id={} count={} danmaku_events={} asr_segments={}", task_id, candidates.len(), events.len(), pass.as_ref().map(|p| p.segments.len()).unwrap_or(0)));
-    if candidates.is_empty() {
-        remove_previous_clips(&db, task_id, &room_id, &ids_json);
-        return Ok((0, warnings));
+    if cfg.clip.use_llm && !cfg.llm.is_configured() {
+        warnings.push("未配置大模型，已按信号切片，标题使用模板".into());
     }
-
-    // 候选窗口内的主播中文段用 Paraformer 重新识别
-    if let Some(p) = pass.take() {
-        set_stage(&db, task_id, "TRANSCRIBE", 62.0);
-        let windows: Vec<(f64, f64)> = candidates.iter().map(|c| (c.start, c.end)).collect();
-        let files: Vec<(String, f64)> = segs.iter().map(|s| (s.file_path.clone(), s.offset_start as f64)).collect();
-        let (mdir2, threads) = (mdir.clone(), cfg.asr.threads);
-        pass = Some(
-            blocking(move || {
-                let mut p = p;
-                let targets: Vec<usize> = (0..p.segments.len())
-                    .filter(|&i| {
-                        let s = &p.segments[i];
-                        s.is_streamer() && windows.iter().any(|(a, b)| s.end > *a && s.start < *b)
-                    })
-                    .collect();
-                let audio: Vec<AudioFile> = files.iter().map(|(path, o)| AudioFile { path, offset_start: *o }).collect();
-                asr::refine_chinese(&mdir2, threads, &audio, &mut p.segments, &targets)?;
-                Ok(p)
-            })
-            .await?,
-        );
-    }
-
-    // 大模型精排
-    let mut judgements: Vec<Option<Judgement>> = vec![None; candidates.len()];
-    let mut statuses: Vec<&'static str> = vec!["SIGNAL_ONLY"; candidates.len()];
-    let mut rank_bonus: Vec<f64> = vec![0.0; candidates.len()];
-    let llm_wanted = cfg.clip.use_llm;
-    if llm_wanted && !cfg.llm.is_configured() {
-        warnings.push("未配置大模型，标题使用模板".into());
-    }
-    if let (true, true, Some(p)) = (llm_wanted, cfg.llm.is_configured(), pass.as_ref()) {
-        set_stage(&db, task_id, "AI", 70.0);
-        let mode = if cfg.llm.structured_output == "auto" {
+    let mut mode: Option<String> = None;
+    if cfg.clip.use_llm && cfg.llm.is_configured() && pass.is_some() {
+        mode = if cfg.llm.structured_output == "auto" {
             let t = llm::test_connection(&cfg.llm).await;
-            if t.ok { Some(t.mode) } else {
-                warnings.push(format!("大模型不可用（{}），已按信号排序", t.message.chars().take(80).collect::<String>()));
-                None
+            if !t.ok {
+                warnings.push(format!("大模型不可用（{}），已按信号切片", t.message.chars().take(80).collect::<String>()));
             }
+            t.ok.then_some(t.mode)
         } else {
             Some(cfg.llm.structured_output.clone())
         };
-        if let Some(mode) = mode {
-            // 每个请求持有自己的数据，避免并发闭包借用局部变量
-            let mut plains: Vec<String> = Vec::with_capacity(candidates.len());
-            let mut jobs: Vec<(usize, String, Vec<(String, usize)>, String)> = Vec::with_capacity(candidates.len());
-            for (i, c) in candidates.iter().enumerate() {
-                let (lines, plain) = window_transcript(&p.segments, c.start, c.end);
-                plains.push(plain);
-                jobs.push((i, lines, signals::top_danmaku(&events, c.start, c.end, 30), c.signals.summary()));
-            }
-            let llm_cfg = Arc::new(cfg.llm.clone());
-            let shared_mode = Arc::new(mode.clone());
-            let shared_title = Arc::new(room_title.clone());
-            let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let total = candidates.len();
-            let titles = cfg.clip.title_candidates;
-            let concurrency = cfg.llm.max_concurrency;
-            let results: Vec<(usize, Result<Judgement, String>)> = stream::iter(jobs)
-                .map(|(i, lines, dm, summary)| {
-                    let (llm_cfg, mode, title, db, done) = (Arc::clone(&llm_cfg), Arc::clone(&shared_mode), Arc::clone(&shared_title), Arc::clone(&db), Arc::clone(&done));
-                    async move {
-                        let input = WindowInput { room_title: &title, transcript: &lines, danmaku: &dm, signal_summary: &summary };
-                        let r = llm::judge(&llm_cfg, &mode, profile, titles, &input).await;
-                        let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        set_stage(&db, task_id, "AI", 70.0 + 15.0 * n as f64 / total as f64);
-                        (i, r)
-                    }
-                })
-                .buffer_unordered(concurrency)
-                .collect()
-                .await;
-            for (i, r) in results {
-                match r {
-                    Ok(j) if !llm::evidence_valid(&j.evidence, &plains[i]) => {
-                        statuses[i] = "UNVERIFIED";
-                        append_log(&ctx.app_log_path, &format!("auto_clip_evidence_invalid task_id={} cand={} evidence={:?}", task_id, i, j.evidence));
-                    }
-                    Ok(j) => {
-                        statuses[i] = if j.keep { "KEPT" } else { "REJECTED" };
-                        judgements[i] = Some(j);
-                    }
-                    Err(e) => {
-                        statuses[i] = "ERROR";
-                        append_log(&ctx.app_log_path, &format!("auto_clip_llm_error task_id={} cand={} err={}", task_id, i, e));
-                    }
-                }
-            }
-            let kept: Vec<(usize, String, String)> = (0..candidates.len())
-                .filter(|&i| statuses[i] == "KEPT")
-                .map(|i| {
-                    let j = judgements[i].as_ref().unwrap();
-                    (i, j.titles.first().cloned().unwrap_or_default(), j.reason.clone())
-                })
-                .collect();
-            if let Ok(order) = llm::rank(&cfg.llm, &mode, &kept).await {
-                let n = order.len().max(1) as f64;
-                for (pos, id) in order.iter().enumerate() {
-                    if let Some(b) = rank_bonus.get_mut(*id) {
-                        *b = 0.05 * (n - pos as f64) / n;
-                    }
-                }
-            }
-        }
     }
 
-    // 边界、门槛、去重
-    let empty = Vec::new();
-    let asr_segs = pass.as_ref().map(|p| &p.segments).unwrap_or(&empty);
-    let mut picked: Vec<Picked> = Vec::new();
-    let llm_failed = statuses.iter().filter(|s| **s == "ERROR").count();
-    if llm_failed > 0 {
-        warnings.push(format!("{} 个候选大模型精排失败，未生成切片", llm_failed));
-    }
-    for (i, cand) in candidates.iter().enumerate() {
-        // 精排失败的候选质量不可控，不出片
-        let factor = match statuses[i] {
-            "KEPT" | "SIGNAL_ONLY" => 1.0,
-            "REJECTED" | "ERROR" => 0.0,
-            _ => 0.6,
-        };
-        if factor == 0.0 {
-            continue;
+    let picked: Vec<Picked> = match (mode, pass.take()) {
+        // 有大模型：整场按话题切分，弹幕只作标注
+        (Some(mode), Some(p)) => {
+            set_stage(&db, task_id, "TRANSCRIBE", 62.0);
+            let ids_key = record_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("-");
+            let cache = clips_dir.join(".cache").join(format!("refine_{}_{}_{}.json", ASR_CACHE_VERSION, ids_key, speaker_key));
+            let files: Vec<(String, f64)> = segs.iter().map(|s| (s.file_path.clone(), s.offset_start as f64)).collect();
+            let (mdir2, threads) = (mdir.clone(), cfg.asr.threads);
+            let p = blocking(move || {
+                let mut p = p;
+                let cached = std::fs::read(&cache).ok().and_then(|b| serde_json::from_slice::<Vec<Option<String>>>(&b).ok());
+                match cached.filter(|c| c.len() == p.segments.len()) {
+                    Some(texts) => p.segments.iter_mut().zip(texts).for_each(|(s, t)| s.zh_text = t),
+                    None => {
+                        let targets: Vec<usize> = (0..p.segments.len()).filter(|&i| p.segments[i].is_streamer()).collect();
+                        let audio: Vec<AudioFile> = files.iter().map(|(path, o)| AudioFile { path, offset_start: *o }).collect();
+                        asr::refine_chinese(&mdir2, threads, &audio, &mut p.segments, &targets)?;
+                        let texts: Vec<Option<String>> = p.segments.iter().map(|s| s.zh_text.clone()).collect();
+                        let _ = std::fs::write(&cache, serde_json::to_vec(&texts).unwrap_or_default());
+                    }
+                }
+                Ok(p)
+            })
+            .await?;
+            topic_clips(ctx, task_id, &cfg, &mode, profile, &room_title, &p, &events, has_danmaku, session_secs, &spans, &mut warnings).await
         }
-        let Some(span) = spans.iter().copied().find(|s| cand.peak >= s.start && cand.peak < s.end) else { continue };
-        let proposed = match judgements[i].as_ref() {
-            Some(j) if statuses[i] == "KEPT" && j.end > j.start => Range { start: j.start.max(cand.start - 60.0), end: j.end.min(cand.end + 60.0) },
-            _ => Range { start: cand.start, end: cand.end },
-        };
-        let mut range = boundary::finalize(proposed, cand.peak, span, asr_segs, cfg.clip.min_duration_secs as f64, cfg.clip.max_duration_secs as f64);
-        if let Some(j) = judgements[i].as_ref().filter(|_| statuses[i] == "KEPT") {
-            range = boundary::cover(range, &locate_evidence(&j.evidence, asr_segs, cand.start, cand.end), span, cfg.clip.max_duration_secs as f64);
+        (_, p) => {
+            set_stage(&db, task_id, "CANDIDATES", 60.0);
+            let candidates = signals::pick_candidates(session_secs, &spans, &events, has_danmaku, p.as_ref(), profile, &cfg.clip);
+            append_log(&ctx.app_log_path, &format!("auto_clip_candidates task_id={} count={} danmaku_events={} asr_segments={}", task_id, candidates.len(), events.len(), p.as_ref().map(|p| p.segments.len()).unwrap_or(0)));
+            signal_clips(&candidates, &spans, p.as_ref(), &cfg.clip)
         }
-        let ratio = pass.as_ref().map(|p| boundary::streamer_ratio(range, &p.segments));
-        picked.push(Picked {
-            cand: cand.clone(),
-            judgement: if statuses[i] == "KEPT" { judgements[i].clone() } else { None },
-            ai_status: statuses[i],
-            range,
-            score: cand.score * factor + rank_bonus[i],
-            streamer_ratio: ratio,
-        });
-    }
-    let keep_idx = boundary::dedupe(&picked.iter().map(|p| (p.range, p.score)).collect::<Vec<_>>());
+    };
+    let keep_idx = boundary::dedupe(&picked.iter().map(|p| (p.range, p.dedupe_key)).collect::<Vec<_>>());
     let picked: Vec<Picked> = keep_idx.into_iter().map(|i| picked[i].clone()).collect();
 
     // 剪辑
@@ -442,7 +342,7 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
     for (idx, p) in picked.into_iter().enumerate() {
         let Some(seg) = segs.iter().find(|s| p.range.start >= s.offset_start as f64 && p.range.start < s.offset_end as f64) else { continue };
         let title = p
-            .judgement
+            .clip
             .as_ref()
             .and_then(|j| j.titles.first().cloned())
             .unwrap_or_else(|| format!("{} 高光 {}", room_title, hms(p.range.start, ":")));
@@ -460,23 +360,141 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
     Ok((made, warnings))
 }
 
+/// 每块转写的时长与步长：块间重叠 5 分钟，跨块的话题至少在一块里是完整的
+const CHUNK_SECS: f64 = 900.0;
+const CHUNK_STEP_SECS: f64 = 600.0;
+/// 短于该秒数的话题不出片
+const MIN_TOPIC_SECS: f64 = 15.0;
+
+/// 整场转写分块交给大模型按话题切分，弹幕作为标注；起止只对齐到句子边界
+#[allow(clippy::too_many_arguments)]
+async fn topic_clips(
+    ctx: &Arc<ClipContext>,
+    task_id: i64,
+    cfg: &settings::AutoClipSettings,
+    mode: &str,
+    profile: Profile,
+    room_title: &str,
+    p: &FullPass,
+    events: &[DanmakuEvent],
+    has_danmaku: bool,
+    session_secs: f64,
+    spans: &[Span],
+    warnings: &mut Vec<String>,
+) -> Vec<Picked> {
+    let per_min = signals::users_per_minute(events, session_secs);
+    let mut jobs: Vec<(f64, String, String, String)> = Vec::new();
+    let mut a = 0.0;
+    while a < session_secs {
+        let b = (a + CHUNK_SECS).min(session_secs);
+        let (lines, plain) = window_transcript(&p.segments, a, b);
+        if !lines.is_empty() {
+            let dm = if has_danmaku { signals::danmaku_lines(events, &per_min, a, b) } else { "（无弹幕数据）".to_string() };
+            jobs.push((a, lines, plain, dm));
+        }
+        if b >= session_secs {
+            break;
+        }
+        a += CHUNK_STEP_SECS;
+    }
+    append_log(&ctx.app_log_path, &format!("auto_clip_chunks task_id={} chunks={} danmaku_events={} asr_segments={}", task_id, jobs.len(), events.len(), p.segments.len()));
+    set_stage(&ctx.db, task_id, "AI", 70.0);
+    let (llm_cfg, shared_mode, shared_title) = (Arc::new(cfg.llm.clone()), Arc::new(mode.to_string()), Arc::new(room_title.to_string()));
+    let (titles, max_secs, total) = (cfg.clip.title_candidates, cfg.clip.max_duration_secs, jobs.len());
+    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let results: Vec<(f64, String, Result<Vec<TopicClip>, String>)> = stream::iter(jobs)
+        .map(|(a, lines, plain, dm)| {
+            let (llm_cfg, mode, title, db, done) = (Arc::clone(&llm_cfg), Arc::clone(&shared_mode), Arc::clone(&shared_title), Arc::clone(&ctx.db), Arc::clone(&done));
+            async move {
+                let input = ChunkInput { room_title: &title, transcript: &lines, danmaku: &dm, max_secs };
+                let r = llm::segment_topics(&llm_cfg, &mode, profile, titles, &input).await;
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                set_stage(&db, task_id, "AI", 70.0 + 15.0 * n as f64 / total.max(1) as f64);
+                (a, plain, r)
+            }
+        })
+        .buffer_unordered(cfg.llm.max_concurrency)
+        .collect()
+        .await;
+
+    let mut failed = 0;
+    let mut out = Vec::new();
+    for (a, plain, r) in results {
+        let clips = match r {
+            Ok(c) => c,
+            Err(e) => {
+                failed += 1;
+                append_log(&ctx.app_log_path, &format!("auto_clip_llm_error task_id={} chunk_start={:.0} err={}", task_id, a, e));
+                continue;
+            }
+        };
+        for clip in clips {
+            let Some(span) = spans.iter().copied().find(|s| clip.start >= s.start && clip.start < s.end) else { continue };
+            if clip.end <= clip.start {
+                continue;
+            }
+            let range = boundary::snap(Range { start: clip.start, end: clip.end }, span, &p.segments);
+            if range.len() < MIN_TOPIC_SECS {
+                continue;
+            }
+            let verified = llm::evidence_valid(&clip.evidence, &plain);
+            if !verified {
+                append_log(&ctx.app_log_path, &format!("auto_clip_evidence_invalid task_id={} start={:.0} evidence={:?}", task_id, range.start, clip.evidence));
+            }
+            let s = &clip.scores;
+            let ai = 0.3 * s.funny + 0.2 * s.complete + 0.15 * s.streamer + 0.15 * s.standalone;
+            let dm = has_danmaku.then(|| signals::danmaku_score(&per_min, range.start, range.end));
+            let total = dm.map(|d| ai + 0.2 * d).unwrap_or(ai / 0.8);
+            let signals = json!({
+                "scores": {
+                    "funny": s.funny, "complete": s.complete, "streamer": s.streamer, "standalone": s.standalone,
+                    "danmaku": dm.map(|d| (d * 10.0).round() / 10.0),
+                    "total": (total * 10.0).round() / 10.0,
+                },
+                "streamerRatio": boundary::streamer_ratio(range, &p.segments),
+            });
+            out.push(Picked {
+                range,
+                ai_status: if verified { "KEPT" } else { "UNVERIFIED" },
+                score: total / 10.0 * if verified { 1.0 } else { 0.6 },
+                dedupe_key: s.complete * 10.0 + total,
+                signals,
+                peak_count: 0,
+                clip: Some(clip),
+            });
+        }
+    }
+    if failed > 0 {
+        warnings.push(format!("{} 段转写大模型切分失败，这部分没有切片", failed));
+    }
+    append_log(&ctx.app_log_path, &format!("auto_clip_topics task_id={} topics={}", task_id, out.len()));
+    out
+}
+
+/// 没有大模型时按信号峰值窗口切片
+fn signal_clips(candidates: &[Candidate], spans: &[Span], pass: Option<&FullPass>, clip: &settings::ClipSettings) -> Vec<Picked> {
+    let empty = Vec::new();
+    let segs = pass.map(|p| &p.segments).unwrap_or(&empty);
+    candidates
+        .iter()
+        .filter_map(|cand| {
+            let span = spans.iter().copied().find(|s| cand.peak >= s.start && cand.peak < s.end)?;
+            let range = boundary::finalize(Range { start: cand.start, end: cand.end }, cand.peak, span, segs, clip.min_duration_secs as f64, clip.max_duration_secs as f64);
+            let signals = json!({
+                "snapshot": cand.signals,
+                "summary": cand.signals.summary(),
+                "signalScore": cand.score,
+                "peak": cand.peak,
+                "streamerRatio": pass.map(|p| boundary::streamer_ratio(range, &p.segments)),
+            });
+            Some(Picked { range, clip: None, ai_status: "SIGNAL_ONLY", score: cand.score, dedupe_key: cand.score, signals, peak_count: cand.signals.max_repeat as i64 })
+        })
+        .collect()
+}
+
 fn hms(secs: f64, sep: &str) -> String {
     let s = secs.max(0.0) as i64;
     format!("{:02}{sep}{:02}{sep}{:02}", s / 3600, (s % 3600) / 60, s % 60)
-}
-
-/// 在候选窗口内找出每条证据所在的句子，返回其起止秒；找不到的证据忽略
-fn locate_evidence(evidence: &[String], segments: &[asr::AsrSegment], start: f64, end: f64) -> Vec<(f64, f64)> {
-    let window: Vec<&asr::AsrSegment> = segments.iter().filter(|s| s.end > start && s.start < end).collect();
-    evidence
-        .iter()
-        .filter_map(|e| {
-            window
-                .iter()
-                .find(|s| llm::evidence_valid(std::slice::from_ref(e), &format!("{}{}", s.best_text(), s.text)))
-                .map(|s| (s.start, s.end))
-        })
-        .collect()
 }
 
 /// 每行：[起止秒][说话方|情绪/事件] 文本；同时返回纯文本用于证据校验
@@ -540,15 +558,8 @@ fn remove_previous_clips(db: &Db, task_id: i64, room_id: &str, ids_json: &str) {
 
 #[allow(clippy::too_many_arguments)]
 fn insert_item(db: &Db, task_id: i64, room_id: &str, seg: &LiveRecordSegment, output: &Path, p: &Picked, title: &str, ok: bool) {
-    let j = p.judgement.as_ref();
+    let j = p.clip.as_ref();
     let titles = j.map(|j| j.titles.clone()).unwrap_or_else(|| vec![title.to_string()]);
-    let signals = json!({
-        "snapshot": p.cand.signals,
-        "summary": p.cand.signals.summary(),
-        "signalScore": p.cand.score,
-        "peak": p.cand.peak,
-        "streamerRatio": p.streamer_ratio,
-    });
     let now = now_rfc3339();
     let _ = db.with_conn(|conn| {
         conn.execute(
@@ -564,10 +575,10 @@ fn insert_item(db: &Db, task_id: i64, room_id: &str, seg: &LiveRecordSegment, ou
                 p.range.start.round() as i64,
                 p.range.end.round() as i64,
                 p.range.len().round() as i64,
-                p.cand.signals.max_repeat as i64,
+                p.peak_count,
                 now,
                 (p.score * 1000.0).round() / 1000.0,
-                signals.to_string(),
+                p.signals.to_string(),
                 j.map(|j| j.category.clone()),
                 serde_json::to_string(&titles).unwrap_or_default(),
                 j.map(|j| j.description.clone()),

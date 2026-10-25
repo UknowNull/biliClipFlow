@@ -1,4 +1,4 @@
-//! 文本大模型：OpenAI 兼容接口，结构化 JSON 输出，切片判断、相对排序与证据校验。
+//! 文本大模型：OpenAI 兼容接口，结构化 JSON 输出，按话题切分与证据校验。
 
 use std::time::{Duration, Instant};
 
@@ -9,11 +9,10 @@ use serde_json::{json, Value};
 use super::settings::LlmSettings;
 use super::signals::Profile;
 
+/// 大模型从一段转写里切出的一个话题切片
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Judgement {
-    #[serde(default)]
-    pub keep: bool,
+pub struct TopicClip {
     #[serde(default)]
     pub category: String,
     #[serde(default)]
@@ -32,6 +31,22 @@ pub struct Judgement {
     pub reason: String,
     #[serde(default)]
     pub evidence: Vec<String>,
+    #[serde(default)]
+    pub scores: TopicScores,
+}
+
+/// 大模型给的分项评分（1~10）
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicScores {
+    #[serde(default)]
+    pub funny: f64,
+    #[serde(default)]
+    pub complete: f64,
+    #[serde(default)]
+    pub streamer: f64,
+    #[serde(default)]
+    pub standalone: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -262,22 +277,36 @@ pub async fn list_models(settings: &LlmSettings) -> Result<Vec<String>, String> 
     Ok(ids)
 }
 
-fn judgement_schema(titles: usize) -> Value {
+fn topics_schema(titles: usize) -> Value {
+    let score = json!({"type": "integer", "minimum": 1, "maximum": 10});
     json!({
         "type": "object",
         "properties": {
-            "keep": {"type": "boolean"},
-            "category": {"type": "string", "enum": ["搞笑", "高燃", "名场面", "翻车", "感人", "互动", "干货", "其他"]},
-            "start": {"type": "number"},
-            "end": {"type": "number"},
-            "titles": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": titles},
-            "description": {"type": "string"},
-            "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-            "coverText": {"type": "string"},
-            "reason": {"type": "string"},
-            "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3}
+            "clips": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string", "enum": ["搞笑", "高燃", "名场面", "翻车", "感人", "互动", "干货", "其他"]},
+                        "start": {"type": "number"},
+                        "end": {"type": "number"},
+                        "titles": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": titles},
+                        "description": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                        "coverText": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
+                        "scores": {
+                            "type": "object",
+                            "properties": {"funny": score, "complete": score, "streamer": score, "standalone": score},
+                            "required": ["funny", "complete", "streamer", "standalone"]
+                        }
+                    },
+                    "required": ["category", "start", "end", "titles", "description", "tags", "coverText", "reason", "evidence", "scores"]
+                }
+            }
         },
-        "required": ["keep", "category", "start", "end", "titles", "description", "tags", "coverText", "reason", "evidence"]
+        "required": ["clips"]
     })
 }
 
@@ -289,57 +318,40 @@ fn profile_note(profile: Profile) -> &'static str {
     }
 }
 
-const BASE_RULES: &str = "你是B站直播切片编辑，判断一段直播录像中是否有值得单独投稿的高光片段。
+const BASE_RULES: &str = "你是B站直播切片编辑。给你一段直播录像的逐句转写和每分钟的弹幕情况，请把其中值得单独投稿的内容切成一条条切片。
 规则：
 1. 只能依据给出的转写与弹幕，不得编造其中没有的情节、人物、台词或观众反应；转写有识别错误时按上下文理解，不要放大。
-2. start/end 必须取自转写行首的秒数；起点放在铺垫开始处，终点放在笑点或高潮之后的反应结束处。
-3. 内容不够精彩时 keep=false，但其余字段仍按最佳候选填写。
-4. 标题不超过 30 个汉字，口语化、有点击欲但不夸大；coverText 不超过 12 个汉字，用于压在封面上；description 50~120 字；tags 3~8 个。
-5. evidence 逐字摘抄 1~3 句转写原文（不要改写），reason 用一两句话说明依据。";
+2. 每条切片是一个完整的话题或事件：从主播开始聊这件事的那句开始（由观众提问、SC、弹幕引出的，从主播念这条提问开始），到主播把这件事聊完为止。话题一转就结束，不要带上后面无关的内容，也不要从前面无关的闲聊开始。
+3. start 取切片第一行的起始秒，end 取切片最后一行的结束秒，都必须是转写里出现的秒数。
+4. 相邻几段属于同一类话题、弹幕也在讨论同一件事时，合成一条；话题短、没有内容的单独一句不要切。
+5. 弹幕只用来帮你发现观众反应强烈的地方，最终按转写内容判断；寒暄、催下播、念礼物感谢、纯原片播放没有主播内容的段落不要切。
+6. 宁多勿漏：凡是能独立成片的话题都输出，平淡的给低分即可。
+7. 分项评分 1~10：funny 有趣或精彩程度；complete 话题完整度（开头或结尾被本段转写截断的打低分）；streamer 主播的表现（观点、反应、情绪）；standalone 不看前后文能否看懂。
+8. 标题不超过 30 个汉字，口语化、有点击欲但不夸大；coverText 不超过 12 个汉字，用于压在封面上；description 50~120 字；tags 3~8 个。
+9. evidence 逐字摘抄 1~3 句该切片内的转写原文（不要改写）；reason 用一两句话说明推荐理由：亮点是什么、起止为什么选在这里。";
 
-pub struct WindowInput<'a> {
+pub struct ChunkInput<'a> {
     pub room_title: &'a str,
     pub transcript: &'a str,
-    pub danmaku: &'a [(String, usize)],
-    pub signal_summary: &'a str,
+    pub danmaku: &'a str,
+    pub max_secs: i64,
 }
 
-pub async fn judge(settings: &LlmSettings, mode: &str, profile: Profile, titles: usize, input: &WindowInput<'_>) -> Result<Judgement, String> {
-    let system = format!("{}\n{}\n每次给出 {} 个不同角度的标题。", BASE_RULES, profile_note(profile), titles);
-    let danmaku = if input.danmaku.is_empty() {
-        "（无弹幕）".to_string()
-    } else {
-        input.danmaku.iter().map(|(t, n)| if *n > 1 { format!("{} ×{}", t, n) } else { t.clone() }).collect::<Vec<_>>().join("\n")
-    };
-    let user = format!(
-        "直播间标题：{}\n信号摘要：{}\n\n转写（每行：[起止秒][说话方|情绪/事件] 文本）：\n{}\n\n窗口内高频弹幕：\n{}",
-        input.room_title, input.signal_summary, input.transcript, danmaku
+/// 把一段转写切成若干话题切片
+pub async fn segment_topics(settings: &LlmSettings, mode: &str, profile: Profile, titles: usize, input: &ChunkInput<'_>) -> Result<Vec<TopicClip>, String> {
+    let system = format!(
+        "{}\n{}\n单条切片一般在 30 秒到 {} 秒之间。每条给出 {} 个不同角度的标题。没有值得切的内容时 clips 为空数组。",
+        BASE_RULES,
+        profile_note(profile),
+        input.max_secs,
+        titles
     );
-    let value = chat_json(settings, mode, &system, &user, &judgement_schema(titles)).await?;
-    serde_json::from_value(value).map_err(|e| format!("模型输出字段不完整: {}", e))
-}
-
-/// 对已保留的候选做相对排序，返回按推荐程度从高到低的 id
-pub async fn rank(settings: &LlmSettings, mode: &str, items: &[(usize, String, String)]) -> Result<Vec<usize>, String> {
-    if items.len() < 2 {
-        return Ok(items.iter().map(|i| i.0).collect());
-    }
-    let list = items
-        .iter()
-        .map(|(id, title, reason)| format!("{}. {} —— {}", id, title, reason))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let schema = json!({"type": "object", "properties": {"order": {"type": "array", "items": {"type": "integer"}}}, "required": ["order"]});
-    let value = chat_json(
-        settings,
-        mode,
-        "你是B站直播切片编辑。按照作为独立投稿的吸引力，从高到低给下列候选排序，只输出编号。",
-        &list,
-        &schema,
-    )
-    .await?;
-    let order: Vec<usize> = value["order"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect()).unwrap_or_default();
-    Ok(order)
+    let user = format!(
+        "直播间标题：{}\n\n转写（每行：[起止秒][说话方|情绪/事件] 文本）：\n{}\n\n每分钟弹幕：\n{}",
+        input.room_title, input.transcript, input.danmaku
+    );
+    let value = chat_json(settings, mode, &system, &user, &topics_schema(titles)).await?;
+    serde_json::from_value(value["clips"].clone()).map_err(|e| format!("模型输出字段不完整: {}", e))
 }
 
 fn normalize(s: &str) -> Vec<char> {

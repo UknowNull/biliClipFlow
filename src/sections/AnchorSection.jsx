@@ -58,6 +58,7 @@ export default function AnchorSection() {
   const [detailView, setDetailView] = useState(null);
   const [analyzingTasks, setAnalyzingTasks] = useState({});
   const [clipView, setClipView] = useState(null);
+  const [clipSortByScore, setClipSortByScore] = useState(true);
   const [clipListLoading, setClipListLoading] = useState(false);
   const [clipListError, setClipListError] = useState("");
   const [clipListMessage, setClipListMessage] = useState("");
@@ -2173,7 +2174,14 @@ export default function AnchorSection() {
                         <th className="pb-2 pr-4 font-medium">序号</th>
                         <th className="pb-2 pr-4 font-medium">标题</th>
                         <th className="pb-2 pr-4 font-medium">类型</th>
-                        <th className="pb-2 pr-4 font-medium">分数</th>
+                        <th
+                          className="cursor-pointer pb-2 pr-4 font-medium hover:text-[var(--ink)]"
+                          title="点击切换按分数 / 按时间排序"
+                          onClick={() => setClipSortByScore((prev) => !prev)}
+                        >
+                          分数{clipSortByScore ? " ↓" : ""}
+                        </th>
+                        <th className="pb-2 pr-4 font-medium">评分</th>
                         <th className="pb-2 pr-4 font-medium">起始时间</th>
                         <th className="pb-2 pr-4 font-medium">结束时间</th>
                         <th className="pb-2 pr-4 font-medium">时长</th>
@@ -2183,7 +2191,7 @@ export default function AnchorSection() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-black/5">
-                      {clipView.records.map((record, index) => {
+                      {(clipSortByScore ? [...clipView.records].sort((a, b) => (b.score || 0) - (a.score || 0)) : clipView.records).map((record, index) => {
                         const expanded = Boolean(clipExpanded[record.id]);
                         const title = record.titles?.[0] || record.filePath?.split(/[\/\\]/).pop() || "-";
                         const mark = String(record.mark || "PENDING").toUpperCase();
@@ -2219,6 +2227,19 @@ export default function AnchorSection() {
                           </td>
                           <td className="py-2 pr-4 text-[var(--muted)]">{record.category || "-"}</td>
                           <td className="py-2 pr-4 tabular-nums text-[var(--muted)]">{Number(record.score || 0).toFixed(2)}</td>
+                          <td className="py-2 pr-4 whitespace-nowrap text-[10px] leading-4 text-[var(--muted)]">
+                            {record.signals?.scores ? (
+                              <>
+                                <div>有趣 {record.signals.scores.funny} · 完整 {record.signals.scores.complete} · 主播 {record.signals.scores.streamer}</div>
+                                <div>
+                                  独立 {record.signals.scores.standalone}
+                                  {record.signals.scores.danmaku != null ? ` · 弹幕 ${record.signals.scores.danmaku}` : ""}
+                                </div>
+                              </>
+                            ) : (
+                              "-"
+                            )}
+                          </td>
                           <td
                             className="py-2 pr-4 tabular-nums text-[var(--muted)]"
                             onDoubleClick={() => startClipEdit(record, "start")}
@@ -2373,7 +2394,14 @@ export default function AnchorSection() {
                         {expanded ? (
                           <tr className="bg-black/[0.02]">
                             <td />
-                            <td colSpan={9} className="py-3 pr-4 text-xs leading-relaxed text-[var(--content-color)]">
+                            <td colSpan={10} className="py-3 pr-4 text-xs leading-relaxed text-[var(--content-color)]">
+                              {record.signals?.scores ? (
+                                <div className="mb-1">
+                                  <span className="font-semibold text-[var(--ink)]">评分：</span>
+                                  综合 {record.signals.scores.total} · 有趣 {record.signals.scores.funny} · 完整 {record.signals.scores.complete} · 主播 {record.signals.scores.streamer} · 独立可看 {record.signals.scores.standalone}
+                                  {record.signals.scores.danmaku != null ? ` · 弹幕 ${record.signals.scores.danmaku}` : ""}
+                                </div>
+                              ) : null}
                               {record.reason ? (
                                 <div><span className="font-semibold text-[var(--ink)]">理由：</span>{record.reason}</div>
                               ) : null}

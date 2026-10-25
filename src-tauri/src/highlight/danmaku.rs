@@ -208,6 +208,16 @@ pub fn keyword_score(normalized: &str) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// 问候、下播、催下播之类的寒暄弹幕：刷得再多也不代表内容精彩
+const FILLER: &[&str] = &[
+    "晚安", "晚上好", "早上好", "中午好", "下午好", "早安", "拜拜", "再见", "88", "下播", "才八点", "才九点", "才十点", "主播好", "来了", "打卡", "签到",
+];
+
+/// 是否为寒暄类无效弹幕（只看短句，长句里顺带一句晚安不算）
+pub fn is_filler(normalized: &str) -> bool {
+    normalized.chars().count() <= 8 && FILLER.iter().any(|w| normalized.contains(w))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +247,8 @@ mod tests {
         assert_eq!(normalize_text("哈哈哈哈哈！"), normalize_text("哈哈 哈"));
         assert_eq!(normalize_text("？？？？"), "??");
         assert!(keyword_score(&normalize_text("前方高能！！")) >= 3.0);
+        assert!(is_filler(&normalize_text("晚安晚安~")));
+        assert!(!is_filler(&normalize_text("主播晚安前能不能讲讲李世民")));
     }
 
     #[test]

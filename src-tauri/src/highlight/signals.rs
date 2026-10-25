@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use super::asr::{AsrSegment, FullPass};
-use super::danmaku::{keyword_score, normalize_text, DanmakuEvent, DanmakuKind};
+use super::danmaku::{is_filler, keyword_score, normalize_text, DanmakuEvent, DanmakuKind};
 use super::settings::ClipSettings;
 
 pub const BIN_SECS: f64 = 5.0;
@@ -167,7 +167,8 @@ fn add_overlap(series: &mut [f64], start: f64, end: f64, weight: f64) {
 
 fn build_features(n: usize, events: &[DanmakuEvent], asr: Option<&FullPass>) -> Features {
     let mut users: Vec<HashSet<&str>> = vec![HashSet::new(); n];
-    let mut texts: Vec<HashMap<String, usize>> = vec![HashMap::new(); n];
+    // 每桶每句弹幕的发送者，刷屏按不同观众计，一个人连发不算
+    let mut texts: Vec<HashMap<String, HashSet<&str>>> = vec![HashMap::new(); n];
     let mut keyword = vec![0.0; n];
     let mut paid_raw = vec![0.0; n];
     let mut dm_count = vec![0.0; n];
@@ -180,12 +181,15 @@ fn build_features(n: usize, events: &[DanmakuEvent], asr: Option<&FullPass>) -> 
             paid_raw[b] += e.money;
         }
         if matches!(e.kind, DanmakuKind::Chat | DanmakuKind::SuperChat) {
+            let norm = normalize_text(&e.text);
+            if is_filler(&norm) {
+                continue;
+            }
             dm_count[b] += 1.0;
             users[b].insert(e.user.as_str());
-            let norm = normalize_text(&e.text);
             keyword[b] += keyword_score(&norm);
             if !norm.is_empty() {
-                *texts[b].entry(norm).or_insert(0) += 1;
+                texts[b].entry(norm).or_default().insert(e.user.as_str());
             }
         }
     }
@@ -196,14 +200,14 @@ fn build_features(n: usize, events: &[DanmakuEvent], asr: Option<&FullPass>) -> 
     let mut max_repeat = vec![(0usize, String::new()); n];
     let span = (20.0 / BIN_SECS) as usize;
     for b in 0..n {
-        let mut merged: HashMap<&str, usize> = HashMap::new();
+        let mut merged: HashMap<&str, HashSet<&str>> = HashMap::new();
         for bb in b.saturating_sub(span - 1)..=b {
             for (k, v) in &texts[bb] {
-                *merged.entry(k.as_str()).or_insert(0) += v;
+                merged.entry(k.as_str()).or_default().extend(v);
             }
         }
-        if let Some((k, v)) = merged.into_iter().max_by_key(|(_, v)| *v) {
-            max_repeat[b] = (v, k.to_string());
+        if let Some((k, v)) = merged.into_iter().max_by_key(|(_, v)| v.len()) {
+            max_repeat[b] = (v.len(), k.to_string());
         }
     }
     let spam: Vec<f64> = (0..n)
@@ -364,7 +368,7 @@ pub fn top_danmaku(events: &[DanmakuEvent], start: f64, end: f64, limit: usize) 
     let mut counts: HashMap<String, (String, usize)> = HashMap::new();
     for e in events.iter().filter(|e| e.t >= start && e.t < end && e.kind != DanmakuKind::Gift) {
         let key = normalize_text(&e.text);
-        if key.is_empty() {
+        if key.is_empty() || is_filler(&key) {
             continue;
         }
         let entry = counts.entry(key).or_insert_with(|| (e.text.clone(), 0));
@@ -374,6 +378,51 @@ pub fn top_danmaku(events: &[DanmakuEvent], start: f64, end: f64, limit: usize) 
     list.sort_by(|a, b| b.1.cmp(&a.1));
     list.truncate(limit);
     list
+}
+
+/// 每分钟发言的不同观众数（不含寒暄弹幕）
+pub fn users_per_minute(events: &[DanmakuEvent], session_secs: f64) -> Vec<usize> {
+    let n = (session_secs / 60.0).ceil().max(1.0) as usize;
+    let mut users: Vec<HashSet<&str>> = vec![HashSet::new(); n];
+    for e in events.iter().filter(|e| matches!(e.kind, DanmakuKind::Chat | DanmakuKind::SuperChat)) {
+        let m = (e.t.max(0.0) / 60.0) as usize;
+        if m < n && !is_filler(&normalize_text(&e.text)) {
+            users[m].insert(e.user.as_str());
+        }
+    }
+    users.iter().map(|u| u.len()).collect()
+}
+
+fn median_users(per_min: &[usize]) -> f64 {
+    let mut sorted = per_min.to_vec();
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0).max(1) as f64
+}
+
+/// 区间的弹幕互动分（1~10）：区间内最热一分钟的人数相对整场中位数的倍数，1 倍约 4 分，2 倍及以上 10 分
+pub fn danmaku_score(per_min: &[usize], start: f64, end: f64) -> f64 {
+    let (a, b) = ((start.max(0.0) / 60.0) as usize, ((end / 60.0).ceil() as usize).min(per_min.len()));
+    let best = per_min.get(a..b).and_then(|w| w.iter().max().copied()).unwrap_or(0) as f64;
+    (1.0 + 3.0 * best / median_users(per_min)).clamp(1.0, 10.0)
+}
+
+/// 给大模型的分钟级弹幕标注：每分钟发言人数与最多的几条弹幕
+pub fn danmaku_lines(events: &[DanmakuEvent], per_min: &[usize], start: f64, end: f64) -> String {
+    let mut lines = vec![format!("（整场每分钟发言人数中位数为 {:.0}）", median_users(per_min))];
+    let first = (start.max(0.0) / 60.0) as usize;
+    for m in first..((end / 60.0).ceil() as usize).min(per_min.len()) {
+        if per_min[m] == 0 {
+            continue;
+        }
+        let (a, b) = (m as f64 * 60.0, m as f64 * 60.0 + 60.0);
+        let top = top_danmaku(events, a, b, 4)
+            .into_iter()
+            .map(|(t, n)| if n > 1 { format!("{}×{}", t, n) } else { t })
+            .collect::<Vec<_>>()
+            .join("、");
+        lines.push(format!("[{:.0}-{:.0}s] {} 人发言：{}", a, b, per_min[m], top));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
