@@ -880,6 +880,29 @@ pub(super) fn load_task_owner_uid(db: &Db, task_id: &str) -> Result<Option<i64>,
     .map_err(|err| err.to_string())
 }
 
+/// 队列串行粒度：(bilibili_uid, source_type)。切片投稿与其他投稿各自排队。
+pub(super) fn load_task_owner_key(
+    db: &Db,
+    task_id: &str,
+) -> Result<(Option<i64>, String), String> {
+    db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT bilibili_uid, COALESCE(source_type, 'NORMAL') \
+             FROM submission_task WHERE task_id = ?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map(|value| value.unwrap_or((None, "NORMAL".to_string())))
+    })
+    .map_err(|err| err.to_string())
+}
+
 pub(super) fn update_submission_status(
     context: &SubmissionContext,
     task_id: &str,

@@ -93,7 +93,7 @@ pub(super) async fn submission_queue_loop(context: SubmissionQueueContext) {
         edit_upload_state: context.edit_upload_state.clone(),
         local_path_prefix: load_local_path_prefix(context.db.as_ref()),
     };
-    let active_owners = Arc::new(AsyncMutex::new(HashMap::<i64, String>::new()));
+    let active_owners = Arc::new(AsyncMutex::new(HashMap::<(i64, String), String>::new()));
     let mut last_stale_check = Instant::now()
         .checked_sub(Duration::from_secs(
             SUBMISSION_UPLOAD_STALE_CHECK_INTERVAL_SECS,
@@ -124,11 +124,11 @@ pub(super) async fn submission_queue_loop(context: SubmissionQueueContext) {
         };
         let active_owner_snapshot = {
             let owners = active_owners.lock().await;
-            owners.keys().copied().collect::<HashSet<i64>>()
+            owners.keys().cloned().collect::<HashSet<(i64, String)>>()
         };
         let ready_tasks: Vec<QueuedSubmissionTask> = queued_tasks
             .into_iter()
-            .filter(|task| !active_owner_snapshot.contains(&task.bilibili_uid.unwrap_or(0)))
+            .filter(|task| !active_owner_snapshot.contains(&task.owner_key()))
             .collect();
         if ready_tasks.is_empty() {
             sleep(Duration::from_secs(2)).await;
@@ -143,11 +143,11 @@ pub(super) async fn submission_queue_loop(context: SubmissionQueueContext) {
             ),
         );
         for queued_task in ready_tasks {
-            let owner_key = queued_task.bilibili_uid.unwrap_or(0);
+            let owner_key = queued_task.owner_key();
             let worker_id = uuid::Uuid::new_v4().to_string();
             let should_spawn = {
                 let mut owners = active_owners.lock().await;
-                try_acquire_submission_owner(&mut owners, owner_key, &worker_id)
+                try_acquire_submission_owner(&mut owners, owner_key.clone(), &worker_id)
             };
             if !should_spawn {
                 continue;
@@ -385,7 +385,7 @@ pub(super) fn load_next_queued_tasks(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT task_id, bilibili_uid \
+                "SELECT task_id, bilibili_uid, COALESCE(source_type, 'NORMAL') \
          FROM submission_task \
          WHERE status = 'WAITING_UPLOAD' \
          ORDER BY \
@@ -397,14 +397,14 @@ pub(super) fn load_next_queued_tasks(
                 Ok(QueuedSubmissionTask {
                     task_id: row.get(0)?,
                     bilibili_uid: row.get(1)?,
+                    source_type: row.get(2)?,
                 })
             })?;
             let mut seen_owners = HashSet::new();
             let mut result = Vec::new();
             for row in rows {
                 let item = row?;
-                let owner_key = item.bilibili_uid.unwrap_or(0);
-                if seen_owners.insert(owner_key) {
+                if seen_owners.insert(item.owner_key()) {
                     result.push(item);
                 }
             }
@@ -414,21 +414,23 @@ pub(super) fn load_next_queued_tasks(
 }
 
 pub(super) fn has_other_queued_tasks(context: &SubmissionContext, task_id: &str) -> Result<bool, String> {
-    let owner_uid = load_task_owner_uid(context.db.as_ref(), task_id)?;
+    let (owner_uid, source_type) = load_task_owner_key(context.db.as_ref(), task_id)?;
     context
         .db
         .with_conn(|conn| {
             let count: i64 = match owner_uid {
                 Some(owner_uid) => conn.query_row(
                     "SELECT COUNT(*) FROM submission_task \
-           WHERE status = 'WAITING_UPLOAD' AND task_id != ?1 AND bilibili_uid = ?2",
-                    params![task_id, owner_uid],
+           WHERE status = 'WAITING_UPLOAD' AND task_id != ?1 AND bilibili_uid = ?2 \
+             AND COALESCE(source_type, 'NORMAL') = ?3",
+                    params![task_id, owner_uid, source_type],
                     |row| row.get(0),
                 )?,
                 None => conn.query_row(
                     "SELECT COUNT(*) FROM submission_task \
-           WHERE status = 'WAITING_UPLOAD' AND task_id != ?1 AND bilibili_uid IS NULL",
-                    [task_id],
+           WHERE status = 'WAITING_UPLOAD' AND task_id != ?1 AND bilibili_uid IS NULL \
+             AND COALESCE(source_type, 'NORMAL') = ?2",
+                    params![task_id, source_type],
                     |row| row.get(0),
                 )?,
             };

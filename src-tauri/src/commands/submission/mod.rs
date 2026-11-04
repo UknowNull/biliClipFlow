@@ -1130,6 +1130,14 @@ struct WorkflowSettings {
 struct QueuedSubmissionTask {
     task_id: String,
     bilibili_uid: Option<i64>,
+    source_type: String,
+}
+
+impl QueuedSubmissionTask {
+    /// 队列串行粒度：同一账号的「切片投稿」与「其他投稿」各自独立排队，互不阻塞。
+    fn owner_key(&self) -> (i64, String) {
+        (self.bilibili_uid.unwrap_or(0), self.source_type.clone())
+    }
 }
 
 #[cfg(test)]
@@ -1784,40 +1792,71 @@ mod tests {
         assert!(!should_block_submission_retry(&task));
     }
 
+    fn clip_owner() -> (i64, String) {
+        (82679456, "CLIP".to_string())
+    }
+
+    fn normal_owner() -> (i64, String) {
+        (82679456, "NORMAL".to_string())
+    }
+
     #[test]
     fn submission_owner_lock_does_not_replace_active_worker() {
         let mut active_owners = HashMap::new();
         assert!(try_acquire_submission_owner(
             &mut active_owners,
-            82679456,
+            clip_owner(),
             "worker-1"
         ));
         assert!(!try_acquire_submission_owner(
             &mut active_owners,
-            82679456,
+            clip_owner(),
             "worker-2"
         ));
         assert_eq!(
-            active_owners.get(&82679456).map(String::as_str),
+            active_owners.get(&clip_owner()).map(String::as_str),
             Some("worker-1")
         );
     }
 
     #[test]
+    fn submission_owner_lock_is_per_source_type() {
+        // 同一账号下，切片投稿与其他投稿各自独立持有锁，互不阻塞
+        let mut active_owners = HashMap::new();
+        assert!(try_acquire_submission_owner(
+            &mut active_owners,
+            clip_owner(),
+            "worker-clip"
+        ));
+        assert!(try_acquire_submission_owner(
+            &mut active_owners,
+            normal_owner(),
+            "worker-normal"
+        ));
+        assert_eq!(active_owners.len(), 2);
+        // 同一类型仍互斥
+        assert!(!try_acquire_submission_owner(
+            &mut active_owners,
+            clip_owner(),
+            "worker-dup"
+        ));
+    }
+
+    #[test]
     fn submission_owner_lock_can_only_be_released_by_holder() {
-        let mut active_owners = HashMap::from([(82679456, "worker-2".to_string())]);
+        let mut active_owners = HashMap::from([(clip_owner(), "worker-2".to_string())]);
         assert!(!release_submission_owner(
             &mut active_owners,
-            82679456,
+            clip_owner(),
             "worker-1"
         ));
-        assert!(active_owners.contains_key(&82679456));
+        assert!(active_owners.contains_key(&clip_owner()));
         assert!(release_submission_owner(
             &mut active_owners,
-            82679456,
+            clip_owner(),
             "worker-2"
         ));
-        assert!(!active_owners.contains_key(&82679456));
+        assert!(!active_owners.contains_key(&clip_owner()));
     }
 
     #[test]

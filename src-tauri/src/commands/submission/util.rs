@@ -2480,8 +2480,8 @@ pub(super) fn truncate_log_value(value: &Value) -> String {
 }
 
 pub(super) fn try_acquire_submission_owner(
-    active_owners: &mut HashMap<i64, String>,
-    owner_key: i64,
+    active_owners: &mut HashMap<(i64, String), String>,
+    owner_key: (i64, String),
     worker_id: &str,
 ) -> bool {
     match active_owners.entry(owner_key) {
@@ -2494,8 +2494,8 @@ pub(super) fn try_acquire_submission_owner(
 }
 
 pub(super) fn release_submission_owner(
-    active_owners: &mut HashMap<i64, String>,
-    owner_key: i64,
+    active_owners: &mut HashMap<(i64, String), String>,
+    owner_key: (i64, String),
     worker_id: &str,
 ) -> bool {
     if active_owners.get(&owner_key).map(String::as_str) != Some(worker_id) {
