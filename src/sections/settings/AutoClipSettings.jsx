@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../../lib/tauri";
 
 const LLM_PRESETS = [
@@ -217,6 +218,33 @@ export default function AutoClipSettings({ visible }) {
     }
   };
 
+  const handleImportPackage = async () => {
+    setMessage("");
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "模型包", extensions: ["zip"] }],
+      });
+      if (!selected) return;
+      const filePath = Array.isArray(selected) ? selected[0] : selected;
+      await invokeCommand("auto_clip_asr_import_package", { packagePath: filePath });
+      await refreshAsr();
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleDownloadPackage = async () => {
+    setMessage("");
+    try {
+      await invokeCommand("auto_clip_settings_save", { settings: normalized() });
+      await invokeCommand("auto_clip_asr_download_package");
+      await refreshAsr();
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
   const modelFiles = asrState?.models || [];
   const allReady = modelFiles.length > 0 && modelFiles.every((item) => item.ready);
   const download = asrState?.download || {};
@@ -325,6 +353,10 @@ export default function AutoClipSettings({ visible }) {
               ))}
             </select>
           </Field>
+          <label className="flex items-center gap-2 text-sm text-[var(--ink)] lg:col-span-2">
+            <input type="checkbox" checked={!!llm.mergeSystem} onChange={(e) => update("llm", "mergeSystem", e.target.checked)} />
+            系统提示并入用户消息（部分中转网关会丢弃系统提示，导致输出不是 JSON 时打开）
+          </label>
           <Field label="思考档位" hint="推理模型的思考过程计入输出 token，关闭可大幅节省；不指定时由服务端决定">
             <select className={inputClass} value={llm.reasoningEffort || ""} onChange={(e) => update("llm", "reasoningEffort", e.target.value)}>
               {REASONING_OPTIONS.map((item) => (
@@ -415,17 +447,32 @@ export default function AutoClipSettings({ visible }) {
           ))}
         </div>
         <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button type="button" className={ghostButton} onClick={handleDownloadPackage} disabled={download.running}>
+            {download.running && download.stage === "download" ? "下载模型包中..." : "下载模型包"}
+          </button>
+          <button type="button" className={ghostButton} onClick={handleImportPackage} disabled={download.running}>
+            导入模型包
+          </button>
           <button type="button" className={ghostButton} onClick={handleDownload} disabled={download.running || allReady}>
-            {allReady ? "模型已就绪" : download.running ? "下载中..." : "下载模型"}
+            {allReady ? "模型已就绪" : download.running ? "下载中..." : "逐个下载模型"}
           </button>
           {download.running ? (
             <span className="text-sm text-[var(--muted)]">
-              {MODEL_LABELS[download.currentFile] || download.currentFile}：{formatMb(download.downloaded)} / {formatMb(download.total)}
+              {download.stage === "verify"
+                ? "正在校验模型包..."
+                : download.stage === "extract"
+                  ? `正在解压 ${download.currentFile || ""}（${download.downloaded}/${download.total}）`
+                  : download.stage === "install"
+                    ? "正在安装模型文件..."
+                    : `${MODEL_LABELS[download.currentFile] || download.currentFile || "模型"}：${formatMb(download.downloaded)} / ${formatMb(download.total)}`}
             </span>
           ) : download.error ? (
             <span className="text-sm text-red-600">{download.error}</span>
           ) : null}
         </div>
+        <p className="mt-2 text-xs text-[var(--muted)]">
+          切片分析需要全部模型（约 770 MB）。可从本页下载模型包，或从发布页下载后用「导入模型包」安装。
+        </p>
       </div>
 
       <div className="flex flex-wrap items-center gap-3">

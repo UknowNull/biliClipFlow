@@ -186,3 +186,76 @@ pub fn anchor_voiceprint_enroll(state: State<'_, AppState>, app: tauri::AppHandl
         Err(err) => ApiResponse::error(format!("保存主播声纹失败: {}", err)),
     }
 }
+
+/// 导入本地模型包（zip），解压校验后安装到模型目录。后台执行，进度通过 auto_clip_asr_status 查询。
+#[tauri::command(async)]
+pub fn auto_clip_asr_import_package(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    package_path: String,
+) -> ApiResponse<String> {
+    let path = package_path.trim().to_string();
+    if path.is_empty() {
+        return ApiResponse::error("请选择模型包文件");
+    }
+    let cfg = settings::load(&state.db);
+    let dir = hl::model_dir(&app.path().app_data_dir().unwrap_or_default(), &cfg.asr);
+    let log_path = state.app_log_path.clone();
+    // 先同步占位，保证前端轮询能立刻看到 running
+    if let Err(err) = asr::begin_progress("verify") {
+        return ApiResponse::error(err);
+    }
+    std::thread::spawn(move || {
+        let package = std::path::PathBuf::from(&path);
+        match asr::import_model_package_locked(&dir, &package) {
+            Ok(message) => crate::utils::append_log(
+                &log_path,
+                &format!("asr_model_import_ok path={} msg={}", path, message),
+            ),
+            Err(err) => {
+                crate::utils::append_log(
+                    &log_path,
+                    &format!("asr_model_import_failed path={} err={}", path, err),
+                );
+            }
+        }
+    });
+    ApiResponse::success("已开始导入模型包".to_string())
+}
+
+/// 从固定地址下载模型包到缓存目录，随后自动导入。
+#[tauri::command(async)]
+pub fn auto_clip_asr_download_package(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> ApiResponse<String> {
+    let cfg = settings::load(&state.db);
+    let dir = hl::model_dir(&app.path().app_data_dir().unwrap_or_default(), &cfg.asr);
+    let cache_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_default()
+        .join("models")
+        .join("packages");
+    let log_path = state.app_log_path.clone();
+    // 先同步占位，保证前端轮询能立刻看到 running
+    if let Err(err) = asr::begin_progress("download") {
+        return ApiResponse::error(err);
+    }
+    std::thread::spawn(move || {
+        // 下载与导入共用同一把进度锁，中途不释放，避免并发解压
+        let result = asr::download_model_package_locked(&cache_dir)
+            .and_then(|path| asr::import_model_package_locked(&dir, &path));
+        match result {
+            Ok(message) => crate::utils::append_log(
+                &log_path,
+                &format!("asr_model_package_ok msg={}", message),
+            ),
+            Err(err) => crate::utils::append_log(
+                &log_path,
+                &format!("asr_model_package_failed err={}", err),
+            ),
+        }
+    });
+    ApiResponse::success("已开始下载模型包".to_string())
+}
