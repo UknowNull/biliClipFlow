@@ -1,0 +1,52 @@
+name: build-model-package
+
+# 仅在模型更新时手动触发。主程序发版不涉及此流程。
+# 产物固定上传到 models-latest 这个 Release，覆盖同名资产。
+# 客户端下载地址形如：
+#   https://github.com/<owner>/<repo>/releases/download/models-latest/biliClipFlow-models.zip
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: "模型包版本（写入 manifest.json，例如 1.0.0）"
+        required: true
+        default: "1.0.0"
+      release_tag:
+        description: "目标 Release tag（固定为 models-latest，模型更新时覆盖资产）"
+        required: true
+        default: "models-latest"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fetch models
+        run: node scripts/fetch-models.mjs src-tauri/models/asr
+
+      - name: Build model package
+        run: node scripts/build-model-package.mjs --src src-tauri/models/asr --version "${{ inputs.model_version }}" --out dist/biliClipFlow-models.zip
+
+      - name: Show package info
+        run: ls -lh dist/biliClipFlow-models.zip
+
+      - name: Publish to models release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: "语音模型包"
+          body: |
+            切片分析所需的语音识别模型（SenseVoice / Paraformer / VAD / 标点 / 声纹）。
+
+            在 biliClipFlow 的「设置 → 自动切片」中点击「导入模型包」选择此文件即可。
+          files: dist/biliClipFlow-models.zip
+          overwrite: true
