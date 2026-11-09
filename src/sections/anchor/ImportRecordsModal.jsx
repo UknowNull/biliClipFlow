@@ -6,6 +6,7 @@ const STATUS = {
   new: ["新录播", "bg-[#E8F5EE] text-[#1F7A45]"],
   overlap: ["时间重叠", "bg-[#FFF3E6] text-[#9A4A0C]"],
   imported: ["已导入过", "bg-black/5 text-[var(--muted)]"],
+  needs_manual: ["待补全", "bg-[#EEF3FF] text-[#1F4FB8]"],
   invalid: ["跳过", "bg-rose-50 text-rose-600"],
 };
 const POLICIES = [
@@ -24,6 +25,8 @@ export default function ImportRecordsModal({ anchor, onClose, onImported }) {
   const [policy, setPolicy] = useState("skip");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  // needs_manual 行的标题补填：path -> 标题
+  const [manualTitles, setManualTitles] = useState({});
 
   const pickAndScan = async () => {
     const selected = await openDialog({ directory: true, multiple: false, title: "选择录播目录" });
@@ -51,15 +54,46 @@ export default function ImportRecordsModal({ anchor, onClose, onImported }) {
   const list = items || [];
   const videos = list.filter((i) => i.status !== "invalid");
   const overlaps = list.filter((i) => i.status === "overlap");
-  const toImport = list.filter((i) => i.status === "new" || (i.status === "overlap" && policy !== "skip"));
+  const toImport = list.filter(
+    (i) => i.status === "new" || i.status === "needs_manual" || (i.status === "overlap" && policy !== "skip"),
+  );
   const replaceIds = policy === "replace" ? [...new Set(overlaps.flatMap((i) => i.overlaps.map((o) => o.id)))] : [];
+
+  // 给缺少字幕的视频补一份 SRT：复制到视频旁并改成同名
+  const attachSrt = async (item) => {
+    setMessage("");
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "字幕", extensions: ["srt"] }],
+        title: `为 ${item.fileName} 选择字幕`,
+      });
+      if (typeof selected !== "string") return;
+      await invokeCommand("anchor_record_import_attach_srt", {
+        videoPath: item.path,
+        srtPath: selected,
+      });
+      setItems((prev) =>
+        (prev || []).map((it) => (it.path === item.path ? { ...it, hasSrt: true } : it)),
+      );
+    } catch (err) {
+      setMessage(err?.message || "关联字幕失败");
+    }
+  };
 
   const commit = async () => {
     if (!toImport.length || busy) return;
     if (replaceIds.length && !(await dialogConfirm(`将删除 ${replaceIds.length} 条重叠的旧录播记录（只删记录，不删文件），删除后不可恢复。确定继续吗？`, { title: "替换旧记录" }))) return;
     setBusy(true);
     try {
-      const entries = toImport.map((i) => ({ path: i.path, title: i.title, startTime: i.startTime, endTime: i.endTime, size: i.size }));
+      const entries = toImport.map((i) => ({
+        path: i.path,
+        // 待补全的行用用户填写的标题；留空时回落到文件名
+        title: i.status === "needs_manual" ? manualTitles[i.path]?.trim() || i.fileName.replace(/\.[^.]+$/, "") : i.title,
+        startTime: i.startTime,
+        endTime: i.endTime,
+        size: i.size,
+      }));
       const n = await invokeCommand("anchor_record_import_commit", { roomId: anchor.uid, entries, replaceIds });
       setMessage(`已导入 ${n} 段录播${replaceIds.length ? `，替换旧记录 ${replaceIds.length} 条` : ""}`);
       setItems(null);
@@ -93,7 +127,9 @@ export default function ImportRecordsModal({ anchor, onClose, onImported }) {
           {items ? (
             <>
               <div className="text-xs text-[var(--muted)]">
-                视频 {videos.length} 段（新 {list.filter((i) => i.status === "new").length}，重叠 {overlaps.length}，已导入过 {list.filter((i) => i.status === "imported").length}）· 字幕 {videos.filter((i) => i.hasSrt).length} 份 · 弹幕 {videos.filter((i) => i.hasDanmaku).length} 份
+                视频 {videos.length} 段（新 {list.filter((i) => i.status === "new").length}
+                {list.some((i) => i.status === "needs_manual") ? `，待补全 ${list.filter((i) => i.status === "needs_manual").length}` : ""}
+                ，重叠 {overlaps.length}，已导入过 {list.filter((i) => i.status === "imported").length}）· 字幕 {videos.filter((i) => i.hasSrt).length} 份 · 弹幕 {videos.filter((i) => i.hasDanmaku).length} 份
                 {list.some((i) => i.status === "invalid") ? ` · 跳过 ${list.filter((i) => i.status === "invalid").length} 个文件` : ""}
               </div>
               <table className="w-full text-xs">
@@ -112,7 +148,15 @@ export default function ImportRecordsModal({ anchor, onClose, onImported }) {
                     <tr key={i.path} className="border-t border-black/5 align-top">
                       <td className="max-w-[360px] py-1.5 pr-2">
                         <div className="truncate text-[var(--ink)]" title={i.fileName}>{i.fileName}</div>
-                        {i.reason ? <div className="text-rose-600">{i.reason}</div> : null}
+                        {i.status === "needs_manual" ? (
+                          <input
+                            className="mt-1 w-full rounded-md border border-[#1F5BD8]/30 bg-[#EEF3FF]/40 px-2 py-1 text-xs text-[var(--ink)] placeholder:text-[var(--muted)]"
+                            placeholder={i.fileName.replace(/\.[^.]+$/, "")}
+                            value={manualTitles[i.path] || ""}
+                            onChange={(e) => setManualTitles((prev) => ({ ...prev, [i.path]: e.target.value }))}
+                          />
+                        ) : null}
+                        {i.reason ? <div className="text-xs text-[var(--muted)]">{i.reason}</div> : null}
                         {i.overlaps.map((o) => (
                           <div key={o.id} className="truncate text-[#9A4A0C]" title={o.filePath}>
                             重叠：#{o.id} {baseName(o.filePath)}（{o.fileExists ? "文件存在" : "文件已缺失"}）
@@ -121,7 +165,22 @@ export default function ImportRecordsModal({ anchor, onClose, onImported }) {
                       </td>
                       <td className="whitespace-nowrap pr-2 tabular-nums">{fmt(i.startTime)}</td>
                       <td className="pr-2 tabular-nums">{i.duration ? dur(i.duration) : "-"}</td>
-                      <td className="pr-2">{i.hasSrt ? "✓" : "—"}</td>
+                      <td className="pr-2">
+                        {i.hasSrt ? (
+                          "✓"
+                        ) : i.status === "invalid" || i.status === "imported" ? (
+                          "—"
+                        ) : (
+                          <button
+                            type="button"
+                            className="rounded-md border border-black/10 bg-white px-1.5 py-0.5 text-[11px] text-[var(--ink)] hover:border-black/20"
+                            onClick={() => attachSrt(i)}
+                            title="没有同名字幕，选择一份 .srt 复制到视频旁边；不选则分析时用语音识别"
+                          >
+                            选择字幕
+                          </button>
+                        )}
+                      </td>
                       <td className="pr-2">{i.hasDanmaku ? "✓" : "—"}</td>
                       <td>
                         <span className={`rounded px-1.5 py-0.5 ${STATUS[i.status]?.[1]}`}>{STATUS[i.status]?.[0] || i.status}</span>
