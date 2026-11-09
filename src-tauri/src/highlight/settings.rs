@@ -58,6 +58,8 @@ pub struct LlmSettings {
     pub timeout_secs: u64,
     pub max_concurrency: usize,
     pub context_tokens: usize,
+    /// 网关会丢弃 system 消息时打开：系统提示拼到用户消息前面发送
+    pub merge_system: bool,
 }
 
 impl Default for LlmSettings {
@@ -73,6 +75,7 @@ impl Default for LlmSettings {
             timeout_secs: 120,
             max_concurrency: 1,
             context_tokens: 32768,
+            merge_system: false,
         }
     }
 }

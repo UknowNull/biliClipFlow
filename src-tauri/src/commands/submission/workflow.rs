@@ -184,6 +184,7 @@ pub(super) async fn run_submission_workflow(
     let media_process_mode = load_media_process_mode(workflow_config.as_ref());
     let use_transcode_media = media_process_mode == MediaProcessMode::ClipAndMergeTranscode;
     let _ = wait_for_workflow_ready(&context, &task_id).await?;
+    burn_clip_subtitles(&context, &task_id, workflow_config.as_ref()).await?;
 
     let sources = if is_update_workflow {
         match load_update_sources(&context, &task_id)? {
@@ -1088,6 +1089,130 @@ pub(super) async fn run_submission_workflow(
     Ok(())
 }
 
+/// 读取库里最新的字幕样式（全局一份）。读不到时退回调用方给的快照。
+fn load_subtitle_style(context: &SubmissionContext, fallback: Value) -> Value {
+    context
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                [crate::commands::anchor::SUBTITLE_STYLE_KEY],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(fallback)
+}
+
+/// 生成参数指纹：边界、样式或字幕任一项变了都要重新生成成片
+fn burn_fingerprint(
+    style: &Value,
+    cues: &[crate::commands::anchor::SubtitleCueInput],
+    start: f64,
+    end: f64,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(start.to_bits().to_le_bytes());
+    hasher.update(end.to_bits().to_le_bytes());
+    hasher.update(serde_json::to_vec(style).unwrap_or_default());
+    for cue in cues {
+        hasher.update(cue.start.to_bits().to_le_bytes());
+        hasher.update(cue.end.to_bits().to_le_bytes());
+        hasher.update(cue.text.as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// 评阅页投稿的切片：先按切片当前起止从录播重新剪辑并压入字幕，再把源视频换成生成的文件。
+/// 已烧录且参数未变时跳过；参数变了（改了字号/颜色/位置或字幕内容）会覆盖重新生成。
+async fn burn_clip_subtitles(context: &SubmissionContext, task_id: &str, config: Option<&Value>) -> Result<(), String> {
+    let Some(burn) = config.and_then(|c| c.get("subtitleBurn")) else {
+        return Ok(());
+    };
+    let clip_id = burn.get("clipId").and_then(|v| v.as_i64()).ok_or("字幕烧录缺少切片编号")?;
+    let cues: Vec<crate::commands::anchor::SubtitleCueInput> =
+        serde_json::from_value(burn.get("cues").cloned().unwrap_or_default()).map_err(|err| format!("字幕数据无效: {}", err))?;
+    // 以库里最新的样式为准，避免前端快照滞后导致烧录用旧字号
+    let style = load_subtitle_style(context, burn.get("style").cloned().unwrap_or_default());
+    // 边界一并纳入指纹：评阅页改过起止也要重新生成，否则会复用旧时长的成片
+    let (bound_start, bound_end) = context
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT start_offset, end_offset FROM live_clip_item WHERE id = ?1",
+                [clip_id],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?)),
+            )
+        })
+        .map_err(|err| format!("读取切片边界失败: {}", err))?;
+    let fingerprint = burn_fingerprint(&style, &cues, bound_start, bound_end);
+
+    let current: Option<String> = context
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT source_file_path FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .map_err(|err| err.to_string())?;
+    // 数据库可能存相对路径（配置了 local_path_prefix），读回来要还原成运行时可用的绝对路径
+    let current_abs = current
+        .as_deref()
+        .map(|value| to_runtime_submission_path(context, value));
+    let current_path = current_abs.as_deref().map(Path::new);
+    let already_burned = current_path
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|name| name == "subtitled")
+        .unwrap_or(false);
+    if already_burned {
+        // 指纹文件与成片同名，只是扩展名不同
+        let stamp = current_path.map(|p| p.with_extension("burn.json"));
+        let same = stamp
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|saved| saved.trim() == fingerprint)
+            .unwrap_or(false);
+        if same && current_path.map(|p| p.is_file()).unwrap_or(false) {
+            append_log(&context.app_log_path, &format!("submission_subtitle_burn_skip task_id={} reason=unchanged", task_id));
+            return Ok(());
+        }
+    }
+
+    update_submission_status(context, task_id, "CLIPPING")?;
+    let _ = update_workflow_status(context, task_id, "RUNNING", Some("CLIPPING"), 0.0);
+    append_log(&context.app_log_path, &format!("submission_subtitle_burn_start task_id={} clip_id={} cues={}", task_id, clip_id, cues.len()));
+    let db = context.db.clone();
+    let (output, seconds) = tauri::async_runtime::spawn_blocking(move || crate::commands::anchor::render_subtitled(&db, clip_id, cues, &style))
+        .await
+        .map_err(|_| "字幕烧录任务异常".to_string())??;
+    // 时长按秒向下取整，多加 1 秒避免截掉末尾（ffmpeg 读到文件尾即止）
+    let end = seconds + 1;
+    let end_time = format!("{:02}:{:02}:{:02}", end / 3600, end / 60 % 60, end % 60);
+    context
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_source_video SET source_file_path = ?1, end_time = ?2 WHERE task_id = ?3",
+                (to_stored_submission_path(context, &output), &end_time, task_id),
+            )
+        })
+        .map_err(|err| err.to_string())?;
+    // 记录本次烧录的参数指纹，供下次投稿判断是否需要重烧
+    let stamp = Path::new(&output).with_extension("burn.json");
+    if let Err(err) = std::fs::write(&stamp, &fingerprint) {
+        append_log(&context.app_log_path, &format!("submission_subtitle_burn_stamp_fail task_id={} err={}", task_id, err));
+    }
+    append_log(&context.app_log_path, &format!("submission_subtitle_burn_done task_id={} output={} end={}", task_id, output, end_time));
+    Ok(())
+}
+
 pub(super) async fn run_submission_workflow_guarded(context: SubmissionContext, task_id: String) {
     if let Err(err) = run_submission_workflow(context.clone(), task_id.clone()).await {
         if err == "Workflow cancelled" {
@@ -1411,4 +1536,55 @@ pub(super) fn update_workflow_status(
       Ok(())
     })
     .map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod subtitle_burn_tests {
+    use super::*;
+    use crate::commands::anchor::SubtitleCueInput;
+
+    fn cue(start: f64, end: f64, text: &str) -> SubtitleCueInput {
+        SubtitleCueInput { start, end, text: text.to_string() }
+    }
+
+    #[test]
+    fn fingerprint_changes_when_font_size_changes() {
+        let cues = vec![cue(1.0, 3.0, "你好")];
+        let small = serde_json::json!({ "fontSize": 54, "color": "#FFFFFF" });
+        let large = serde_json::json!({ "fontSize": 78, "color": "#FFFFFF" });
+        assert_ne!(
+            burn_fingerprint(&small, &cues, 10.0, 40.0),
+            burn_fingerprint(&large, &cues, 10.0, 40.0),
+            "改字号必须改变指纹，否则不会重烧"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_cues_change() {
+        let style = serde_json::json!({ "fontSize": 54 });
+        assert_ne!(
+            burn_fingerprint(&style, &[cue(1.0, 3.0, "你好")], 10.0, 40.0),
+            burn_fingerprint(&style, &[cue(1.0, 3.0, "再见")], 10.0, 40.0),
+            "改字幕文字必须改变指纹"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_bounds_change() {
+        let style = serde_json::json!({ "fontSize": 54 });
+        let cues = vec![cue(1.0, 3.0, "你好")];
+        assert_ne!(
+            burn_fingerprint(&style, &cues, 10.0, 40.0),
+            burn_fingerprint(&style, &cues, 8.0, 44.0),
+            "改边界必须改变指纹，否则会复用旧时长的成片"
+        );
+    }
+
+    #[test]
+    fn fingerprint_stable_for_identical_input() {
+        let style = serde_json::json!({ "fontSize": 54, "x": 50.0, "y": 82.0 });
+        let first = burn_fingerprint(&style, &[cue(1.0, 3.0, "你好"), cue(3.5, 5.0, "世界")], 10.0, 40.0);
+        let second = burn_fingerprint(&style, &[cue(1.0, 3.0, "你好"), cue(3.5, 5.0, "世界")], 10.0, 40.0);
+        assert_eq!(first, second, "参数不变时指纹必须一致，才能跳过重烧");
+    }
 }

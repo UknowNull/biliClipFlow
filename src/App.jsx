@@ -48,6 +48,8 @@ const sectionLabels = {
 function App() {
   const [active, setActive] = useState("download");
   const [expandedMenus, setExpandedMenus] = useState({ toolbox: false });
+  // 录播管理与切片评阅需要更多纵向空间，进入时隐藏顶部账号栏
+  const [anchorFullPage, setAnchorFullPage] = useState(false);
   const [authStatus, setAuthStatus] = useState({ loggedIn: false });
   const [avatarPreviews, setAvatarPreviews] = useState({});
   const [accountBindings, setAccountBindings] = useState({});
@@ -270,7 +272,7 @@ function App() {
           />
         );
       case "anchor":
-        return <AnchorSection />;
+        return <AnchorSection onFullPageChange={setAnchorFullPage} />;
       case "download":
         return (
           <DownloadSection
@@ -362,7 +364,7 @@ function App() {
         })}
       </aside>
       <div id="main" className="main-shell">
-        <div className="title-bar" data-tauri-drag-region>
+        <div className={`title-bar ${anchorFullPage && activeSection === "anchor" ? "hidden" : ""}`} data-tauri-drag-region>
           <div />
           <div className="avatar-actions" data-tauri-drag-region="false">
             <button

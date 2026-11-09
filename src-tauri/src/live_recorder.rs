@@ -4262,7 +4262,7 @@ fn handle_danmaku_payload(
                     "SUPER_CHAT_MESSAGE" | "SUPER_CHAT_MESSAGE_JPN" => {
                         settings.record_danmaku_superchat
                     }
-                    "SEND_GIFT" => settings.record_danmaku_gift,
+                    "SEND_GIFT" | "SEND_GIFT_V2" => settings.record_danmaku_gift,
                     "GUARD_BUY" | "USER_TOAST_MSG" => settings.record_danmaku_guard,
                     _ => false,
                 }

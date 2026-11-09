@@ -1,31 +1,12 @@
-import { Fragment, useEffect, useRef, useState } from "react";
-import { confirm as dialogConfirm } from "@tauri-apps/plugin-dialog";
+import { useEffect, useRef, useState } from "react";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime } from "../lib/format";
+import RecordManageView from "./anchor/RecordManageView";
+import ClipReviewView from "./anchor/ClipReviewView";
+import BatchSubmitView from "./anchor/BatchSubmitView";
+import { clipFormError, createClipSubmission, joinClipTitle } from "./anchor/clipSubmit";
 
-const CLIP_ACTIVE_STATUSES = ["RUNNING", "QUEUED"];
-const CLIP_STAGE_LABELS = {
-  PREPARE: "准备",
-  ASR: "语音识别",
-  SPEAKER: "声纹判定",
-  CANDIDATES: "挑选候选",
-  TRANSCRIBE: "转写",
-  AI: "AI 精排",
-  CUT: "剪辑",
-};
-const CLIP_PROFILES = [
-  { value: "reaction", label: "reaction（看作品解说）" },
-  { value: "game", label: "游戏" },
-  { value: "chat", label: "杂谈" },
-];
-const CLIP_AI_LABELS = {
-  KEPT: "AI 推荐",
-  SIGNAL_ONLY: "仅信号",
-  UNVERIFIED: "证据未通过",
-  ERROR: "AI 失败",
-};
-
-export default function AnchorSection() {
+export default function AnchorSection({ onFullPageChange }) {
   const [newAnchorUid, setNewAnchorUid] = useState("");
   const [anchors, setAnchors] = useState([]);
   const [anchorAvatars, setAnchorAvatars] = useState({});
@@ -55,22 +36,14 @@ export default function AnchorSection() {
   const [recordList, setRecordList] = useState([]);
   const [recordListLoading, setRecordListLoading] = useState(false);
   const [recordListError, setRecordListError] = useState("");
-  const [detailView, setDetailView] = useState(null);
-  const [analyzingTasks, setAnalyzingTasks] = useState({});
-  const [clipView, setClipView] = useState(null);
-  const [clipSortByScore, setClipSortByScore] = useState(true);
-  const [clipListLoading, setClipListLoading] = useState(false);
-  const [clipListError, setClipListError] = useState("");
-  const [clipListMessage, setClipListMessage] = useState("");
-  const [clipEdit, setClipEdit] = useState(null);
-  const [reclipLoading, setReclipLoading] = useState({});
-  const [clipExpanded, setClipExpanded] = useState({});
-  const [clipProfile, setClipProfile] = useState("reaction");
-  // 主播声纹：null 为未登记，否则为来源说明；voiceprintForm 非空时显示登记表单
-  const [voiceprint, setVoiceprint] = useState(null);
-  const [voiceprintForm, setVoiceprintForm] = useState(null);
-  const [voiceprintBusy, setVoiceprintBusy] = useState(false);
+  // 正在评阅的场次；非空时录播管理页显示评阅工作台
+  const [reviewSession, setReviewSession] = useState(null);
+  useEffect(() => {
+    onFullPageChange?.(Boolean(recordView));
+    return () => onFullPageChange?.(false);
+  }, [recordView]);
   const [clipSubmitView, setClipSubmitView] = useState(null);
+  const [batchSubmitView, setBatchSubmitView] = useState(null);
   const [clipSubmitMessage, setClipSubmitMessage] = useState("");
   const [clipSubmitSubmitting, setClipSubmitSubmitting] = useState(false);
   const [submissionConfigView, setSubmissionConfigView] = useState(null);
@@ -432,7 +405,7 @@ export default function AnchorSection() {
     setRecordList([]);
     setRecordListError("");
     setRecordListLoading(true);
-    setAnalyzingTasks({});
+    setReviewSession(null);
     try {
       const data = await invokeCommand("anchor_record_list", { roomId: anchor.uid });
       setRecordList(data || []);
@@ -456,8 +429,6 @@ export default function AnchorSection() {
   const handleOpenSubmissionConfig = async (anchor) => {
     setSubmissionConfigView(anchor);
     setRecordView(null);
-    setClipView(null);
-    setClipEdit(null);
     setSubmissionConfigMessage("");
     setSubmissionConfigLoading(true);
     setSubmissionConfigSubmitting(false);
@@ -493,6 +464,17 @@ export default function AnchorSection() {
     resetSubmissionConfigForm();
     try {
       await loadAnchorSubmissionConfig(recordView);
+      // 自动切片：标题为投稿设置里的标题（如【主播名】）加切片标题，简介和标签用切片上的
+      const clipTitle = record.titles?.[0]?.trim();
+      if (clipTitle) {
+        setSubmissionConfigForm((prev) => ({
+          ...prev,
+          title: joinClipTitle(prev.title, clipTitle),
+          description: record.description?.trim() || prev.description,
+        }));
+        const clipTags = String(record.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
+        setSubmissionConfigTags((prev) => [...new Set([...prev, ...clipTags])]);
+      }
     } catch (error) {
       setClipSubmitMessage(error?.message || "加载投稿配置失败");
     } finally {
@@ -771,233 +753,6 @@ export default function AnchorSection() {
     }
     return trimmed;
   };
-
-  const formatSeconds = (seconds) => {
-    const total = Math.max(0, Number(seconds) || 0);
-    const hours = Math.floor(total / 3600);
-    const minutes = Math.floor((total % 3600) / 60);
-    const secs = Math.floor(total % 60);
-    return [hours, minutes, secs].map((value) => String(value).padStart(2, "0")).join(":");
-  };
-
-  const parseTimeInput = (value) => {
-    if (value === null || value === undefined) {
-      return null;
-    }
-    const raw = String(value).trim();
-    if (!raw) {
-      return null;
-    }
-    if (/^\d+$/.test(raw)) {
-      return Number(raw);
-    }
-    const parts = raw.split(":").map((item) => item.trim());
-    if (parts.length === 2 || parts.length === 3) {
-      const nums = parts.map((item) => Number(item));
-      if (nums.some((num) => Number.isNaN(num))) {
-        return null;
-      }
-      const [h, m, s] = parts.length === 3 ? nums : [0, nums[0], nums[1]];
-      return h * 3600 + m * 60 + s;
-    }
-    return null;
-  };
-
-  const startClipEdit = (record, field) => {
-    if (!record?.id) {
-      return;
-    }
-    const current = field === "start" ? record.startOffset : record.endOffset;
-    setClipEdit({ id: record.id, field, value: formatSeconds(current) });
-  };
-
-  const submitClipEdit = async (record) => {
-    if (!clipEdit || !record) {
-      return;
-    }
-    const value = parseTimeInput(clipEdit.value);
-    if (value === null) {
-      setClipListError("时间格式无效，支持 HH:MM:SS 或秒数");
-      return;
-    }
-    const startOffset = clipEdit.field === "start" ? value : record.startOffset;
-    const endOffset = clipEdit.field === "end" ? value : record.endOffset;
-    if (endOffset <= startOffset || startOffset < 0) {
-      setClipListError("时间段无效，请确保结束时间大于开始时间");
-      return;
-    }
-    try {
-      const updated = await invokeCommand("anchor_clip_update_time", {
-        clipId: record.id,
-        startOffset,
-        endOffset,
-      });
-      setClipView((prev) => {
-        if (!prev) return prev;
-        const nextRecords = prev.records.map((item) =>
-          item.id === record.id ? { ...item, ...updated } : item
-        );
-        return { ...prev, records: nextRecords };
-      });
-      setClipEdit(null);
-    } catch (error) {
-      setClipListError(error?.message || "更新时间失败");
-    }
-  };
-
-  const handleAnalyzeClips = async (day, records) => {
-    if (!recordView) {
-      return;
-    }
-    const recordIds = records.map((record) => record.id).filter((id) => Number.isFinite(id));
-    if (recordIds.length === 0) {
-      setRecordListError("录播记录为空，无法分析");
-      return;
-    }
-    setRecordListError("");
-    setAnalyzingTasks((prev) => ({
-      ...prev,
-      [day]: { taskId: prev?.[day]?.taskId || 0, status: "RUNNING", errorMessage: "" },
-    }));
-    try {
-      const taskId = await invokeCommand("anchor_analyze_clips", {
-        roomId: recordView.uid,
-        recordIds,
-      });
-      setAnalyzingTasks((prev) => ({
-        ...prev,
-        [day]: { taskId, status: "RUNNING", errorMessage: "" },
-      }));
-    } catch (error) {
-      setAnalyzingTasks((prev) => ({
-        ...prev,
-        [day]: { taskId: 0, status: "FAILED", errorMessage: error?.message || "分析失败" },
-      }));
-      setRecordListError(error?.message || "分析失败");
-    }
-  };
-
-  const handleOpenClipList = async (day, records) => {
-    if (!recordView) {
-      return;
-    }
-    const recordIds = records.map((record) => record.id).filter((id) => Number.isFinite(id));
-    setClipListLoading(true);
-    setClipListError("");
-    setClipListMessage("");
-    setClipEdit(null);
-    setClipView({ dateLabel: day, records: [], recordIds });
-    try {
-      const data = await invokeCommand("anchor_clip_list", {
-        roomId: recordView.uid,
-        recordIds,
-      });
-      const items = data?.items ?? data ?? [];
-      setClipView({ dateLabel: day, records: items, recordIds, task: data });
-      invokeCommand("anchor_clip_profile_get", { roomId: recordView.uid })
-        .then((value) => setClipProfile(value || "reaction"))
-        .catch(() => {});
-      setVoiceprintForm(null);
-      invokeCommand("anchor_voiceprint_get", { roomId: recordView.uid })
-        .then((value) => setVoiceprint(value || null))
-        .catch(() => {});
-    } catch (error) {
-      setClipListError(error?.message || "加载切片记录失败");
-    } finally {
-      setClipListLoading(false);
-    }
-  };
-
-  const refreshClipList = async (source = "refresh") => {
-    if (!recordView || !clipView?.recordIds?.length || clipListLoading) {
-      return;
-    }
-    setClipListLoading(true);
-    setClipListError("");
-    if (source === "reclip") {
-      setClipListMessage("");
-    }
-    try {
-      const data = await invokeCommand("anchor_clip_list", {
-        roomId: recordView.uid,
-        recordIds: clipView.recordIds,
-      });
-      const items = data?.items ?? data ?? [];
-      setClipView((prev) => (prev ? { ...prev, records: items, task: data } : prev));
-    } catch (error) {
-      setClipListError(error?.message || "刷新切片记录失败");
-    } finally {
-      setClipListLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    const handler = () => {
-      if (!clipView?.recordIds?.length || !recordView) {
-        return;
-      }
-      refreshClipList("repost");
-    };
-    window.addEventListener("anchor-clip-list-refresh", handler);
-    return () => window.removeEventListener("anchor-clip-list-refresh", handler);
-  }, [clipView, recordView]);
-
-  useEffect(() => {
-    if (!clipView?.records?.length || !recordView) {
-      return undefined;
-    }
-    const hasRunning = clipView.records.some(
-      (record) => String(record?.status || "").toUpperCase() === "RUNNING"
-    );
-    if (!hasRunning) {
-      return undefined;
-    }
-    const timer = setInterval(() => {
-      refreshClipList("poll");
-    }, 2000);
-    return () => clearInterval(timer);
-  }, [clipView, recordView, clipListLoading]);
-
-  useEffect(() => {
-    if (!recordView || Object.keys(analyzingTasks).length === 0) {
-      return undefined;
-    }
-    const polling = setInterval(async () => {
-      const entries = Object.entries(analyzingTasks);
-      for (const [day, task] of entries) {
-        if (!task?.taskId || !CLIP_ACTIVE_STATUSES.includes(task.status)) {
-          continue;
-        }
-        try {
-          const result = await invokeCommand("anchor_clip_task_status", {
-            taskId: task.taskId,
-          });
-          if (result?.status) {
-            setAnalyzingTasks((prev) => ({
-              ...prev,
-              [day]: {
-                ...task,
-                status: result.status,
-                stage: result.stage || "",
-                progress: Number(result.progress || 0),
-                errorMessage: result.errorMessage || "",
-              },
-            }));
-          }
-        } catch (error) {
-          setAnalyzingTasks((prev) => ({
-            ...prev,
-            [day]: {
-              ...task,
-              status: "FAILED",
-              errorMessage: error?.message || "状态查询失败",
-            },
-          }));
-        }
-      }
-    }, 2000);
-    return () => clearInterval(polling);
-  }, [analyzingTasks, recordView]);
 
   useEffect(() => {
     if (!submissionConfigView && !clipSubmitView) {
@@ -1334,98 +1089,26 @@ export default function AnchorSection() {
     if (!clipSubmitView || clipSubmitSubmitting) {
       return;
     }
-    setClipSubmitMessage("");
-    if (!submissionConfigForm.title.trim()) {
-      setClipSubmitMessage("请输入投稿标题");
-      return;
-    }
-    if (submissionConfigForm.title.length > 80) {
-      setClipSubmitMessage("投稿标题不能超过 80 个字符");
-      return;
-    }
-    if (!submissionConfigForm.partitionId) {
-      setClipSubmitMessage("请选择B站分区");
-      return;
-    }
-    if (!submissionConfigForm.videoType) {
-      setClipSubmitMessage("请选择视频类型");
-      return;
-    }
-    if (submissionConfigForm.description && submissionConfigForm.description.length > 2000) {
-      setClipSubmitMessage("视频描述不能超过 2000 个字符");
-      return;
-    }
-    const normalizedTags = [...submissionConfigTags]
-      .map((tag) => tag.trim())
-      .filter((tag) => tag);
-    if (!normalizedTags.length) {
-      setClipSubmitMessage("请填写至少一个投稿标签");
-      return;
-    }
-    const uniqueTags = [...new Set(normalizedTags)];
-    const clipPath = clipSubmitView.record?.filePath;
-    if (!clipPath) {
-      setClipSubmitMessage("切片文件路径为空，无法投稿");
+    const tags = [...new Set(submissionConfigTags.map((tag) => tag.trim()).filter(Boolean))];
+    const formError = clipFormError(submissionConfigForm, tags);
+    setClipSubmitMessage(formError);
+    if (formError) {
       return;
     }
     setClipSubmitSubmitting(true);
     try {
-      try {
-        const auth = await invokeCommand("auth_status");
-        if (!auth?.loggedIn) {
-          setClipSubmitMessage("请先登录B站账号");
-          return;
-        }
-      } catch (error) {
-        setClipSubmitMessage(error?.message || "登录状态校验失败");
+      const auth = await invokeCommand("auth_status");
+      if (!auth?.loggedIn) {
+        setClipSubmitMessage("请先登录B站账号");
         return;
       }
-      const result = await invokeCommand("submission_create", {
-        request: {
-          task: {
-            title: submissionConfigForm.title.trim(),
-            description: submissionConfigForm.description?.trim() || "",
-            partitionId: Number(submissionConfigForm.partitionId),
-            collectionId: submissionConfigForm.collectionId
-              ? Number(submissionConfigForm.collectionId)
-              : null,
-            tags: uniqueTags.join(","),
-            topicId: submissionConfigForm.activityTopicId
-              ? Number(submissionConfigForm.activityTopicId)
-              : null,
-            missionId: submissionConfigForm.activityMissionId
-              ? Number(submissionConfigForm.activityMissionId)
-              : null,
-            activityTitle: submissionConfigForm.activityTitle || null,
-            videoType: submissionConfigForm.videoType,
-            segmentPrefix: null,
-            priority: false,
-            baiduSyncEnabled: false,
-            baiduSyncPath: null,
-            baiduSyncFilename: null,
-            sourceType: "CLIP",
-          },
-          sourceVideos: [
-            {
-              sourceFilePath: clipPath,
-              sortOrder: 1,
-            },
-          ],
-          workflowConfig: {
-            enableSegmentation: false,
-            segmentationConfig: {
-              enabled: false,
-              segmentDurationSeconds: 133,
-              preserveOriginal: true,
-            },
-          },
-        },
-      });
-      const taskId = result?.taskId || result?.task_id;
-      if (taskId) {
-        await invokeCommand("submission_execute", { taskId });
+      await createClipSubmission(clipSubmitView.record, submissionConfigForm, tags);
+      // 任务创建成功后把切片标记为已投稿，避免重复投稿
+      const clipId = clipSubmitView.record?.id;
+      if (clipId != null) {
+        await invokeCommand("anchor_clip_mark", { clipId, mark: "SUBMITTED" }).catch(() => {});
       }
-      setClipSubmitMessage("已创建并提交投稿任务");
+      setClipSubmitMessage("已创建投稿任务，字幕烧录和上传在后台进行");
     } catch (error) {
       setClipSubmitMessage(error?.message || String(error) || "提交投稿失败");
     } finally {
@@ -1433,20 +1116,25 @@ export default function AnchorSection() {
     }
   };
 
-  const clipStatusLabel = (record) => {
-    if (!record) {
-      return "成功";
-    }
-    const status = String(record.status || "").toUpperCase();
-    if (status === "RUNNING") {
-      return "剪辑中";
-    }
-    if (status === "FAILED") {
-      return "失败";
-    }
-    return "成功";
+  // 评阅页批量投稿：加载投稿设置和分区、合集列表后进入批量投稿页
+  const openBatchSubmit = async (records) => {
+    await Promise.all([loadConfigPartitions(), loadConfigCollections()]);
+    const config = (await invokeCommand("anchor_submission_config_get", { roomId: recordView.uid })) || {};
+    setBatchSubmitView({ records, config });
   };
 
+  if (batchSubmitView) {
+    return (
+      <BatchSubmitView
+        anchor={recordView}
+        records={batchSubmitView.records}
+        config={batchSubmitView.config}
+        partitions={configPartitions}
+        collections={configCollections}
+        onBack={() => setBatchSubmitView(null)}
+      />
+    );
+  }
 
   if (clipSubmitView) {
     const hasPartitionOption = configPartitions.some(
@@ -1819,635 +1507,30 @@ export default function AnchorSection() {
   }
 
   if (recordView) {
-    const formatSize = (bytes) => {
-      if (!bytes) return "-";
-      if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
-      if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-      return (bytes / 1024).toFixed(0) + " KB";
-    };
-    const toLocalDateStr = (isoStr) => {
-      if (!isoStr) return "未知日期";
-      try {
-        return new Date(isoStr).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
-      } catch {
-        return isoStr.slice(0, 10);
-      }
-    };
-    const toLocalTimeStr = (isoStr) => {
-      if (!isoStr) return "-";
-      try {
-        return new Date(isoStr).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-      } catch {
-        return isoStr.slice(11, 19);
-      }
-    };
-    const getDirPath = (filePath) => {
-      if (!filePath) return "";
-      const sep = filePath.includes("/") ? "/" : "\\";
-      const parts = filePath.split(sep);
-      parts.pop();
-      return parts.join(sep);
-    };
-    // 按场次分组：相邻分段间隔不超过 30 分钟视为同一场（跨午夜不拆开），与自动切片的场次规则一致
-    const SESSION_GAP_MS = 30 * 60 * 1000;
-    const sessions = [];
-    [...recordList]
-      .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))
-      .forEach((record) => {
-        const start = new Date(record.startTime).getTime();
-        const last = sessions[sessions.length - 1];
-        if (last && start - last.endMs <= SESSION_GAP_MS) {
-          last.records.push(record);
-          last.endMs = Math.max(last.endMs, new Date(record.endTime || record.startTime).getTime());
-        } else {
-          sessions.push({ records: [record], endMs: new Date(record.endTime || record.startTime).getTime() });
-        }
-      });
-    const dayCount = {};
-    sessions.forEach((s) => {
-      s.date = toLocalDateStr(s.records[0].startTime);
-      dayCount[s.date] = (dayCount[s.date] || 0) + 1;
-    });
-    // 同一天有多场时附上开播时间区分
-    const days = sessions.reverse().map((s) => ({
-      day: dayCount[s.date] > 1 ? `${s.date} ${toLocalTimeStr(s.records[0].startTime).slice(0, 5)}` : s.date,
-      records: s.records,
-    }));
+    if (reviewSession) {
+      return (
+        <ClipReviewView
+          anchor={recordView}
+          session={reviewSession}
+          onBack={() => setReviewSession(null)}
+          onSubmitClip={(clip) => handleOpenClipSubmit(clip)}
+          onBatchSubmit={openBatchSubmit}
+        />
+      );
+    }
     return (
-      <div className="space-y-6">
-        <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div>
-              <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">录播管理</p>
-              <h2 className="text-2xl font-semibold text-[var(--ink)]">{recordView.nickname || recordView.uid} 的录播记录</h2>
-            </div>
-            <button
-              className="rounded-full border border-black/10 bg-white px-4 py-2 text-sm font-semibold text-[var(--ink)] transition hover:border-black/20"
-              onClick={() => {
-                setRecordView(null);
-                setDetailView(null);
-                setClipView(null);
-                setClipListError("");
-              }}
-            >
-              返回
-            </button>
-          </div>
-        </div>
-        <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
-          {recordListLoading ? (
-            <div className="text-sm text-[var(--muted)]">加载中...</div>
-          ) : recordListError ? (
-            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{recordListError}</div>
-          ) : days.length === 0 ? (
-            <div className="text-sm text-[var(--muted)]">暂无录播记录</div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-black/5 text-left text-xs text-[var(--muted)]">
-                    <th className="pb-2 pr-6 font-medium">直播日期</th>
-                    <th className="pb-2 pr-6 font-medium">直播标题</th>
-                    <th className="pb-2 pr-6 font-medium">录播文件目录</th>
-                    <th className="pb-2 font-medium">操作</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-black/5">
-                  {days.map(({ day, records }) => {
-                    const dirPath = getDirPath(records[0]?.filePath);
-                    const dayTitle = records[records.length - 1]?.title || records[0]?.title || "";
-                    const analyzing = analyzingTasks[day];
-                    const isRunning = CLIP_ACTIVE_STATUSES.includes(analyzing?.status);
-                    const analyzeLabel = isRunning
-                      ? analyzing?.status === "QUEUED"
-                        ? "排队中..."
-                        : `${CLIP_STAGE_LABELS[analyzing?.stage] || "分析中"} ${Math.round(analyzing?.progress || 0)}%`
-                      : analyzing?.status === "FAILED"
-                        ? "分析失败"
-                        : "分析";
-                    return (
-                      <tr key={day} className="text-[var(--ink)]">
-                        <td className="py-3 pr-6 tabular-nums whitespace-nowrap">{day}</td>
-                        <td className="py-3 pr-6 text-[var(--muted)]">{dayTitle || "-"}</td>
-                        <td className="py-3 pr-6">
-                          {dirPath ? (
-                            <button
-                              className="text-left text-xs text-blue-600 hover:underline break-all"
-                              onClick={() => invokeCommand("anchor_open_record_dir", { filePath: records[0].filePath })}
-                              title="点击打开目录"
-                            >
-                              {dirPath}
-                            </button>
-                          ) : "-"}
-                        </td>
-                        <td className="py-3">
-                          <div className="flex flex-wrap gap-2">
-                            <button
-                              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20"
-                              onClick={() => setDetailView({ day, records })}
-                            >
-                              查看
-                            </button>
-                            <button
-                              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:cursor-not-allowed disabled:opacity-60"
-                              onClick={() => handleAnalyzeClips(day, records)}
-                              disabled={isRunning}
-                            >
-                              {analyzeLabel}
-                            </button>
-                            <button
-                              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20"
-                              onClick={() => handleOpenClipList(day, records)}
-                            >
-                              切片记录
-                            </button>
-                          </div>
-                          {analyzing?.errorMessage ? (
-                            <div className="mt-1 text-[10px] text-amber-600">{analyzing.errorMessage}</div>
-                          ) : null}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-
-        {detailView ? (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setDetailView(null)}>
-            <div className="w-full max-w-5xl rounded-2xl bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
-              <div className="flex items-center justify-between border-b border-black/5 px-6 py-4">
-                <div>
-                  <div className="text-xs uppercase tracking-widest text-[var(--muted)]">录播文件详情</div>
-                  <div className="mt-0.5 text-base font-semibold text-[var(--ink)]">{detailView.day}　{detailView.records[detailView.records.length - 1]?.title || ""}</div>
-                </div>
-                <button
-                  className="rounded-full border border-black/10 bg-white px-3 py-1 text-sm font-semibold text-[var(--ink)] hover:border-black/20"
-                  onClick={() => setDetailView(null)}
-                >
-                  关闭
-                </button>
-              </div>
-              <div className="max-h-[60vh] overflow-y-auto px-6 py-4">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b border-black/5 text-left text-[var(--muted)]">
-                      <th className="pb-2 pr-4 font-medium">文件名</th>
-                      <th className="pb-2 pr-4 font-medium">开始时间</th>
-                      <th className="pb-2 pr-4 font-medium">结束时间</th>
-                      <th className="pb-2 pr-4 font-medium">大小</th>
-                      <th className="pb-2 font-medium">状态</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-black/5">
-                    {detailView.records.map((record) => (
-                      <tr key={record.id}>
-                        <td className="py-2 pr-4 max-w-[200px] truncate" title={record.filePath}>
-                          <button
-                            className="text-blue-600 hover:underline text-left truncate max-w-full"
-                            onClick={() => invokeCommand("anchor_open_record_file", { filePath: record.filePath }).catch((err) => alert(err?.message || "打开失败"))}
-                          >
-                            {record.filePath.split(/[\/\\]/).pop()}
-                          </button>
-                        </td>
-                        <td className="py-2 pr-4 tabular-nums text-[var(--muted)] whitespace-nowrap">{toLocalTimeStr(record.startTime)}</td>
-                        <td className="py-2 pr-4 tabular-nums text-[var(--muted)] whitespace-nowrap">{record.endTime ? toLocalTimeStr(record.endTime) : "-"}</td>
-                        <td className="py-2 pr-4 tabular-nums text-[var(--muted)] whitespace-nowrap">{formatSize(record.fileSize)}</td>
-                        <td className="py-2">
-                          {record.status === "RECORDING" ? (
-                            <span className="rounded-full bg-green-100 px-2 py-0.5 text-green-700">录制中</span>
-                          ) : record.status === "ERROR" ? (
-                            <span className="rounded-full bg-red-100 px-2 py-0.5 text-red-700" title={record.errorMessage || ""}>出错</span>
-                          ) : (
-                            <span className="rounded-full bg-black/5 px-2 py-0.5 text-[var(--muted)]">已完成</span>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        ) : null}
-        {clipView ? (
-          <div className="fixed inset-0 z-[55] flex items-center justify-center bg-black/40 p-4" onClick={() => setClipView(null)}>
-            <div className="w-full max-w-5xl rounded-2xl bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
-              <div className="flex items-center justify-between border-b border-black/5 px-6 py-4">
-                <div>
-                  <div className="text-xs uppercase tracking-widest text-[var(--muted)]">切片记录</div>
-                  <div className="mt-0.5 text-base font-semibold text-[var(--ink)]">
-                    {clipView.dateLabel} 切片记录
-                  </div>
-                  {clipView.task?.errorMessage ? (
-                    <div className="mt-1 text-xs text-amber-700">{clipView.task.errorMessage}</div>
-                  ) : null}
-                </div>
-                <label className="ml-auto mr-3 flex items-center gap-2 text-xs text-[var(--muted)]">
-                  内容类型
-                  <select
-                    className="rounded-lg border border-black/10 bg-white px-2 py-1 text-xs text-[var(--ink)]"
-                    value={clipProfile}
-                    title="影响信号权重与 AI 判断方式，下次分析生效"
-                    onChange={async (event) => {
-                      const value = event.target.value;
-                      setClipProfile(value);
-                      try {
-                        await invokeCommand("anchor_clip_profile_set", { roomId: recordView.uid, profile: value });
-                      } catch (error) {
-                        setClipListError(error?.message || "保存内容类型失败");
-                      }
-                    }}
-                  >
-                    {CLIP_PROFILES.map((item) => (
-                      <option key={item.value} value={item.value}>
-                        {item.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <div
-                  className="mr-3 flex items-center gap-2 text-xs text-[var(--muted)]"
-                  title="原片也是中文时，靠主播声纹区分主播解说与原片对白；选一段只有主播说话的位置，取其后 120 秒"
-                >
-                  主播声纹
-                  {voiceprintForm ? (
-                    <>
-                      <select
-                        className="rounded-lg border border-black/10 bg-white px-2 py-1 text-xs text-[var(--ink)]"
-                        value={voiceprintForm.recordId}
-                        onChange={(event) => setVoiceprintForm((prev) => ({ ...prev, recordId: Number(event.target.value) }))}
-                      >
-                        {recordList
-                          .filter((record) => clipView.recordIds.includes(record.id))
-                          .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))
-                          .map((record, index) => (
-                            <option key={record.id} value={record.id}>
-                              {`分段 ${index + 1}（${new Date(record.startTime).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })} 开始）`}
-                            </option>
-                          ))}
-                      </select>
-                      <input
-                        className="w-20 rounded-lg border border-black/10 bg-white px-2 py-1 text-xs text-[var(--ink)]"
-                        placeholder="00:04:03"
-                        value={voiceprintForm.time}
-                        onChange={(event) => setVoiceprintForm((prev) => ({ ...prev, time: event.target.value }))}
-                      />
-                      <button
-                        className="rounded-full border border-black/10 bg-white px-2 py-0.5 text-xs font-semibold text-[var(--ink)] hover:border-black/20 disabled:opacity-50"
-                        disabled={voiceprintBusy}
-                        onClick={async () => {
-                          const startSecs = voiceprintForm.time
-                            .split(":")
-                            .map(Number)
-                            .reduce((acc, part) => acc * 60 + (Number.isFinite(part) ? part : 0), 0);
-                          setVoiceprintBusy(true);
-                          try {
-                            const source = await invokeCommand("anchor_voiceprint_enroll", {
-                              roomId: recordView.uid,
-                              recordId: voiceprintForm.recordId,
-                              startSecs,
-                            });
-                            setVoiceprint(source);
-                            setVoiceprintForm(null);
-                            setClipListMessage("主播声纹已登记，下次分析生效");
-                          } catch (error) {
-                            setClipListError(error?.message || "登记主播声纹失败");
-                          } finally {
-                            setVoiceprintBusy(false);
-                          }
-                        }}
-                      >
-                        {voiceprintBusy ? "登记中..." : "确定"}
-                      </button>
-                      <button className="text-xs hover:underline" onClick={() => setVoiceprintForm(null)}>
-                        取消
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      {voiceprint ? (
-                        <span className="text-[var(--ink)]" title={voiceprint}>
-                          已登记
-                        </span>
-                      ) : (
-                        <span className="text-amber-700">未登记</span>
-                      )}
-                      <button
-                        className="text-xs text-blue-600 hover:underline"
-                        onClick={() => setVoiceprintForm({ recordId: clipView.recordIds[0], time: "" })}
-                      >
-                        {voiceprint ? "重新登记" : "登记"}
-                      </button>
-                    </>
-                  )}
-                </div>
-            <button
-              className="rounded-full border border-black/10 bg-white px-3 py-1 text-sm font-semibold text-[var(--ink)] hover:border-black/20"
-              onClick={() => {
-                setClipView(null);
-                setClipEdit(null);
-              }}
-            >
-              关闭
-            </button>
-              </div>
-              <div className="max-h-[60vh] overflow-y-auto px-6 py-4">
-                {clipListLoading ? (
-                  <div className="text-sm text-[var(--muted)]">加载中...</div>
-                ) : clipListError ? (
-                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-                    {clipListError}
-                  </div>
-                ) : clipListMessage ? (
-                  <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
-                    {clipListMessage}
-                  </div>
-                ) : clipView.records.length === 0 ? (
-                  <div className="text-sm text-[var(--muted)]">暂无切片记录</div>
-                ) : (
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="border-b border-black/5 text-left text-[var(--muted)]">
-                        <th className="pb-2 pr-4 font-medium">序号</th>
-                        <th className="pb-2 pr-4 font-medium">标题</th>
-                        <th className="pb-2 pr-4 font-medium">类型</th>
-                        <th
-                          className="cursor-pointer pb-2 pr-4 font-medium hover:text-[var(--ink)]"
-                          title="点击切换按分数 / 按时间排序"
-                          onClick={() => setClipSortByScore((prev) => !prev)}
-                        >
-                          分数{clipSortByScore ? " ↓" : ""}
-                        </th>
-                        <th className="pb-2 pr-4 font-medium">评分</th>
-                        <th className="pb-2 pr-4 font-medium">起始时间</th>
-                        <th className="pb-2 pr-4 font-medium">结束时间</th>
-                        <th className="pb-2 pr-4 font-medium">时长</th>
-                        <th className="pb-2 pr-4 font-medium">状态</th>
-                        <th className="pb-2 pr-4 font-medium">标记</th>
-                        <th className="pb-2 font-medium">操作</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-black/5">
-                      {(clipSortByScore ? [...clipView.records].sort((a, b) => (b.score || 0) - (a.score || 0)) : clipView.records).map((record, index) => {
-                        const expanded = Boolean(clipExpanded[record.id]);
-                        const title = record.titles?.[0] || record.filePath?.split(/[\/\\]/).pop() || "-";
-                        const mark = String(record.mark || "PENDING").toUpperCase();
-                        const setMark = async (value) => {
-                          const next = mark === value ? "PENDING" : value;
-                          try {
-                            await invokeCommand("anchor_clip_mark", { clipId: record.id, mark: next });
-                            setClipView((prev) =>
-                              prev
-                                ? { ...prev, records: prev.records.map((item) => (item.id === record.id ? { ...item, mark: next } : item)) }
-                                : prev
-                            );
-                          } catch (error) {
-                            setClipListError(error?.message || "标记失败");
-                          }
-                        };
-                        return (
-                        <Fragment key={record.id || record.filePath || index}>
-                        <tr>
-                          <td className="py-2 pr-4 tabular-nums text-[var(--muted)]">{index + 1}</td>
-                          <td className="py-2 pr-4 max-w-[280px]">
-                            <button
-                              className="truncate max-w-full text-left font-semibold text-[var(--ink)] hover:underline"
-                              title={title}
-                              onClick={() => setClipExpanded((prev) => ({ ...prev, [record.id]: !prev[record.id] }))}
-                            >
-                              {expanded ? "▾ " : "▸ "}
-                              {title}
-                            </button>
-                            {record.aiStatus ? (
-                              <div className="mt-0.5 text-[10px] text-[var(--muted)]">{CLIP_AI_LABELS[record.aiStatus] || record.aiStatus}</div>
-                            ) : null}
-                          </td>
-                          <td className="py-2 pr-4 text-[var(--muted)]">{record.category || "-"}</td>
-                          <td className="py-2 pr-4 tabular-nums text-[var(--muted)]">{Number(record.score || 0).toFixed(2)}</td>
-                          <td className="py-2 pr-4 whitespace-nowrap text-[10px] leading-4 text-[var(--muted)]">
-                            {record.signals?.scores ? (
-                              <>
-                                <div>有趣 {record.signals.scores.funny} · 完整 {record.signals.scores.complete} · 主播 {record.signals.scores.streamer}</div>
-                                <div>
-                                  独立 {record.signals.scores.standalone}
-                                  {record.signals.scores.danmaku != null ? ` · 弹幕 ${record.signals.scores.danmaku}` : ""}
-                                </div>
-                              </>
-                            ) : (
-                              "-"
-                            )}
-                          </td>
-                          <td
-                            className="py-2 pr-4 tabular-nums text-[var(--muted)]"
-                            onDoubleClick={() => startClipEdit(record, "start")}
-                          >
-                            {clipEdit && clipEdit.id === record.id && clipEdit.field === "start" ? (
-                              <input
-                                className="w-20 rounded border border-black/10 px-1 py-0.5 text-xs text-[var(--ink)]"
-                                value={clipEdit.value}
-                                autoFocus
-                                onChange={(event) =>
-                                  setClipEdit((prev) => (prev ? { ...prev, value: event.target.value } : prev))
-                                }
-                                onBlur={() => submitClipEdit(record)}
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter") {
-                                    submitClipEdit(record);
-                                  } else if (event.key === "Escape") {
-                                    setClipEdit(null);
-                                  }
-                                }}
-                              />
-                            ) : (
-                              formatSeconds(record.startOffset)
-                            )}
-                          </td>
-                          <td
-                            className="py-2 pr-4 tabular-nums text-[var(--muted)]"
-                            onDoubleClick={() => startClipEdit(record, "end")}
-                          >
-                            {clipEdit && clipEdit.id === record.id && clipEdit.field === "end" ? (
-                              <input
-                                className="w-20 rounded border border-black/10 px-1 py-0.5 text-xs text-[var(--ink)]"
-                                value={clipEdit.value}
-                                autoFocus
-                                onChange={(event) =>
-                                  setClipEdit((prev) => (prev ? { ...prev, value: event.target.value } : prev))
-                                }
-                                onBlur={() => submitClipEdit(record)}
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter") {
-                                    submitClipEdit(record);
-                                  } else if (event.key === "Escape") {
-                                    setClipEdit(null);
-                                  }
-                                }}
-                              />
-                            ) : (
-                              formatSeconds(record.endOffset)
-                            )}
-                          </td>
-                          <td className="py-2 pr-4 tabular-nums text-[var(--muted)]">
-                            {formatSeconds(record.duration)}
-                          </td>
-                          <td className="py-2 pr-4 text-[var(--muted)]">{clipStatusLabel(record)}</td>
-                          <td className="py-2 pr-4">
-                            <div className="flex gap-1">
-                              <button
-                                className={`rounded-full border px-2 py-0.5 text-xs font-semibold ${mark === "KEEP" ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-black/10 bg-white text-[var(--muted)]"}`}
-                                onClick={() => setMark("KEEP")}
-                              >
-                                保留
-                              </button>
-                              <button
-                                className={`rounded-full border px-2 py-0.5 text-xs font-semibold ${mark === "DISCARD" ? "border-red-400 bg-red-50 text-red-600" : "border-black/10 bg-white text-[var(--muted)]"}`}
-                                onClick={() => setMark("DISCARD")}
-                              >
-                                丢弃
-                              </button>
-                            </div>
-                          </td>
-                          <td className="py-2">
-                            <div className="flex flex-wrap gap-2">
-                              <button
-                                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
-                                onClick={() =>
-                                  invokeCommand("anchor_open_record_file", {
-                                    filePath: record.filePath,
-                                  }).catch((err) => alert(err?.message || "打开失败"))
-                                }
-                              >
-                                打开文件
-                              </button>
-                              <button
-                                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
-                                onClick={() => handleOpenClipSubmit(record)}
-                              >
-                                投稿
-                              </button>
-                              <button
-                                className="rounded-full border border-red-200 bg-white px-3 py-1 text-xs font-semibold text-red-600 hover:border-red-300"
-                                onClick={async () => {
-                                  if (!record?.id) return;
-                                  const confirmed = await dialogConfirm("确认删除该切片文件和记录？", {
-                                    title: "删除切片",
-                                  });
-                                  if (!confirmed) return;
-                                  setClipListMessage("");
-                                  setClipListError("");
-                                  try {
-                                    await invokeCommand("anchor_clip_delete", { clipId: record.id });
-                                    await refreshClipList("delete");
-                                    setClipListMessage("切片已删除");
-                                  } catch (error) {
-                                    setClipListError(error?.message || "删除失败");
-                                  }
-                                }}
-                              >
-                                删除
-                              </button>
-                              <button
-                                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
-                                onClick={async () => {
-                                  if (!record?.id) return;
-                                  const isRunning = String(record.status || "").toUpperCase() === "RUNNING";
-                                  if (isRunning) return;
-                                  setReclipLoading((prev) => ({ ...prev, [record.id]: true }));
-                                  setClipView((prev) => {
-                                    if (!prev) return prev;
-                                    const nextRecords = prev.records.map((item) =>
-                                      item.id === record.id ? { ...item, status: "RUNNING" } : item
-                                    );
-                                    return { ...prev, records: nextRecords };
-                                  });
-                                  setClipListMessage("");
-                                  setClipListError("");
-                                  try {
-                                    await invokeCommand("anchor_clip_reclip", { clipId: record.id });
-                                    setClipListMessage("已开始重新剪辑");
-                                  } catch (error) {
-                                    const message =
-                                      error?.message ||
-                                      (typeof error === "string" ? error : error?.toString?.()) ||
-                                      "重新剪辑失败";
-                                    setClipListError(message);
-                                  } finally {
-                                    setReclipLoading((prev) => ({ ...prev, [record.id]: false }));
-                                    await refreshClipList("reclip");
-                                  }
-                                }}
-                                disabled={
-                                  reclipLoading[record.id] ||
-                                  String(record.status || "").toUpperCase() === "RUNNING"
-                                }
-                              >
-                                {reclipLoading[record.id] || String(record.status || "").toUpperCase() === "RUNNING"
-                                  ? "剪辑中..."
-                                  : "重新剪辑"}
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                        {expanded ? (
-                          <tr className="bg-black/[0.02]">
-                            <td />
-                            <td colSpan={10} className="py-3 pr-4 text-xs leading-relaxed text-[var(--content-color)]">
-                              {record.signals?.scores ? (
-                                <div className="mb-1">
-                                  <span className="font-semibold text-[var(--ink)]">评分：</span>
-                                  综合 {record.signals.scores.total} · 有趣 {record.signals.scores.funny} · 完整 {record.signals.scores.complete} · 主播 {record.signals.scores.streamer} · 独立可看 {record.signals.scores.standalone}
-                                  {record.signals.scores.danmaku != null ? ` · 弹幕 ${record.signals.scores.danmaku}` : ""}
-                                </div>
-                              ) : null}
-                              {record.reason ? (
-                                <div><span className="font-semibold text-[var(--ink)]">理由：</span>{record.reason}</div>
-                              ) : null}
-                              {record.evidence?.length ? (
-                                <div className="mt-1">
-                                  <span className="font-semibold text-[var(--ink)]">原文证据：</span>
-                                  {record.evidence.map((item, i) => (
-                                    <div key={i} className="ml-4 text-[var(--muted)]">「{item}」</div>
-                                  ))}
-                                </div>
-                              ) : null}
-                              {record.signals?.summary ? (
-                                <div className="mt-1"><span className="font-semibold text-[var(--ink)]">信号：</span>{record.signals.summary}</div>
-                              ) : null}
-                              {record.description ? (
-                                <div className="mt-1"><span className="font-semibold text-[var(--ink)]">简介：</span>{record.description}</div>
-                              ) : null}
-                              {record.tags ? (
-                                <div className="mt-1"><span className="font-semibold text-[var(--ink)]">标签：</span>{record.tags}</div>
-                              ) : null}
-                              {record.titles?.length > 1 ? (
-                                <div className="mt-1">
-                                  <span className="font-semibold text-[var(--ink)]">其他标题：</span>
-                                  {record.titles.slice(1).join(" ／ ")}
-                                </div>
-                              ) : null}
-                              {record.coverText ? (
-                                <div className="mt-1"><span className="font-semibold text-[var(--ink)]">封面文案：</span>{record.coverText}</div>
-                              ) : null}
-                              <div className="mt-1 break-all text-[var(--muted)]">
-                                源视频：{record.sourceFilePath || "-"}　切片文件：{record.filePath || "-"}
-                              </div>
-                            </td>
-                          </tr>
-                        ) : null}
-                        </Fragment>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            </div>
-          </div>
-        ) : null}
-      </div>
+      <RecordManageView
+        anchor={recordView}
+        records={recordList}
+        loading={recordListLoading}
+        error={recordListError}
+        onBack={() => {
+          setRecordView(null);
+          setReviewSession(null);
+        }}
+        onOpenReview={(session) => setReviewSession(session)}
+        onReload={() => invokeCommand("anchor_record_list", { roomId: recordView.uid }).then((data) => setRecordList(data || [])).catch(() => {})}
+      />
     );
   }
 

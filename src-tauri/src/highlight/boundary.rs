@@ -1,6 +1,8 @@
-//! 边界层：起止吸附到语音分段边界，强制时长范围，去重，主播解说占比计算。
+//! 边界层：起止吸附到语音分段边界，强制时长范围，去重，主播解说占比计算，念 SC 标注。
 
-use super::asr::AsrSegment;
+use std::collections::{HashMap, HashSet};
+
+use super::asr::{AsrSegment, ScRead};
 use super::signals::Span;
 
 const SNAP_LOOKBACK_SECS: f64 = 15.0;
@@ -106,7 +108,7 @@ pub fn snap(proposed: Range, span: Span, segments: &[AsrSegment]) -> Range {
     Range { start, end: (end + TAIL_SECS).min(span.end) }
 }
 
-/// 主播中文说话时长占区间的比例
+/// 主播中文说话时长占区间的比例；念 SC 是在读观众的话，不算主播自己的内容（夹着自己的话的算一半）
 pub fn streamer_ratio(range: Range, segments: &[AsrSegment]) -> f64 {
     if range.len() <= 0.0 {
         return 0.0;
@@ -115,9 +117,123 @@ pub fn streamer_ratio(range: Range, segments: &[AsrSegment]) -> f64 {
     let speech: f64 = segments
         .iter()
         .filter(|s| s.end > s.start)
-        .map(|s| s.streamer_seconds() * (s.end.min(range.end) - s.start.max(range.start)).max(0.0) / (s.end - s.start))
+        .map(|s| {
+            let own = match &s.sc {
+                Some(sc) if sc.pure => 0.0,
+                Some(_) => 0.5,
+                None => 1.0,
+            };
+            own * s.streamer_seconds() * (s.end.min(range.end) - s.start.max(range.start)).max(0.0) / (s.end - s.start)
+        })
         .sum();
     speech / range.len()
+}
+
+/// SC 被念出来的时间可能比发送晚很久，在发送后这段时间内找
+const SC_READ_WINDOW_SECS: f64 = 3600.0;
+/// SC 原文至少有这么多被几句连续转写覆盖，才算找到了念它的位置
+const SC_MATCH_MIN: f64 = 0.5;
+/// 一句里 SC 原文的成分达到这个比例算在念 SC，达到 PURE 算整句都在念
+const SC_LINE_MIN: f64 = 0.25;
+const SC_LINE_PURE: f64 = 0.5;
+
+fn norm_chars(text: &str) -> Vec<char> {
+    text.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+fn bigrams(chars: &[char]) -> HashSet<(char, char)> {
+    chars.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// “谢谢某某的 SC”这类念 SC 的开场白（识别结果里 SC 常被拆成字母或认成相近的写法）
+fn is_sc_thanks(chars: &[char]) -> bool {
+    const CODES: [&str; 10] = ["sc", "az", "sz", "nc", "mc", "ez", "as", "sd", "ac", "easy"];
+    let text: String = chars.iter().collect();
+    let Some(i) = text.find("谢谢") else { return false };
+    let rest: Vec<char> = text[i + "谢谢".len()..].chars().take(26).collect();
+    rest.iter().enumerate().any(|(k, c)| {
+        *c == '的' && k > 0 && {
+            let after: String = rest[k + 1..].iter().collect();
+            CODES.iter().any(|code| after.starts_with(code))
+        }
+    })
+}
+
+/// 按弹幕里的 SC 原文和发送时间，标出转写中主播在念 SC 的句子。`scs` 为（发送时间, 原文）。
+pub fn mark_sc_readings(segments: &mut [AsrSegment], scs: &[(f64, String)]) {
+    let texts: Vec<Vec<char>> = segments.iter().map(|s| norm_chars(s.best_text())).collect();
+    let line_grams: Vec<HashSet<(char, char)>> = texts.iter().map(|t| bigrams(t)).collect();
+    // 句子下标 -> (SC 编号, 该句中 SC 成分比例)
+    let mut marks: HashMap<usize, (usize, f64)> = HashMap::new();
+    for (id, (sent, message)) in scs.iter().enumerate() {
+        let sc = bigrams(&norm_chars(message));
+        if sc.len() < 3 {
+            continue;
+        }
+        // 找连续 1~4 句覆盖 SC 原文最多的位置
+        let from = segments.partition_point(|s| s.start < sent - 10.0);
+        let to = segments.partition_point(|s| s.start <= sent + SC_READ_WINDOW_SECS);
+        let mut best = (0.0, 0, 0);
+        for i in from..to {
+            let mut window: Vec<char> = Vec::new();
+            for j in i..(i + 4).min(segments.len()) {
+                window.extend(&texts[j]);
+                let covered = sc.intersection(&bigrams(&window)).count() as f64 / sc.len() as f64;
+                if covered > best.0 + 0.05 {
+                    best = (covered, i, j);
+                }
+            }
+        }
+        if best.0 < SC_MATCH_MIN {
+            continue;
+        }
+        let mut first = None;
+        for k in best.1.saturating_sub(1)..(best.2 + 2).min(segments.len()) {
+            let own = &line_grams[k];
+            let share = own.intersection(&sc).count() as f64 / own.len().max(1) as f64;
+            if share >= SC_LINE_MIN && share > marks.get(&k).map(|m| m.1).unwrap_or(0.0) {
+                marks.insert(k, (id, share));
+                first.get_or_insert(k);
+            }
+        }
+        // 紧挨在前面的“谢谢某某的 SC”也是在念这条
+        if let Some(k) = first.filter(|k| *k > 0).map(|k| k - 1) {
+            if !marks.contains_key(&k) && is_sc_thanks(&texts[k]) {
+                marks.insert(k, (id, 1.0));
+            }
+        }
+    }
+    for (k, seg) in segments.iter_mut().enumerate() {
+        seg.sc = match marks.get(&k) {
+            Some(&(id, share)) => Some(ScRead { id, pure: share >= SC_LINE_PURE, text: scs[id].1.clone() }),
+            // 没对上原文的 SC，开场白也标出来，方便判断下一条 SC 从哪开始
+            None if is_sc_thanks(&texts[k]) => Some(ScRead { id: usize::MAX - k, pure: true, text: String::new() }),
+            None => None,
+        };
+    }
+}
+
+/// 按念 SC 的标注修正切片边界：起点落在一条 SC 中间时退到这条 SC 开头；
+/// 结尾是在念下一条 SC 的句子时去掉（切片应结束在主播的回应上）
+pub fn fit_sc(range: Range, segments: &[AsrSegment]) -> Range {
+    let inside: Vec<usize> = (0..segments.len()).filter(|&i| segments[i].start >= range.start - 0.01 && segments[i].start < range.end).collect();
+    let (Some(&first), Some(&last)) = (inside.first(), inside.last()) else { return range };
+    let mut start_idx = first;
+    if let Some(id) = segments[first].sc.as_ref().map(|s| s.id) {
+        while start_idx > 0 && segments[start_idx - 1].sc.as_ref().map(|s| s.id) == Some(id) {
+            start_idx -= 1;
+        }
+    }
+    let first_id = segments[start_idx].sc.as_ref().map(|s| s.id);
+    let mut end_idx = last;
+    while end_idx > first {
+        match &segments[end_idx].sc {
+            Some(sc) if sc.pure && Some(sc.id) != first_id => end_idx -= 1,
+            _ => break,
+        }
+    }
+    let end = if end_idx == last { range.end } else { (segments[end_idx].end + TAIL_SECS).min(range.end) };
+    Range { start: segments[start_idx].start.min(range.start), end }
 }
 
 /// 按分数从高到低保留，与已保留区间重叠超过较短者 30% 的丢弃。返回保留项的下标。
@@ -157,6 +273,25 @@ mod tests {
             streamer_secs: None,
             sc: None,
         }
+    }
+
+    #[test]
+    fn marks_sc_readings_and_fits_clip_to_them() {
+        let line = |start: f64, text: &str| AsrSegment { text: text.into(), ..seg(start, start + 4.0, "Speech") };
+        let mut segments = vec![
+            line(100.0, "谢谢价值四十的 s c"),
+            line(104.0, "李二杀兄弟杀侄子抢嫂子但是是顺位继承的"),
+            line(108.0, "这点朱四羡慕不来"),
+            line(112.0, "抢嫂子还有这啊哈哈太好笑了吧"),
+            line(116.0, "谢谢小王子的 a z 奶姐晚上好"),
+        ];
+        let scs = vec![(50.0, "李二杀兄弟，杀侄子，抢嫂子，但是是顺位继承的，这点朱四羡慕不来".to_string())];
+        mark_sc_readings(&mut segments, &scs);
+        let pure: Vec<bool> = segments.iter().map(|s| s.sc.as_ref().is_some_and(|sc| sc.pure)).collect();
+        assert_eq!(pure, [true, true, true, false, true]);
+        // 从 SC 中间开始、带进下一条 SC 开场白的切片：起点退到“谢谢”，结尾去掉下一条
+        let r = fit_sc(Range { start: 104.0, end: 122.0 }, &segments);
+        assert_eq!((r.start, r.end), (100.0, 118.0));
     }
 
     #[test]

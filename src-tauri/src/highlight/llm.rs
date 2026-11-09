@@ -22,8 +22,6 @@ pub struct TopicClip {
     #[serde(default)]
     pub titles: Vec<String>,
     #[serde(default)]
-    pub description: String,
-    #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default, alias = "cover_text")]
     pub cover_text: String,
@@ -169,7 +167,11 @@ async fn chat_json_inner(settings: &LlmSettings, mode: &str, system: &str, user:
             schema
         ));
     }
-    body["messages"] = json!([{"role": "system", "content": system}, {"role": "user", "content": user}]);
+    body["messages"] = if settings.merge_system {
+        json!([{"role": "user", "content": format!("{}\n\n{}", system, user)}])
+    } else {
+        json!([{"role": "system", "content": system}, {"role": "user", "content": user}])
+    };
     let mut last_err = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
@@ -291,8 +293,7 @@ fn topics_schema(titles: usize) -> Value {
                         "start": {"type": "number"},
                         "end": {"type": "number"},
                         "titles": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": titles},
-                        "description": {"type": "string"},
-                        "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                        "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
                         "coverText": {"type": "string"},
                         "reason": {"type": "string"},
                         "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
@@ -302,7 +303,7 @@ fn topics_schema(titles: usize) -> Value {
                             "required": ["funny", "complete", "streamer", "standalone"]
                         }
                     },
-                    "required": ["category", "start", "end", "titles", "description", "tags", "coverText", "reason", "evidence", "scores"]
+                    "required": ["category", "start", "end", "titles", "tags", "coverText", "reason", "evidence", "scores"]
                 }
             }
         },
@@ -323,27 +324,38 @@ const BASE_RULES: &str = "你是B站直播切片编辑。给你一段直播录�
 1. 只能依据给出的转写与弹幕，不得编造其中没有的情节、人物、台词或观众反应；转写有识别错误时按上下文理解，不要放大。
 2. 每条切片是一个完整的话题或事件：从主播开始聊这件事的那句开始（由观众提问、SC、弹幕引出的，从主播念这条提问开始），到主播把这件事聊完为止。话题一转就结束，不要带上后面无关的内容，也不要从前面无关的闲聊开始。
 3. start 取切片第一行的起始秒，end 取切片最后一行的结束秒，都必须是转写里出现的秒数。
-4. 相邻几段属于同一类话题、弹幕也在讨论同一件事时，合成一条；话题短、没有内容的单独一句不要切。
-5. 弹幕只用来帮你发现观众反应强烈的地方，最终按转写内容判断；寒暄、催下播、念礼物感谢、纯原片播放没有主播内容的段落不要切。
-6. 宁多勿漏：凡是能独立成片的话题都输出，平淡的给低分即可。
-7. 分项评分 1~10：funny 有趣或精彩程度；complete 话题完整度（开头或结尾被本段转写截断的打低分）；streamer 主播的表现（观点、反应、情绪）；standalone 不看前后文能否看懂。
-8. 标题不超过 30 个汉字，口语化、有点击欲但不夸大；coverText 不超过 12 个汉字，用于压在封面上；description 50~120 字；tags 3~8 个。
-9. evidence 逐字摘抄 1~3 句该切片内的转写原文（不要改写）；reason 用一两句话说明推荐理由：亮点是什么、起止为什么选在这里。";
+4. 一件事只出一条：同一个话题里有几个笑点、中间穿插了几句弹幕互动，也合成一条，不要拆成几条短片；话题短、没有内容的单独一句不要切。
+5. 弹幕只用来帮你发现观众反应强烈的地方，最终按转写内容判断；寒暄、催下播、念礼物感谢的段落不要切。
+6. 只切有看点的内容：主播的金句和梗、对观众或 SC 的回怼、鲜明的观点、强烈的情绪反应、完整的小故事；平淡的过渡和闲聊不要输出。
+7. 分项评分 1~10：funny 有趣或精彩程度，只按主播自己的回应打（主播的金句、梗、回怼、名场面给高分）；complete 话题完整度（开头或结尾被本段转写截断的打低分）；streamer 主播的表现（观点、反应、情绪）；standalone 不看前后文能否看懂。
+8. 标题不超过 30 个汉字，口语化、有点击欲但不夸大；不要加【】前缀（投稿时统一加）。标题里称呼主播用主播名字或转写、弹幕里观众对主播的常用称呼，不要写“主播”。标题要交代清楚这件事：谁、因为什么、主播什么态度或结论，可以引用一句关键原话（放在引号里），不要只摘一句没有前因的原话。参考风格：LPL首轮全败给奶姐笑惨了／奶姐毒奶中科大考研：你包考不上的别考了／“给异性女主播打钱算出轨吗”，给明前奶绿打钱不算／情侣吵架重点不是“说清楚”，而是要“说”，要有一方低头／对喜欢的人一直看走眼？奶绿：说明你就喜欢这样的。可以点名话题里的具体人物、游戏、作品。coverText 不超过 12 个汉字，用于压在封面上。
+   tags 1~3 个，只写具体的人名、游戏、赛事、作品或梗名（如 LPL、KDA、李世民），不要写“搞笑”“互动”“吐槽”这类泛词。
+9. evidence 逐字摘抄 1~3 句该切片内的转写原文（不要改写）；reason 用一两句话说明推荐理由：亮点是什么、起止为什么选在这里。
+10. 切片必须以主播的发言为主：「原片」行是正在播放的作品原声，不算主播内容；「原片+主播插话」行里有主播的话。原片情节再精彩，主播没怎么说话也不要切，原片只能作为主播吐槽、观点、反应的铺垫。streamer 分按主播实际说了什么、说了多少来打，主播行很少时 streamer 不超过 3。
+11. 观众点歌、让主播看视频的段落：从主播念这条点歌或请求开始，播放的歌或视频作为铺垫一起切进去（播放部分超过 60 秒的只保留与主播反应相关的部分），到主播评价完为止。
+12. 「念SC」行是主播在朗读观众的 SC，内容是观众写的，不是主播的表现；「念SC+主播」行里夹着主播自己的话；行尾的（SC原文：…）是这条 SC 的原文，识别有误时以原文为准。
+    - SC 写得再好笑，主播只是念完、附和或说“不知道”的，funny 和 streamer 都不超过 4，一般不要切；主播的回应只有一两句的也不要单独切。
+    - 由 SC 引出的切片，start 取这条 SC 第一行「念SC」的起始秒（包括“谢谢某某的 SC”）；end 取主播回应这条 SC 的最后一句，不要包含下一条「念SC」。几条 SC 聊的是同一件事、主播连着回应的，可以合成一条。";
 
 pub struct ChunkInput<'a> {
     pub room_title: &'a str,
+    pub streamer: &'a str,
     pub transcript: &'a str,
     pub danmaku: &'a str,
     pub max_secs: i64,
 }
 
+/// 单条切片时长上限：长片完播率低，同类竞品切片播放好的多在 30~90 秒
+const MAX_TOPIC_SECS: i64 = 180;
+
 /// 把一段转写切成若干话题切片
 pub async fn segment_topics(settings: &LlmSettings, mode: &str, profile: Profile, titles: usize, input: &ChunkInput<'_>) -> Result<Vec<TopicClip>, String> {
     let system = format!(
-        "{}\n{}\n单条切片一般在 30 秒到 {} 秒之间。每条给出 {} 个不同角度的标题。没有值得切的内容时 clips 为空数组。",
+        "{}\n{}\n主播名字：{}。一件事通常 30~90 秒；内容连贯完整的可以更长，但不超过 {} 秒。每条给出 {} 个不同角度的标题。没有值得切的内容时 clips 为空数组。",
         BASE_RULES,
         profile_note(profile),
-        input.max_secs,
+        input.streamer,
+        input.max_secs.min(MAX_TOPIC_SECS),
         titles
     );
     let user = format!(
@@ -352,6 +364,73 @@ pub async fn segment_topics(settings: &LlmSettings, mode: &str, profile: Profile
     );
     let value = chat_json(settings, mode, &system, &user, &topics_schema(titles)).await?;
     serde_json::from_value(value["clips"].clone()).map_err(|e| format!("模型输出字段不完整: {}", e))
+}
+
+/// 精修结果：在给定的编号行里重新选定起止，并给出保留与否和档位
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Refined {
+    #[serde(default)]
+    pub start_line: usize,
+    #[serde(default)]
+    pub end_line: usize,
+    #[serde(default)]
+    pub keep: bool,
+    #[serde(default)]
+    pub grade: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+const REFINE_RULES: &str = "你是B站直播切片编辑，正在精修一条候选切片的起止，并判断它值不值得投稿。给你候选切片前后各约 90 秒的逐句转写，每行开头是行号；「主播」是主播的话，「念SC」是主播在朗读观众的 SC（不是主播的表现），「念SC+主播」夹着主播自己的话，「原片」是正在播放的视频或歌曲；行尾【弹幕N】是这句话前后几秒内的弹幕条数，观众反应一般比主播晚几秒，弹幕突然变多的地方通常是笑点。
+规则：
+1. 起点：从这件事的起因开始。由 SC、提问、点歌引出的，从这条「念SC」的第一行开始（包括“谢谢某某的SC”）；主播自己引出的，从主播开始说这件事的第一句开始。起因在候选范围之前的要往前补，前面无关的内容要去掉。
+2. 终点：到主播把这件事说完、笑点或金句落地、弹幕反应回落为止；遇到下一条无关的「念SC」或话题一转就停。不要为了凑时长带上无关内容，一件事 10 秒说完就切 10 秒。
+3. keep：主播只是念完 SC、附和几句、说“不知道”，没有自己的笑点或观点的；只有一两句回应的；不看前文就看不懂的，keep 为 false。
+4. grade 逐条对照下面的标准，不满足就往下降一档：
+   A＝有明确的笑点或金句，主播反应强烈，弹幕有明显增多，不看前后文也能看懂，值得优先投稿；
+   B＝主播有自己的笑点或鲜明观点，不看前后文能看懂，弹幕有反应；
+   C＝其余情况，包括：看视频时插一两句吐槽、对剧情或史实的普通评论、观点平淡、弹幕没有反应、需要前文背景才能看懂。
+   一场直播里通常 A 不超过一成、B 约三成，其余都是 C；拿不准时选低的一档。
+5. 只能依据转写判断，转写有识别错误时按上下文理解。reason 用一句话说明起止为什么选在这里、为什么是这个档位。";
+
+/// 杂谈场的卖点常是完整的观点或答题，不一定有笑点，评级标准单独说明
+fn refine_profile_note(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Chat => "\n杂谈直播评级补充：主播把一个观点讲完整、把观众的提问答完（有自己的结论或态度），即使没有强笑点也可以评 B，观点鲜明、有金句的评 A；30 秒以内只回一两句的最高评 C。",
+        _ => "",
+    }
+}
+
+pub struct RefineInput<'a> {
+    pub streamer: &'a str,
+    pub topic: &'a str,
+    pub reason: &'a str,
+    pub lines: &'a str,
+    pub proposed: (usize, usize),
+    pub last_line: usize,
+}
+
+/// 单条候选切片的精修：重新定起止、判断保留与否并分档
+pub async fn refine_clip(settings: &LlmSettings, mode: &str, profile: Profile, input: &RefineInput<'_>) -> Result<Refined, String> {
+    let system = format!("{}\n{}{}\n主播名字：{}。", REFINE_RULES, profile_note(profile), refine_profile_note(profile), input.streamer);
+    let user = format!(
+        "候选切片：第 {}~{} 行，话题：{}\n初选理由：{}\n\n转写（行号 [起止秒][说话方] 文本【弹幕N】）：\n{}",
+        input.proposed.0, input.proposed.1, input.topic, input.reason, input.lines
+    );
+    let line = json!({"type": "integer", "minimum": 0, "maximum": input.last_line});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "startLine": line, "endLine": line,
+            "keep": {"type": "boolean"},
+            "grade": {"type": "string", "enum": ["A", "B", "C"]},
+            "reason": {"type": "string"}
+        },
+        "required": ["startLine", "endLine", "keep", "grade", "reason"]
+    });
+    let value = chat_json(settings, mode, &system, &user, &schema).await?;
+    serde_json::from_value(value).map_err(|e| format!("模型输出字段不完整: {}", e))
 }
 
 fn normalize(s: &str) -> Vec<char> {

@@ -291,6 +291,7 @@ impl Db {
             "ALTER TABLE live_clip_item ADD COLUMN source_file_path TEXT",
             [],
         );
+        let _ = conn.execute("ALTER TABLE live_clip_item ADD COLUMN cover_spec TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE live_clip_item ADD COLUMN status TEXT DEFAULT 'SUCCESS'",
             [],

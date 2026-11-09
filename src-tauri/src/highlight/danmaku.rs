@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -23,6 +24,8 @@ pub struct DanmakuEvent {
     pub t: f64,
     /// 用户标识：uid，取不到时用昵称
     pub user: String,
+    /// 昵称，取不到时为空
+    pub name: String,
     pub text: String,
     /// 人民币金额
     pub money: f64,
@@ -81,6 +84,7 @@ pub fn parse_jsonl_line(line: &str, base_time: DateTime<Utc>) -> Option<DanmakuE
     let cmd = value.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
     let raw = value.get("data")?;
     let body = raw.get("data");
+    let str_of = |v: Option<&Value>| v.and_then(|v| v.as_str()).unwrap_or("").to_string();
     let uid_or = |uid: Option<&Value>, name: Option<&Value>| -> String {
         let uid = uid.and_then(|v| v.as_i64()).filter(|v| *v > 0);
         match uid {
@@ -96,13 +100,15 @@ pub fn parse_jsonl_line(line: &str, base_time: DateTime<Utc>) -> Option<DanmakuE
             user_info.and_then(|u| u.first()),
             user_info.and_then(|u| u.get(1)),
         );
-        return Some(DanmakuEvent { t, user, text, money: 0.0, kind: DanmakuKind::Chat });
+        let name = str_of(user_info.and_then(|u| u.get(1)));
+        return Some(DanmakuEvent { t, user, name, text, money: 0.0, kind: DanmakuKind::Chat });
     }
     let body = body?;
     match cmd {
         "SUPER_CHAT_MESSAGE" | "SUPER_CHAT_MESSAGE_JPN" => Some(DanmakuEvent {
             t,
             user: uid_or(body.get("uid"), body.get("user_info").and_then(|u| u.get("uname"))),
+            name: str_of(body.get("user_info").and_then(|u| u.get("uname"))),
             text: body.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             money: body.get("price").and_then(as_f64).unwrap_or(0.0),
             kind: DanmakuKind::SuperChat,
@@ -116,14 +122,35 @@ pub fn parse_jsonl_line(line: &str, base_time: DateTime<Utc>) -> Option<DanmakuE
             Some(DanmakuEvent {
                 t,
                 user: uid_or(body.get("uid"), body.get("uname")),
-                text: body.get("giftName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                name: str_of(body.get("uname")),
+                text: gift_text(&str_of(body.get("giftName")), body.get("num").and_then(as_f64).unwrap_or(1.0) as u64),
                 money: if gold { total / 1000.0 } else { 0.0 },
+                kind: DanmakuKind::Gift,
+            })
+        }
+        // 新版送礼消息：礼物信息是 base64 编码的 protobuf
+        "SEND_GIFT_V2" => {
+            let pb = base64::engine::general_purpose::STANDARD.decode(body.get("pb")?.as_str()?).ok()?;
+            let top = pb_fields(&pb)?;
+            let gift = pb_fields(pb_bytes(&top, 10)?)?;
+            let num = pb_int(&gift, 3).unwrap_or(1);
+            let total = pb_int(&gift, 7).unwrap_or_else(|| pb_int(&gift, 5).unwrap_or(0) * num);
+            let gold = pb_bytes(&gift, 8) == Some(b"gold".as_slice());
+            let uid = pb_int(&top, 1).unwrap_or(0);
+            let name = String::from_utf8_lossy(pb_bytes(&top, 2).unwrap_or_default()).to_string();
+            Some(DanmakuEvent {
+                t,
+                user: if uid > 0 { uid.to_string() } else { name.clone() },
+                name,
+                text: gift_text(&String::from_utf8_lossy(pb_bytes(&gift, 2)?), num),
+                money: if gold { total as f64 / 1000.0 } else { 0.0 },
                 kind: DanmakuKind::Gift,
             })
         }
         "GUARD_BUY" => Some(DanmakuEvent {
             t,
             user: uid_or(body.get("uid"), body.get("username")),
+            name: str_of(body.get("username")),
             text: body.get("gift_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             money: body.get("price").and_then(as_f64).unwrap_or(0.0)
                 * body.get("num").and_then(as_f64).unwrap_or(1.0)
@@ -132,6 +159,72 @@ pub fn parse_jsonl_line(line: &str, base_time: DateTime<Utc>) -> Option<DanmakuE
         }),
         _ => None,
     }
+}
+
+fn gift_text(gift: &str, num: u64) -> String {
+    if num > 1 { format!("{gift} × {num}") } else { gift.to_string() }
+}
+
+/// protobuf 字段值：整数或字节串（嵌套消息、字符串）
+enum PbValue<'a> {
+    Int(u64),
+    Bytes(&'a [u8]),
+}
+
+/// 解析一层 protobuf，同号字段只保留第一个
+fn pb_fields(mut buf: &[u8]) -> Option<Vec<(u64, PbValue<'_>)>> {
+    fn varint(buf: &mut &[u8]) -> Option<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let (&b, rest) = buf.split_first()?;
+            *buf = rest;
+            v |= u64::from(b & 0x7f) << shift;
+            if b < 0x80 {
+                return Some(v);
+            }
+        }
+        None
+    }
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        let key = varint(&mut buf)?;
+        let value = match key & 7 {
+            0 => PbValue::Int(varint(&mut buf)?),
+            2 => {
+                let len = varint(&mut buf)? as usize;
+                let (data, rest) = (buf.get(..len)?, buf.get(len..)?);
+                buf = rest;
+                PbValue::Bytes(data)
+            }
+            1 => {
+                buf = buf.get(8..)?;
+                continue;
+            }
+            5 => {
+                buf = buf.get(4..)?;
+                continue;
+            }
+            _ => return None,
+        };
+        if !out.iter().any(|(f, _)| *f == key >> 3) {
+            out.push((key >> 3, value));
+        }
+    }
+    Some(out)
+}
+
+fn pb_int(fields: &[(u64, PbValue)], field: u64) -> Option<u64> {
+    fields.iter().find_map(|(f, v)| match v {
+        PbValue::Int(n) if *f == field => Some(*n),
+        _ => None,
+    })
+}
+
+fn pb_bytes<'a>(fields: &[(u64, PbValue<'a>)], field: u64) -> Option<&'a [u8]> {
+    fields.iter().find_map(|(f, v)| match v {
+        PbValue::Bytes(b) if *f == field => Some(*b),
+        _ => None,
+    })
 }
 
 fn as_f64(v: &Value) -> Option<f64> {
@@ -154,6 +247,7 @@ fn parse_xml_line(line: &str, offset_start: f64) -> Vec<DanmakuEvent> {
             out.push(DanmakuEvent {
                 t: offset_start + sec,
                 user: attrs.get(6).copied().unwrap_or("").to_string(),
+                name: String::new(),
                 text: text.to_string(),
                 money: 0.0,
                 kind: DanmakuKind::Chat,
@@ -240,6 +334,16 @@ mod tests {
         assert_eq!(parse_jsonl_line(free_gift, base()).unwrap().money, 0.0);
         let paid_gift = r#"{"cmd":"SEND_GIFT","data":{"cmd":"SEND_GIFT","data":{"uid":7,"giftName":"小花花","coin_type":"gold","total_coin":5000}},"timestamp":"2026-10-22T08:52:49+08:00"}"#;
         assert_eq!(parse_jsonl_line(paid_gift, base()).unwrap().money, 5.0);
+    }
+
+    #[test]
+    fn parses_protobuf_gift_v2() {
+        let line = r#"{"cmd":"SEND_GIFT_V2","data":{"cmd":"SEND_GIFT_V2","data":{"pb":"CMS98KABEhLlh7rpm7LltI7jga3jga3lrZBSGBIJ5Lq65rCU56WoGAooZDjoB0IEZ29sZA=="}},"timestamp":"2026-10-22T08:52:49+08:00"}"#;
+        let e = parse_jsonl_line(line, base()).unwrap();
+        assert_eq!(
+            (e.kind, e.user.as_str(), e.name.as_str(), e.text.as_str(), e.money),
+            (DanmakuKind::Gift, "337387204", "出雲崎ねね子", "人气票 × 10", 1.0)
+        );
     }
 
     #[test]

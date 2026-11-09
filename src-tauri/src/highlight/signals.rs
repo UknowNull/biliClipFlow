@@ -430,7 +430,7 @@ mod tests {
     use super::*;
 
     fn chat(t: f64, user: &str, text: &str) -> DanmakuEvent {
-        DanmakuEvent { t, user: user.to_string(), text: text.to_string(), money: 0.0, kind: DanmakuKind::Chat }
+        DanmakuEvent { t, user: user.to_string(), name: String::new(), text: text.to_string(), money: 0.0, kind: DanmakuKind::Chat }
     }
 
     #[test]

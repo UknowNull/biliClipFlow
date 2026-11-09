@@ -2,6 +2,20 @@
 @tailwind components;
 @tailwind utilities;
 
+/* 切片封面字体（投稿封面渲染与编辑器共用） */
+@font-face {
+  font-family: "CoverSourceHan";
+  src: url("./assets/fonts/SourceHanSans-Heavy.woff2") format("woff2");
+  font-weight: 900;
+  font-display: block;
+}
+@font-face {
+  font-family: "CoverPuHuiTi";
+  src: url("./assets/fonts/AlibabaPuHuiTi-Heavy.woff2") format("woff2");
+  font-weight: 900;
+  font-display: block;
+}
+
 :root {
   --primary-color: rgb(0, 161, 214);
   --primary-text: rgb(233, 233, 233);
