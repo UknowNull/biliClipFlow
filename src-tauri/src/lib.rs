@@ -12,10 +12,12 @@ mod api;
 mod app_log;
 mod baidu_sync;
 mod bilibili;
+mod change_events;
 mod commands;
 mod config;
 mod db;
 mod ffmpeg;
+mod highlight;
 mod live_recorder;
 mod login_refresh;
 mod login_store;
@@ -137,7 +139,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     utils::append_log(&heartbeat_path, "heartbeat");
-                    sleep(Duration::from_secs(30)).await;
+                    sleep(Duration::from_secs(300)).await;
                 }
             });
             let state = AppState {
@@ -200,6 +202,12 @@ pub fn run() {
                 toolbox_season_backup_receiver,
             );
             commands::toolbox::start_bilibili_season_backup_scheduler(app.handle().clone());
+            change_events::start_emit_loop(app.handle().clone());
+            highlight::start(highlight::ClipContext {
+                db: Arc::clone(&app.state::<AppState>().db),
+                app_log_path: Arc::clone(&app.state::<AppState>().app_log_path),
+                app_data_dir: app_dir.clone(),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -246,6 +254,35 @@ pub fn run() {
             commands::anchor::anchor_clip_reclip,
             commands::anchor::anchor_clip_delete,
             commands::anchor::anchor_clip_list,
+            commands::anchor::anchor_clip_mark,
+            commands::anchor::anchor_clip_sessions,
+            commands::anchor::anchor_clip_session_context,
+            commands::anchor::anchor_session_events,
+            commands::anchor::anchor_clip_update_meta,
+            commands::anchor::anchor_clip_preview,
+            commands::anchor::anchor_clip_cover_frame,
+            commands::anchor::anchor_clip_cover_image,
+            commands::anchor::anchor_clip_cover_save,
+            commands::anchor::anchor_cover_person_box_get,
+            commands::anchor::anchor_cover_person_box_set,
+            commands::anchor::anchor_record_import_scan,
+            commands::anchor::anchor_record_import_commit,
+            commands::anchor::anchor_clip_subtitle_edit,
+            commands::anchor::clip_subtitle_style_get,
+            commands::anchor::clip_subtitle_style_set,
+            commands::auto_clip::anchor_clip_profile_get,
+            commands::auto_clip::anchor_clip_profile_set,
+            commands::auto_clip::anchor_voiceprint_get,
+            commands::auto_clip::anchor_voiceprint_enroll,
+            commands::auto_clip::auto_clip_settings_get,
+            commands::auto_clip::auto_clip_settings_save,
+            commands::auto_clip::auto_clip_llm_test,
+            commands::auto_clip::auto_clip_llm_models,
+            commands::auto_clip::auto_clip_asr_status,
+            commands::auto_clip::auto_clip_asr_download,
+            commands::auto_clip::anchor_auto_clip_set,
+            commands::auto_clip::auto_clip_asr_import_package,
+            commands::auto_clip::auto_clip_asr_download_package,
             commands::live::live_record_start,
             commands::live::live_record_stop,
             commands::live::live_room_auto_record_update,

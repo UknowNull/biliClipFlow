@@ -107,7 +107,7 @@ pub struct BaiduAccountLoginInput {
     pub input: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_settings(
     state: State<'_, AppState>,
 ) -> ApiResponse<baidu_sync::BaiduSyncSettings> {
@@ -117,7 +117,7 @@ pub fn baidu_sync_settings(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_status(state: State<'_, AppState>) -> ApiResponse<baidu_sync::BaiduLoginInfo> {
     match baidu_sync::check_baidu_login(&state.db) {
         Ok(info) => ApiResponse::success(info),
@@ -125,7 +125,7 @@ pub fn baidu_sync_status(state: State<'_, AppState>) -> ApiResponse<baidu_sync::
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_accounts_list(
     state: State<'_, AppState>,
 ) -> ApiResponse<Vec<baidu_sync::BaiduAccountSummary>> {
@@ -135,7 +135,7 @@ pub fn baidu_accounts_list(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_account_switch(
     state: State<'_, AppState>,
     uid: String,
@@ -147,7 +147,7 @@ pub fn baidu_account_switch(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_account_logout(state: State<'_, AppState>, uid: String) -> ApiResponse<String> {
     match baidu_sync::logout_baidu_by_uid(&state.db, &uid) {
         Ok(()) => ApiResponse::success("ok".to_string()),
@@ -155,7 +155,7 @@ pub fn baidu_account_logout(state: State<'_, AppState>, uid: String) -> ApiRespo
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_login(
     state: State<'_, AppState>,
     request: BaiduLoginRequest,
@@ -217,7 +217,7 @@ fn summarize_baidu_token(raw: &str, label: &str) -> String {
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_logout(state: State<'_, AppState>) -> ApiResponse<String> {
     match baidu_sync::logout_baidu(&state.db) {
         Ok(()) => ApiResponse::success("ok".to_string()),
@@ -225,7 +225,7 @@ pub fn baidu_sync_logout(state: State<'_, AppState>) -> ApiResponse<String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_list(
     state: State<'_, AppState>,
     request: Option<BaiduSyncListRequest>,
@@ -243,15 +243,26 @@ pub fn baidu_sync_list(
     }
 }
 
+/// 网盘目录请求用的是阻塞 HTTP 客户端，不能直接在异步运行时里调用，放到阻塞线程池执行
+async fn run_blocking<T: Send + 'static>(
+    state: &State<'_, AppState>,
+    f: impl FnOnce(&crate::db::Db) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || f(&db))
+        .await
+        .map_err(|err| format!("网盘请求执行失败: {}", err))?
+}
+
 #[tauri::command]
-pub fn baidu_sync_remote_dirs(
+pub async fn baidu_sync_remote_dirs(
     state: State<'_, AppState>,
     request: Option<BaiduRemoteListRequest>,
-) -> ApiResponse<Vec<BaiduRemoteEntry>> {
+) -> Result<ApiResponse<Vec<BaiduRemoteEntry>>, String> {
     let path = request
         .and_then(|value| value.path)
         .unwrap_or_else(|| "/".to_string());
-    match baidu_sync::list_baidu_remote_dirs(&state.db, &path) {
+    Ok(match run_blocking(&state, move |db| baidu_sync::list_baidu_remote_dirs(db, &path)).await {
         Ok(list) => ApiResponse::success(
             list.into_iter()
                 .map(|item| BaiduRemoteEntry {
@@ -262,18 +273,18 @@ pub fn baidu_sync_remote_dirs(
                 .collect(),
         ),
         Err(err) => ApiResponse::error(err),
-    }
+    })
 }
 
 #[tauri::command]
-pub fn baidu_sync_remote_entries(
+pub async fn baidu_sync_remote_entries(
     state: State<'_, AppState>,
     request: Option<BaiduRemoteListRequest>,
-) -> ApiResponse<Vec<BaiduRemoteEntry>> {
+) -> Result<ApiResponse<Vec<BaiduRemoteEntry>>, String> {
     let path = request
         .and_then(|value| value.path)
         .unwrap_or_else(|| "/".to_string());
-    match baidu_sync::list_baidu_remote_entries(&state.db, &path) {
+    Ok(match run_blocking(&state, move |db| baidu_sync::list_baidu_remote_entries(db, &path)).await {
         Ok(list) => ApiResponse::success(
             list.into_iter()
                 .map(|item| BaiduRemoteEntry {
@@ -284,56 +295,56 @@ pub fn baidu_sync_remote_entries(
                 .collect(),
         ),
         Err(err) => ApiResponse::error(err),
-    }
+    })
 }
 
 #[tauri::command]
-pub fn baidu_sync_create_dir(
+pub async fn baidu_sync_create_dir(
     state: State<'_, AppState>,
     request: Option<BaiduRemoteCreateRequest>,
-) -> ApiResponse<BaiduRemoteEntry> {
+) -> Result<ApiResponse<BaiduRemoteEntry>, String> {
     let request = request.unwrap_or(BaiduRemoteCreateRequest {
         parent_path: Some("/".to_string()),
         name: Some("新建文件夹".to_string()),
     });
     let parent_path = request.parent_path.unwrap_or_else(|| "/".to_string());
     let name = request.name.unwrap_or_else(|| "新建文件夹".to_string());
-    match baidu_sync::create_baidu_remote_dir(&state.db, &parent_path, &name) {
+    Ok(match run_blocking(&state, move |db| baidu_sync::create_baidu_remote_dir(db, &parent_path, &name)).await {
         Ok(entry) => ApiResponse::success(BaiduRemoteEntry {
             name: entry.name,
             path: entry.path,
             is_dir: true,
         }),
         Err(err) => ApiResponse::error(err),
-    }
+    })
 }
 
 #[tauri::command]
-pub fn baidu_sync_rename_dir(
+pub async fn baidu_sync_rename_dir(
     state: State<'_, AppState>,
     request: Option<BaiduRemoteRenameRequest>,
-) -> ApiResponse<BaiduRemoteEntry> {
+) -> Result<ApiResponse<BaiduRemoteEntry>, String> {
     let request = request.ok_or_else(|| "请求参数不能为空".to_string());
     let request = match request {
         Ok(value) => value,
-        Err(err) => return ApiResponse::error(err),
+        Err(err) => return Ok(ApiResponse::error(err)),
     };
     let from_path = request.from_path.unwrap_or_default();
     if from_path.trim().is_empty() {
-        return ApiResponse::error("原目录不能为空".to_string());
+        return Ok(ApiResponse::error("原目录不能为空".to_string()));
     }
     let name = request.name.unwrap_or_default();
-    match baidu_sync::rename_baidu_remote_dir(&state.db, &from_path, &name) {
+    Ok(match run_blocking(&state, move |db| baidu_sync::rename_baidu_remote_dir(db, &from_path, &name)).await {
         Ok(entry) => ApiResponse::success(BaiduRemoteEntry {
             name: entry.name,
             path: entry.path,
             is_dir: true,
         }),
         Err(err) => ApiResponse::error(err),
-    }
+    })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_retry(state: State<'_, AppState>, task_id: i64) -> ApiResponse<String> {
     match baidu_sync::retry_baidu_sync_task(&state.db, task_id) {
         Ok(()) => ApiResponse::success("ok".to_string()),
@@ -341,7 +352,7 @@ pub fn baidu_sync_retry(state: State<'_, AppState>, task_id: i64) -> ApiResponse
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_cancel(state: State<'_, AppState>, task_id: i64) -> ApiResponse<String> {
     match baidu_sync::cancel_baidu_sync_task(&state.db, task_id) {
         Ok(()) => ApiResponse::success("ok".to_string()),
@@ -349,7 +360,7 @@ pub fn baidu_sync_cancel(state: State<'_, AppState>, task_id: i64) -> ApiRespons
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_pause(state: State<'_, AppState>, task_id: i64) -> ApiResponse<String> {
     match baidu_sync::pause_baidu_sync_task(&state.db, task_id) {
         Ok(()) => ApiResponse::success("ok".to_string()),
@@ -357,7 +368,7 @@ pub fn baidu_sync_pause(state: State<'_, AppState>, task_id: i64) -> ApiResponse
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_delete(state: State<'_, AppState>, task_id: i64) -> ApiResponse<String> {
     match baidu_sync::delete_baidu_sync_task(&state.db, task_id) {
         Ok(()) => ApiResponse::success("ok".to_string()),
@@ -365,7 +376,7 @@ pub fn baidu_sync_delete(state: State<'_, AppState>, task_id: i64) -> ApiRespons
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_update_settings(
     state: State<'_, AppState>,
     request: Option<BaiduSyncUpdateRequest>,
@@ -396,7 +407,7 @@ pub fn baidu_sync_update_settings(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_account_login_status(
     state: State<'_, AppState>,
 ) -> ApiResponse<BaiduAccountLoginStatus> {
@@ -410,7 +421,7 @@ pub fn baidu_sync_account_login_status(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_account_login_start(
     state: State<'_, AppState>,
     request: BaiduAccountLoginRequest,
@@ -535,7 +546,7 @@ pub fn baidu_sync_account_login_start(
     ApiResponse::success(snapshot_baidu_login_status(&runtime))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_account_login_input(
     state: State<'_, AppState>,
     request: BaiduAccountLoginInput,
@@ -562,7 +573,7 @@ pub fn baidu_sync_account_login_input(
     ApiResponse::success("ok".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn baidu_sync_account_login_cancel(state: State<'_, AppState>) -> ApiResponse<String> {
     let mut runtime = match state.baidu_login_runtime.lock() {
         Ok(value) => value,

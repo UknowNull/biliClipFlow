@@ -26,6 +26,10 @@ impl Db {
         }
 
         let conn = Connection::open(db_path)?;
+        // WAL 让后台写入不阻塞前端读取；busy_timeout 避免偶发锁竞争直接报错。
+        let _ = conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
+        );
         let _ = conn.execute(
             "ALTER TABLE task_output_segment ADD COLUMN merged_id INTEGER",
             [],
@@ -287,8 +291,88 @@ impl Db {
             "ALTER TABLE live_clip_item ADD COLUMN source_file_path TEXT",
             [],
         );
+        let _ = conn.execute("ALTER TABLE live_clip_item ADD COLUMN cover_spec TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE live_clip_item ADD COLUMN status TEXT DEFAULT 'SUCCESS'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_room_settings ADD COLUMN clip_profile TEXT NOT NULL DEFAULT 'reaction'",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE live_room_settings ADD COLUMN voiceprint TEXT", []);
+        // 主播级自动切片开关；为空时沿用全局设置。auto_clip_since 记录开启时间，
+        // 避免刚开启就把历史录播全部回溯分析。
+        let _ = conn.execute(
+            "ALTER TABLE live_room_settings ADD COLUMN auto_clip INTEGER",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_room_settings ADD COLUMN auto_clip_since TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_record_task ADD COLUMN remux_status TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_task ADD COLUMN trigger_type TEXT NOT NULL DEFAULT 'MANUAL'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_task ADD COLUMN session_key TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_task ADD COLUMN stage TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_task ADD COLUMN progress REAL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN score REAL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN signals TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN category TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN titles TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN description TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN tags TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN cover_text TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN reason TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN evidence TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN ai_status TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_clip_item ADD COLUMN mark TEXT NOT NULL DEFAULT 'PENDING'",
             [],
         );
         let _ = conn.execute(
@@ -317,6 +401,12 @@ impl Db {
       "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES ('active_baidu_uid', '', datetime('now'))",
       [],
     );
+        // 存量录播的转封装状态：MP4 视为完成，其余视为失败（不会再自动重试），录制中的保持为空。
+        let _ = conn.execute(
+            "UPDATE live_record_task SET remux_status = CASE WHEN LOWER(file_path) LIKE '%.mp4' THEN 'DONE' ELSE 'FAILED' END \
+       WHERE remux_status IS NULL AND status <> 'RECORDING'",
+            [],
+        );
         let baidu_account_count = conn
             .query_row("SELECT COUNT(*) FROM baidu_account_info", [], |row| {
                 row.get::<_, i64>(0)
@@ -495,6 +585,10 @@ impl Db {
        WHERE key = 'baidu_sync_concurrency' AND value = '1'",
             [],
         );
+
+        conn.update_hook(Some(|_action, _db: &str, table: &str, _rowid: i64| {
+            crate::change_events::mark_table(table);
+        }));
 
         Ok(Self {
             conn: Mutex::new(conn),

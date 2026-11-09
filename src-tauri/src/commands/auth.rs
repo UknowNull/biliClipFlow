@@ -89,7 +89,7 @@ pub async fn auth_sms_login(
     code: String,
     captcha_key: String,
 ) -> Result<ApiResponse<i32>, String> {
-    let client = reqwest::Client::new();
+    let client = state.bilibili.http();
     let mut headers = HeaderMap::new();
     headers.insert(
         USER_AGENT,
@@ -169,7 +169,7 @@ pub async fn auth_pwd_login(
     validate: String,
     seccode: String,
 ) -> Result<ApiResponse<i32>, String> {
-    let client = reqwest::Client::new();
+    let client = state.bilibili.http();
     let mut headers = HeaderMap::new();
     headers.insert(
         USER_AGENT,
@@ -293,7 +293,7 @@ pub async fn auth_refresh(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn auth_accounts_list(state: State<'_, AppState>) -> ApiResponse<Vec<BilibiliAccountSummary>> {
     match state.login_store.list_accounts(&state.db) {
         Ok(accounts) => ApiResponse::success(accounts),
@@ -343,7 +343,7 @@ pub async fn auth_account_logout(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn account_binding_list(state: State<'_, AppState>) -> ApiResponse<Vec<AccountBindingRecord>> {
     let result = state.db.with_conn(|conn| {
         let mut stmt = conn.prepare(
@@ -363,7 +363,7 @@ pub fn account_binding_list(state: State<'_, AppState>) -> ApiResponse<Vec<Accou
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn account_binding_get(
     state: State<'_, AppState>,
     bilibili_uid: i64,
@@ -387,7 +387,7 @@ pub fn account_binding_get(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn account_binding_set(
     state: State<'_, AppState>,
     bilibili_uid: i64,
@@ -551,7 +551,7 @@ async fn poll_qrcode_once_inner(
     qrcode_key: &str,
     log_path: Option<&Path>,
 ) -> Result<PollResult, String> {
-    let client = reqwest::Client::new();
+    let client = bilibili.http();
     let url = format!(
         "{}{}?qrcode_key={}&source=main-fe-header",
         bilibili.passport_base_url(),

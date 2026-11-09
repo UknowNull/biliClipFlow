@@ -503,7 +503,10 @@ pub async fn video_playurl_by_aid(
 }
 
 #[tauri::command]
-pub async fn video_proxy_image(url: String) -> Result<ApiResponse<String>, String> {
+pub async fn video_proxy_image(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<ApiResponse<String>, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Ok(ApiResponse::error("图片地址不能为空"));
@@ -519,7 +522,7 @@ pub async fn video_proxy_image(url: String) -> Result<ApiResponse<String>, Strin
         HeaderValue::from_static("https://www.bilibili.com"),
     );
 
-    let client = reqwest::Client::new();
+    let client = state.bilibili.http();
     let response = match client.get(trimmed).headers(headers).send().await {
         Ok(response) => response,
         Err(err) => {

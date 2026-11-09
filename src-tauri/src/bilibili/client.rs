@@ -107,6 +107,11 @@ impl BilibiliClient {
         &self.base_url
     }
 
+    /// 共享的 HTTP 客户端，复用连接池，避免每次请求重新握手。
+    pub fn http(&self) -> &Client {
+        &self.client
+    }
+
     pub fn passport_base_url(&self) -> &str {
         &self.passport_base_url
     }

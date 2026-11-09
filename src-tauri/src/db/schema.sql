@@ -454,7 +454,11 @@ CREATE TABLE IF NOT EXISTS live_room_settings (
   record_mode TEXT NOT NULL DEFAULT 'DAILY',
   record_dates TEXT,
   keep_record_after INTEGER NOT NULL DEFAULT 0,
-  update_time TEXT NOT NULL
+  update_time TEXT NOT NULL,
+  clip_profile TEXT NOT NULL DEFAULT 'reaction',
+  voiceprint TEXT,
+  auto_clip INTEGER,
+  auto_clip_since TEXT
 );
 
 CREATE TABLE IF NOT EXISTS live_record_task (
@@ -469,7 +473,8 @@ CREATE TABLE IF NOT EXISTS live_record_task (
   title TEXT,
   error_message TEXT,
   create_time TEXT NOT NULL,
-  update_time TEXT NOT NULL
+  update_time TEXT NOT NULL,
+  remux_status TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_live_record_task_room_id ON live_record_task (room_id);
@@ -578,10 +583,15 @@ CREATE TABLE IF NOT EXISTS live_clip_task (
   clip_count    INTEGER DEFAULT 0,
   error_message TEXT,
   create_time   TEXT NOT NULL,
-  update_time   TEXT NOT NULL
+  update_time   TEXT NOT NULL,
+  trigger_type TEXT NOT NULL DEFAULT 'MANUAL',
+  session_key TEXT,
+  stage TEXT,
+  progress REAL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_live_clip_task_room_id ON live_clip_task (room_id);
+CREATE INDEX IF NOT EXISTS idx_live_clip_task_session_key ON live_clip_task (session_key);
 
 CREATE TABLE IF NOT EXISTS live_clip_item (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -594,7 +604,18 @@ CREATE TABLE IF NOT EXISTS live_clip_item (
   end_offset    INTEGER NOT NULL,
   duration      INTEGER NOT NULL,
   peak_count    INTEGER DEFAULT 0,
-  create_time   TEXT NOT NULL
+  create_time   TEXT NOT NULL,
+  score REAL DEFAULT 0,
+  signals TEXT,
+  category TEXT,
+  titles TEXT,
+  description TEXT,
+  tags TEXT,
+  cover_text TEXT,
+  reason TEXT,
+  evidence TEXT,
+  ai_status TEXT,
+  mark TEXT NOT NULL DEFAULT 'PENDING'
 );
 
 CREATE INDEX IF NOT EXISTS idx_live_clip_item_task_id ON live_clip_item (task_id);

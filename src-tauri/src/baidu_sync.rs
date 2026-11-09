@@ -1158,6 +1158,7 @@ fn recover_baidu_sync_tasks_internal(
     let Ok(tasks) = tasks else {
         return;
     };
+    let count = tasks.len();
     for task in tasks {
         if let Err(err) = recover_single_baidu_sync_task(db, app_log_path, &task, reason) {
             append_log(
@@ -1169,10 +1170,13 @@ fn recover_baidu_sync_tasks_internal(
             );
         }
     }
-    append_log(
-        app_log_path,
-        &format!("baidu_sync_recover_ok reason={}", reason),
-    );
+    // 周期巡检每 3 秒一次，无任务时不记日志
+    if count > 0 {
+        append_log(
+            app_log_path,
+            &format!("baidu_sync_recover_ok reason={} count={}", reason, count),
+        );
+    }
 }
 
 fn recover_single_baidu_sync_task(

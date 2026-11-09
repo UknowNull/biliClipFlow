@@ -24,10 +24,12 @@ tauri-plugin-dialog = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 base64 = "0.22"
 md5 = "0.7"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 thiserror = "1"
 tokio = { version = "1", features = ["sync", "time", "net", "io-util", "macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+# 弹幕 wss 需要 rustls 有且只有一个加密后端，否则 connect_async 时 panic
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 flate2 = "1"
 brotli = "6"
@@ -39,9 +41,18 @@ rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.10"
 rand = "0.8"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# 本地语音识别（静态链接预编译库）；识别结果的完整字段需直接调用 sys 接口
+sherpa-onnx = "=1.13.8"
+sherpa-onnx-sys = "=1.13.8"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "blocking"] }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -92,7 +92,7 @@ pub struct CacheItemInfo {
     pub exists: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_download_settings(state: State<'_, AppState>) -> ApiResponse<DownloadSettings> {
     match load_download_settings_from_db(&state.db) {
         Ok(settings) => ApiResponse::success(settings),
@@ -100,7 +100,7 @@ pub fn get_download_settings(state: State<'_, AppState>) -> ApiResponse<Download
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_live_settings(state: State<'_, AppState>) -> ApiResponse<LiveSettings> {
     match load_live_settings_from_db(&state.db) {
         Ok(settings) => ApiResponse::success(settings),
@@ -108,7 +108,7 @@ pub fn get_live_settings(state: State<'_, AppState>) -> ApiResponse<LiveSettings
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn settings_cache_overview(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
@@ -119,7 +119,7 @@ pub fn settings_cache_overview(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn settings_cache_clear(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
@@ -137,7 +137,7 @@ pub fn settings_cache_clear(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn settings_cache_open(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
@@ -157,7 +157,7 @@ pub fn settings_cache_open(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_download_settings(
     state: State<'_, AppState>,
     threads: i64,
@@ -306,7 +306,7 @@ pub fn update_download_settings(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_live_settings(
     state: State<'_, AppState>,
     payload: LiveSettings,
@@ -628,7 +628,7 @@ pub fn default_live_settings() -> LiveSettings {
         stream_retry_no_qn_sec: 90,
         stream_connect_timeout_ms: 5000,
         stream_read_timeout_ms: 15000,
-        check_interval_sec: 180,
+        check_interval_sec: 30,
         flv_fix_split_on_missing: false,
         flv_fix_adjust_timestamp_jump: false,
         flv_fix_split_on_timestamp_jump: true,

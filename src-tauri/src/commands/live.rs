@@ -27,7 +27,7 @@ pub async fn live_record_start(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn live_record_stop(state: State<'_, AppState>, room_id: String) -> ApiResponse<String> {
     let context = LiveContext {
         db: state.db.clone(),
@@ -100,7 +100,7 @@ pub async fn live_room_auto_record_update(
     Ok(ApiResponse::success("已更新".to_string()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn live_room_baidu_sync_update(
     state: State<'_, AppState>,
     room_id: String,
@@ -128,7 +128,7 @@ pub fn live_room_baidu_sync_update(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn live_room_baidu_sync_toggle(
     state: State<'_, AppState>,
     room_id: String,
@@ -172,7 +172,7 @@ pub fn live_room_baidu_sync_toggle(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn live_room_record_config_update(
     state: State<'_, AppState>,
     room_id: String,

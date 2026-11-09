@@ -3,6 +3,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import LoadingButton from "../components/LoadingButton";
 import { showErrorDialog } from "../lib/dialog";
 import { invokeCommand } from "../lib/tauri";
+import useAppDataChanged from "../lib/useAppDataChanged";
 import { formatDateTime, formatDuration, formatNumber, parseVideoInput } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
 import BaiduRemoteFilePicker from "../components/BaiduRemoteFilePicker";
@@ -701,7 +702,6 @@ export default function DownloadSection({
       const data = await invokeCommand("download_list_by_status", {
         status,
         page,
-        page_size: size,
         pageSize: size,
       });
       setDownloadList(data?.items || []);
@@ -735,15 +735,11 @@ export default function DownloadSection({
     }
   }, [mainTab, activeRecordStatus]);
 
-  useEffect(() => {
-    if (mainTab !== "records") {
-      return undefined;
-    }
-    const timer = setInterval(() => {
-      loadDownloadList(activeRecordStatus, downloadPage, downloadPageSize);
-    }, 3000);
-    return () => clearInterval(timer);
-  }, [mainTab, activeRecordStatus, downloadPage, downloadPageSize]);
+  useAppDataChanged(
+    "download",
+    () => loadDownloadList(activeRecordStatus, downloadPage, downloadPageSize),
+    { enabled: mainTab === "records", minGapMs: 1000 },
+  );
 
   useEffect(() => {
     if (mainTab !== "download") {
@@ -1609,7 +1605,7 @@ export default function DownloadSection({
           message: `quick_fill_request page=${page} size=${quickFillPageSize}`,
         });
       } catch (_) {}
-      const payload = { page, page_size: quickFillPageSize, pageSize: quickFillPageSize };
+      const payload = { page, pageSize: quickFillPageSize };
       const currentBilibiliUid = Number(selectedBilibiliUid || currentUpProfile?.uid || 0);
       if (Number.isFinite(currentBilibiliUid) && currentBilibiliUid > 0) {
         payload.bilibiliUid = currentBilibiliUid;

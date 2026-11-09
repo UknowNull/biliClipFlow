@@ -139,6 +139,7 @@ impl LiveRuntime {
 const STALE_RECORD_REMUX_MAX_AGE_SECS: u64 = 36 * 60 * 60;
 const STALE_RECORD_IDLE_SECS: u64 = 30 * 60;
 const STALE_RECORD_RECOVERY_INTERVAL_SECS: u64 = 10 * 60;
+const ROOM_CHECK_TIMEOUT_SECS: u64 = 10;
 
 pub fn recover_stale_recordings(context: LiveContext) {
     let records = context
@@ -493,7 +494,14 @@ pub fn start_auto_record_loop(context: LiveContext) {
             let interval_sec = settings.check_interval_sec.max(10);
             if let Ok(rooms) = load_anchor_room_ids(&context.db) {
                 for room_id in rooms {
-                    match fetch_room_info(&context.bilibili, &room_id).await {
+                    // 单个房间请求卡住会阻塞整轮检测，导致所有主播漏检开播，必须限时。
+                    let room_info = tokio::time::timeout(
+                        Duration::from_secs(ROOM_CHECK_TIMEOUT_SECS),
+                        fetch_room_info(&context.bilibili, &room_id),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("查询直播间状态超时".to_string()));
+                    match room_info {
                         Ok(info) => {
                             let _ = update_anchor_status(&context.db, &room_id, info.live_status);
                             let auto_record = should_auto_record_now(
@@ -2628,6 +2636,19 @@ fn open_segment(
     })
 }
 
+// 录完后的转封装与兜底重编码限制并发：多个分段同时结束时，同时跑多个 x264 重编码会占满 CPU，
+// 拖慢仍在进行的录制并引发读超时重连。
+static LIVE_REMUX_COPY_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+static LIVE_REMUX_TRANSCODE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+async fn run_live_ffmpeg_limited(
+    limit: &'static tokio::sync::Semaphore,
+    args: Vec<String>,
+) -> Result<Result<(), String>, tauri::Error> {
+    let _permit = limit.acquire().await;
+    tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&args)).await
+}
+
 fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) {
     let source_path = PathBuf::from(file_path);
     let ext = source_path
@@ -2636,8 +2657,10 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
         .unwrap_or("")
         .to_string();
     if !ext.eq_ignore_ascii_case("flv") {
+        set_record_remux_status(&context.db, record_id, "DONE");
         return;
     }
+    set_record_remux_status(&context.db, record_id, "PENDING");
     let target_path = source_path.with_extension("mp4");
     let source = source_path.to_string_lossy().to_string();
     let target = target_path.to_string_lossy().to_string();
@@ -2655,7 +2678,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
             ),
         );
         let copy_args = build_live_remux_copy_args(&source, &target);
-        let copy_result = tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&copy_args))
+        let copy_result = run_live_ffmpeg_limited(&LIVE_REMUX_COPY_LIMIT, copy_args)
             .await
             .map_err(|_| "转封装执行失败".to_string());
 
@@ -2677,7 +2700,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
                 used_fallback_transcode = true;
                 let fallback_args = build_live_remux_transcode_args(&source, &target);
                 let fallback_result =
-                    tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&fallback_args))
+                    run_live_ffmpeg_limited(&LIVE_REMUX_TRANSCODE_LIMIT, fallback_args)
                         .await
                         .map_err(|_| "兜底转码执行失败".to_string());
                 remux_ok = matches!(fallback_result, Ok(Ok(())));
@@ -2711,7 +2734,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
             used_fallback_transcode = true;
             let fallback_args = build_live_remux_transcode_args(&source, &target);
             let fallback_result =
-                tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&fallback_args))
+                run_live_ffmpeg_limited(&LIVE_REMUX_TRANSCODE_LIMIT, fallback_args)
                     .await
                     .map_err(|_| "兜底转码执行失败".to_string());
             remux_ok = matches!(fallback_result, Ok(Ok(())));
@@ -2763,6 +2786,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
                     record_id, used_fallback_transcode
                 ),
             );
+            set_record_remux_status(&db, record_id, "FAILED");
             if let Err(err) = baidu_sync::enqueue_live_sync(&db, log_path.as_ref(), record_id) {
                 append_log(
                     log_path.as_ref(),
@@ -2775,6 +2799,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
             return;
         }
 
+        set_record_remux_status(&db, record_id, "DONE");
         if let Err(err) = update_record_task_file_path(&db, record_id, &target, final_target_size) {
             append_log(
                 log_path.as_ref(),
@@ -2897,6 +2922,16 @@ fn update_record_task(
     Ok(())
   })
   .map_err(|err| format!("更新录制任务失败: {}", err))
+}
+
+/// 记录分段转封装状态，自动切片据此判断一场直播的所有分段是否已就绪。
+fn set_record_remux_status(db: &Db, record_id: i64, status: &str) {
+    let _ = db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE live_record_task SET remux_status = ?1 WHERE id = ?2",
+            (status, record_id),
+        )
+    });
 }
 
 fn update_record_task_file_path(
@@ -4227,7 +4262,7 @@ fn handle_danmaku_payload(
                     "SUPER_CHAT_MESSAGE" | "SUPER_CHAT_MESSAGE_JPN" => {
                         settings.record_danmaku_superchat
                     }
-                    "SEND_GIFT" => settings.record_danmaku_gift,
+                    "SEND_GIFT" | "SEND_GIFT_V2" => settings.record_danmaku_gift,
                     "GUARD_BUY" | "USER_TOAST_MSG" => settings.record_danmaku_guard,
                     _ => false,
                 }
