@@ -266,6 +266,7 @@ pub fn run() {
             commands::anchor::anchor_cover_person_box_get,
             commands::anchor::anchor_cover_person_box_set,
             commands::anchor::anchor_record_import_scan,
+            commands::anchor::anchor_record_import_attach_srt,
             commands::anchor::anchor_record_import_commit,
             commands::anchor::anchor_clip_subtitle_edit,
             commands::anchor::clip_subtitle_style_get,

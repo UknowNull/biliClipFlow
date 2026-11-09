@@ -690,10 +690,13 @@ pub struct RecordImportItem {
     pub size: u64,
     pub has_srt: bool,
     pub has_danmaku: bool,
-    /// new 新录播 / imported 已导入过 / invalid 解析不了或房间号不符 / overlap 与库里录播时间重叠
+    /// new 新录播 / imported 已导入过 / invalid 无法使用 / overlap 与库里录播时间重叠
+    /// / needs_manual 文件名解析不出时间，需用户补填
     pub status: String,
     pub reason: Option<String>,
     pub overlaps: Vec<RecordOverlap>,
+    /// 从文件名推测出的开始时间（解析失败时可能仍能猜出，供手动补填页预填）
+    pub guessed_start: Option<String>,
 }
 
 /// 解析录播文件名：录制-房间号-日期-时间[-毫秒]-标题。
@@ -714,6 +717,23 @@ fn parse_record_file_name(stem: &str) -> Option<(String, DateTime<Utc>, String)>
     };
     let title = parts[if ms.is_some() { 4 } else { 3 }..].join("-");
     Some((parts[0].to_string(), start, title))
+}
+
+/// 只能从文件名里猜出开始时间时的宽松解析（房间号取自当前导入的主播）。
+/// 支持 20261108-192826-标题 / 20261108_192826_标题 / 2026-11-08-19-28-26-标题。
+/// 这类文件名多由第三方工具生成，按北京时间解释。
+fn guess_record_start(stem: &str) -> Option<DateTime<Utc>> {
+    let beijing = chrono::FixedOffset::east_opt(8 * 3600)?;
+    let digits: String = stem.chars().take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '_').collect();
+    let compact: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
+    // 14 位：yyyymmddHHMMSS
+    if compact.len() >= 14 {
+        let (date, time) = compact.split_at(14);
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&format!("{}{}", date, time), "%Y%m%d%H%M%S") {
+            return naive.and_local_timezone(beijing).single().map(|dt| dt.with_timezone(&Utc));
+        }
+    }
+    None
 }
 
 /// 扫描目录里的录播（mp4/flv），识别同名字幕和弹幕，检查是否已导入或与库里录播时间重叠。只读，不写库
@@ -754,11 +774,25 @@ pub async fn anchor_record_import_scan(state: State<'_, AppState>, room_id: Stri
                 status: "new".into(),
                 reason: None,
                 overlaps: Vec::new(),
+                guessed_start: None,
             };
             let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             let Some((room, start, title)) = parse_record_file_name(&stem) else {
-                item.status = "invalid".into();
-                item.reason = Some("文件名里解析不出房间号和开始时间".into());
+                // 解析不出标准格式：若还能猜到开始时间，交给用户补填标题后导入
+                if let Some(start) = guess_record_start(&stem) {
+                    let duration = probe_duration_seconds(&path_str).unwrap_or(0);
+                    item.status = "needs_manual".into();
+                    item.reason = Some("文件名缺少房间号，请确认开始时间与标题".into());
+                    item.guessed_start = Some(start.to_rfc3339());
+                    item.start_time = start.to_rfc3339();
+                    item.duration = duration;
+                    if duration > 0 {
+                        item.end_time = (start + Duration::seconds(duration)).to_rfc3339();
+                    }
+                } else {
+                    item.status = "invalid".into();
+                    item.reason = Some("文件名里解析不出房间号和开始时间".into());
+                }
                 items.push(item);
                 continue;
             };
@@ -820,6 +854,38 @@ pub struct RecordImportEntry {
     pub start_time: String,
     pub end_time: String,
     pub size: i64,
+}
+
+/// 为指定视频补上字幕：把用户选的 SRT 文件复制到视频旁边并改成同名，
+/// 分析与评阅都按「视频同名 .srt」查找字幕，因此无需改其他逻辑。
+#[tauri::command]
+pub fn anchor_record_import_attach_srt(
+    video_path: String,
+    srt_path: String,
+) -> ApiResponse<String> {
+    match copy_srt_beside_video(Path::new(video_path.trim()), Path::new(srt_path.trim())) {
+        Ok(target) => ApiResponse::success(target),
+        Err(err) => ApiResponse::error(err),
+    }
+}
+
+/// 把 SRT 复制到视频旁边并改成同名。返回目标路径。
+fn copy_srt_beside_video(video: &Path, srt: &Path) -> Result<String, String> {
+    if !video.is_file() {
+        return Err("视频文件不存在".to_string());
+    }
+    if !srt.is_file() {
+        return Err("字幕文件不存在".to_string());
+    }
+    if srt.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() != Some("srt") {
+        return Err("请选择 .srt 字幕文件".to_string());
+    }
+    let target = video.with_extension("srt");
+    if target.exists() {
+        return Err(format!("目标位置已存在同名字幕：{}", target.to_string_lossy()));
+    }
+    std::fs::copy(srt, &target).map_err(|err| format!("复制字幕失败: {}", err))?;
+    Ok(target.to_string_lossy().to_string())
 }
 
 /// 登记导入的录播：先删除要替换的旧记录（只删记录，不删文件），再写入新记录；同一文件已登记过则跳过。返回新登记的段数
@@ -1960,6 +2026,41 @@ mod tests {
         assert_eq!(start.to_rfc3339(), "2026-10-28T04:40:06.263+00:00");
         let (_, start, title) = parse_record_file_name("录制-25034104-20261024-110010-大唐创业史0.0").unwrap();
         assert_eq!((start.to_rfc3339().as_str(), title.as_str()), ("2026-10-24T11:00:10+00:00", "大唐创业史0.0"));
+    }
+
+    #[test]
+    fn copies_srt_beside_video_with_matching_name() {
+        let root = std::env::temp_dir().join(format!("srt_attach_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let video = root.join("20261108-192826-柚恩不加糖.mp4");
+        let srt = root.join("字幕文件.srt");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&srt, b"1\n00:00:00,000 --> 00:00:01,000\nhi\n").unwrap();
+
+        let target = copy_srt_beside_video(&video, &srt).unwrap();
+        assert_eq!(Path::new(&target), video.with_extension("srt"));
+        assert!(video.with_extension("srt").is_file(), "应生成与视频同名的 srt");
+
+        // 已存在同名 srt 时拒绝覆盖
+        let err = copy_srt_beside_video(&video, &srt).unwrap_err();
+        assert!(err.contains("已存在"), "{}", err);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn guesses_start_time_from_third_party_names() {
+        // 用户实际格式：日期-时间-主播名-标题
+        let start = guess_record_start("20261108-192826-柚恩不加糖-【2D】新三正篇完结回！").unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-11-08T11:28:26+00:00");
+        // 下划线分隔
+        let start = guess_record_start("20261108_192826_标题").unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-11-08T11:28:26+00:00");
+        // 标准日期格式
+        let start = guess_record_start("2026-11-08-19-28-26-标题").unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-11-08T11:28:26+00:00");
+        // 无法识别
+        assert!(guess_record_start("随便一个名字").is_none());
     }
 
     /// 回归：全局自动切片开关必须在连接锁外读取。
