@@ -29,3 +29,10 @@ docs
 src-tauri/target*/
 *.db
 *.sqlite3
+
+# 本地备份与临时调试脚本
+src-tauri/bin/**/*.bak.*
+scripts/check_db.py
+scripts/cleanup_copied_tasks.py
+scripts/copy_tasks.py
+scripts/fix_live_blackscreen.py
