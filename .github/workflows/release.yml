@@ -38,6 +38,13 @@ jobs:
           echo "Version synced from tag: ${RAW_TAG} -> ${VERSION}"
       - name: Install dependencies
         run: pnpm install
+      # sherpa-onnx-sys 构建需从 GitHub Releases 下载静态库，偶发 504 会中断打包，
+      # 缓存解压后的库目录以跳过重复下载。
+      - name: Cache sherpa-onnx prebuilt libs
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/target/sherpa-onnx-prebuilt
+          key: sherpa-onnx-${{ runner.os }}-${{ runner.arch }}-v1.13.8
       - name: Build DMG
         run: pnpm tauri build --bundles dmg
       - name: Add installation instructions
