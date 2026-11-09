@@ -47,9 +47,25 @@ const stateOf = (clip) => MARK_STATE[String(clip.mark || "PENDING").toUpperCase(
 // 识别分段可能长达几十秒：按标点和长度切成 SRT 式短句，按字数比例估算每句起止，画面字幕和字幕栏都用它
 const CUE_MAX_CHARS = 18;
 const PUNCT_TAIL = /[。！？!?；;，,、：:“”"‘’'（）()…—]+$/;
+// 按标点切句并保留标点。不用后行断言 (?<=...)：旧版 WebKit 不支持该语法，
+// 会让整个模块加载失败、评阅页白屏（打包后在低版本 macOS 上出现过）。
+const CUE_SPLIT_PUNCT = "。！？!?；;，,、";
+const splitByPunct = (text) => {
+  const parts = [];
+  let current = "";
+  for (const ch of String(text || "")) {
+    current += ch;
+    if (CUE_SPLIT_PUNCT.includes(ch)) {
+      parts.push(current);
+      current = "";
+    }
+  }
+  if (current) parts.push(current);
+  return parts;
+};
+
 const splitParts = (text) =>
-  String(text || "")
-    .split(/(?<=[。！？!?；;，,、])/)
+  splitByPunct(text)
     .flatMap((p) => {
       const out = [];
       for (let i = 0; i < p.length; i += CUE_MAX_CHARS) out.push(p.slice(i, i + CUE_MAX_CHARS));
