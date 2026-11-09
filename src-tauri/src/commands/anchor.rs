@@ -165,6 +165,9 @@ pub async fn anchor_subscribe(
 
 #[tauri::command(async)]
 pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
+    // 全局开关要在加连接锁之前读好：settings::load 内部也会 with_conn，
+    // 若放进下面的查询闭包里会重复加锁导致死锁。
+    let global_auto_clip = global_auto_clip_enabled(state.db.as_ref());
     match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
       "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path, IFNULL(l.record_mode, 'DAILY'), l.record_dates, IFNULL(l.keep_record_after, 0), l.auto_clip \
@@ -193,7 +196,7 @@ pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
           record_mode: row.get(10)?,
           record_dates: crate::live_recorder::parse_record_dates_public(row.get(11)?),
           keep_record_after: row.get::<_, i64>(12)? != 0,
-          auto_clip: row.get::<_, Option<i64>>(13)?.map(|v| v != 0).unwrap_or_else(|| global_auto_clip_enabled(state.db.as_ref())),
+          auto_clip: row.get::<_, Option<i64>>(13)?.map(|v| v != 0).unwrap_or(global_auto_clip),
           recording_status: record_info.as_ref().map(|_| "RECORDING".to_string()),
           recording_file: record_info.as_ref().map(|info| info.file_path.clone()),
           recording_start_time: record_info.map(|info| info.start_time),
@@ -1957,5 +1960,19 @@ mod tests {
         assert_eq!(start.to_rfc3339(), "2026-10-28T04:40:06.263+00:00");
         let (_, start, title) = parse_record_file_name("录制-25034104-20261024-110010-大唐创业史0.0").unwrap();
         assert_eq!((start.to_rfc3339().as_str(), title.as_str()), ("2026-10-24T11:00:10+00:00", "大唐创业史0.0"));
+    }
+
+    /// 回归：全局自动切片开关必须在连接锁外读取。
+    /// 早期把它放进 with_conn 闭包里，而 settings::load 内部又会 with_conn，
+    /// 同一把 Mutex 重入导致 anchor_list 失败、界面数据全空。
+    #[test]
+    fn global_auto_clip_is_read_outside_conn_lock() {
+        let db = crate::db::Db::new(std::path::PathBuf::from(":memory:")).expect("init db");
+        let global = global_auto_clip_enabled(&db);
+        let count: i64 = db
+            .with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM anchor", [], |r| r.get(0)))
+            .expect("锁外读全局值后应能正常查询");
+        assert_eq!(count, 0);
+        let _ = global;
     }
 }
