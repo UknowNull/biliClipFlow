@@ -1,6 +1,7 @@
 import { Component } from "react";
+import { brief, clientLog } from "../lib/clientLog";
 
-/** 渲染出错时显示堆栈而不是白屏，便于定位前端崩溃 */
+/** 渲染出错时显示堆栈而不是白屏，并把错误写进后端日志便于远程排查 */
 export default class ErrorBoundary extends Component {
   state = { error: null, info: null };
 
@@ -11,6 +12,10 @@ export default class ErrorBoundary extends Component {
   componentDidCatch(error, info) {
     this.setState({ info });
     console.error("渲染崩溃:", error, info?.componentStack);
+    // 写进后端日志：用户只需把 auth_debug.log 发回来即可定位
+    void clientLog(
+      `render_crash error=${brief(error?.message || String(error))} stack=${brief(error?.stack || "", 2000)} componentStack=${brief(info?.componentStack || "", 2000)}`,
+    );
   }
 
   render() {

@@ -3,6 +3,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { confirm as dialogConfirm } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../../lib/tauri";
 import { SubtitleOverlay, SubtitleStylePanel, useSubtitleStyle } from "./SubtitleStyle";
+import { brief, clientLog } from "../../lib/clientLog";
 import CoverEditor from "./CoverEditor";
 
 // 字幕上下文：片段前后各显示多少秒
@@ -146,6 +147,8 @@ export default function ClipReviewView({ anchor, session, onBack, onSubmitClip, 
   const loadClips = async () => {
     const data = await invokeCommand("anchor_clip_list", { roomId: anchor.uid, recordIds });
     const items = data?.items ?? [];
+    // 记录返回结构，便于排查打包环境下的数据异常
+    void clientLog(`clips_loaded count=${items.length} first=${brief(items[0])}`);
     setClips(items);
     return items;
   };
@@ -153,28 +156,59 @@ export default function ClipReviewView({ anchor, session, onBack, onSubmitClip, 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
+    void clientLog(`load_start room=${anchor.uid} recordIds=${brief(recordIds)}`);
     Promise.all([
-      loadClips(),
-      invokeCommand("anchor_clip_session_context", { roomId: anchor.uid, recordIds, includeTranscript: true }).catch((err) => {
-        setMessage(err?.message || "读取字幕失败");
-        return null;
+      loadClips().catch((err) => {
+        void clientLog(`clips_load_fail err=${brief(err?.message || err)} stack=${brief(err?.stack || "", 1000)}`);
+        throw err;
       }),
+      invokeCommand("anchor_clip_session_context", { roomId: anchor.uid, recordIds, includeTranscript: true })
+        .then((context) => {
+          void clientLog(
+            `context_loaded files=${context?.files?.length ?? "N/A"} segments=${context?.segments?.length ?? "N/A"} heat=${context?.heat?.length ?? "N/A"} sample=${brief(context?.segments?.[0])}`,
+          );
+          return context;
+        })
+        .catch((err) => {
+          void clientLog(`context_load_fail err=${brief(err?.message || err)} stack=${brief(err?.stack || "", 1000)}`);
+          setMessage(err?.message || "读取字幕失败");
+          return null;
+        }),
     ])
       .then(([items, context]) => {
         if (cancelled) return;
         if (context) setCtx(context);
         const first = [...items].sort((a, b) => (b.score || 0) - (a.score || 0)).find((c) => stateOf(c) === "todo") || items[0];
         if (first) {
+          void clientLog(`selected first=${brief(first)}`);
           setSelId(first.id);
           setT(first.startOffset);
+        } else {
+          void clientLog("no_clip_available");
         }
       })
-      .catch((err) => setMessage(err?.message || "读取切片失败"))
-      .finally(() => !cancelled && setLoading(false));
+      .catch((err) => {
+        void clientLog(`load_fail err=${brief(err?.message || err)} stack=${brief(err?.stack || "", 1200)}`);
+        setMessage(err?.message || "读取切片失败");
+      })
+      .finally(() => {
+        if (!cancelled) {
+          void clientLog("load_done");
+          setLoading(false);
+        }
+      });
     return () => {
       cancelled = true;
     };
   }, [anchor.uid, recordIds.join(",")]);
+
+  // 进入渲染前记录一次数据形态：崩溃时能对照日志确认哪项异常
+  useEffect(() => {
+    if (loading) return;
+    void clientLog(
+      `render_prepare clips=${clips.length} files=${ctx.files?.length ?? "N/A"} segments=${ctx.segments?.length ?? "N/A"} heat=${ctx.heat?.length ?? "N/A"} selId=${selId ?? "N/A"} ctxKeys=${brief(Object.keys(ctx || {}))} clip=${brief(clips.find((c) => c.id === selId))}`,
+    );
+  }, [loading, selId]);
 
   // 有切片在重新剪辑时轮询状态
   const reclipping = clips.some((c) => String(c.status).toUpperCase() === "RUNNING");
