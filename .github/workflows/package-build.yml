@@ -77,6 +77,14 @@ jobs:
       - name: Install deps
         run: pnpm install
 
+      # sherpa-onnx-sys 构建时要从 GitHub Releases 下载约 100MB 静态库，
+      # 该地址偶发 504 会让整个打包失败。缓存解压后的库目录，命中后不再下载。
+      - name: Cache sherpa-onnx prebuilt libs
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/target/sherpa-onnx-prebuilt
+          key: sherpa-onnx-${{ runner.os }}-${{ runner.arch }}-v1.13.8
+
       - name: Fetch bins (Windows x64)
         if: matrix.os == 'windows-latest'
         run: $env:BIN_DOWNLOAD="1"; pnpm run install-bins
