@@ -129,6 +129,40 @@ pub fn anchor_clip_profile_set(state: State<'_, AppState>, room_id: String, prof
     }
 }
 
+#[tauri::command(async)]
+pub fn anchor_auto_clip_set(
+    state: State<'_, AppState>,
+    room_id: String,
+    enabled: bool,
+) -> ApiResponse<bool> {
+    let now = now_rfc3339();
+    let room = room_id.trim().to_string();
+    let result = state.db.with_conn(move |c| {
+        if enabled {
+            // 只在从未开启过时记录起始时间，重复保存不刷新，避免推迟已等待的场次
+            c.execute(
+                "INSERT INTO live_room_settings (room_id, auto_clip, auto_clip_since, update_time) \
+                 VALUES (?1, 1, ?2, ?2) \
+                 ON CONFLICT(room_id) DO UPDATE SET \
+                   auto_clip = 1, \
+                   auto_clip_since = COALESCE(live_room_settings.auto_clip_since, excluded.auto_clip_since), \
+                   update_time = excluded.update_time",
+                (&room, &now),
+            )
+        } else {
+            c.execute(
+                "INSERT INTO live_room_settings (room_id, auto_clip, update_time) VALUES (?1, 0, ?2) \
+                 ON CONFLICT(room_id) DO UPDATE SET auto_clip = 0, update_time = excluded.update_time",
+                (&room, &now),
+            )
+        }
+    });
+    match result {
+        Ok(_) => ApiResponse::success(enabled),
+        Err(err) => ApiResponse::error(format!("保存自动切片设置失败: {}", err)),
+    }
+}
+
 const VOICEPRINT_SECS: f64 = 120.0;
 
 /// 房间主播声纹登记情况：未登记时返回 None，已登记返回来源说明

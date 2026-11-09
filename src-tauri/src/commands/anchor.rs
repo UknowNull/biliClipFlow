@@ -42,9 +42,16 @@ pub struct Anchor {
     pub record_mode: String,
     pub record_dates: Vec<String>,
     pub keep_record_after: bool,
+    /// 该主播是否开启自动切片（主播级设置，未设置时回落到全局开关）
+    pub auto_clip: bool,
     pub recording_status: Option<String>,
     pub recording_file: Option<String>,
     pub recording_start_time: Option<String>,
+}
+
+/// 全局自动切片开关，用于主播未单独设置时的回落值
+fn global_auto_clip_enabled(db: &crate::db::Db) -> bool {
+    crate::highlight::settings::load(db).clip.enabled
 }
 
 struct AnchorLiveInfo {
@@ -160,7 +167,7 @@ pub async fn anchor_subscribe(
 pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
     match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path, IFNULL(l.record_mode, 'DAILY'), l.record_dates, IFNULL(l.keep_record_after, 0) \
+      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path, IFNULL(l.record_mode, 'DAILY'), l.record_dates, IFNULL(l.keep_record_after, 0), l.auto_clip \
        FROM anchor a LEFT JOIN live_room_settings l ON a.uid = l.room_id ORDER BY a.id DESC",
     )?;
     let anchors = stmt
@@ -186,6 +193,7 @@ pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
           record_mode: row.get(10)?,
           record_dates: crate::live_recorder::parse_record_dates_public(row.get(11)?),
           keep_record_after: row.get::<_, i64>(12)? != 0,
+          auto_clip: row.get::<_, Option<i64>>(13)?.map(|v| v != 0).unwrap_or_else(|| global_auto_clip_enabled(state.db.as_ref())),
           recording_status: record_info.as_ref().map(|_| "RECORDING".to_string()),
           recording_file: record_info.as_ref().map(|info| info.file_path.clone()),
           recording_start_time: record_info.map(|info| info.start_time),
@@ -1476,9 +1484,10 @@ pub async fn anchor_check(state: State<'_, AppState>) -> Result<ApiResponse<Vec<
         app_log_path: state.app_log_path.clone(),
         live_runtime: state.live_runtime.clone(),
     };
+    let global = global_auto_clip_enabled(state.db.as_ref());
     let anchors = match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path, IFNULL(l.record_mode, 'DAILY'), l.record_dates, IFNULL(l.keep_record_after, 0) \
+      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path, IFNULL(l.record_mode, 'DAILY'), l.record_dates, IFNULL(l.keep_record_after, 0), l.auto_clip \
        FROM anchor a LEFT JOIN live_room_settings l ON a.uid = l.room_id ORDER BY a.id DESC",
     )?;
     let list = stmt
@@ -1501,6 +1510,7 @@ pub async fn anchor_check(state: State<'_, AppState>) -> Result<ApiResponse<Vec<
           record_mode: row.get(10)?,
           record_dates: crate::live_recorder::parse_record_dates_public(row.get(11)?),
           keep_record_after: row.get::<_, i64>(12)? != 0,
+          auto_clip: row.get::<_, Option<i64>>(13)?.map(|v| v != 0).unwrap_or(global),
           recording_status: None,
           recording_file: None,
           recording_start_time: None,
@@ -1560,6 +1570,7 @@ pub async fn anchor_check(state: State<'_, AppState>) -> Result<ApiResponse<Vec<
             record_mode: anchor.record_mode,
             record_dates: anchor.record_dates,
             keep_record_after: anchor.keep_record_after,
+            auto_clip: anchor.auto_clip,
             recording_status: record_info.as_ref().map(|_| "RECORDING".to_string()),
             recording_file: record_info.as_ref().map(|info| info.file_path.clone()),
             recording_start_time: record_info.map(|info| info.start_time),

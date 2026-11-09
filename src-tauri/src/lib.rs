@@ -280,6 +280,7 @@ pub fn run() {
             commands::auto_clip::auto_clip_llm_models,
             commands::auto_clip::auto_clip_asr_status,
             commands::auto_clip::auto_clip_asr_download,
+            commands::auto_clip::anchor_auto_clip_set,
             commands::auto_clip::auto_clip_asr_import_package,
             commands::auto_clip::auto_clip_asr_download_package,
             commands::live::live_record_start,

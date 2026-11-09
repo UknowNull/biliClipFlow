@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use rusqlite::OptionalExtension;
 use futures_util::stream::{self, StreamExt};
 use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -1055,12 +1056,53 @@ fn insert_item(db: &Db, task_id: i64, room_id: &str, seg: &LiveRecordSegment, ou
     });
 }
 
+/// 主播自动切片的生效状态：Some(since) 表示按主播设置启用，零点表示沿用全局，
+/// None 表示未启用。`since` 用于跳过开启之前结束的场次。
+fn room_auto_clip_state(
+    db: &crate::db::Db,
+    room_id: &str,
+    global_enabled: bool,
+    global_since: Option<DateTime<Utc>>,
+) -> Option<Option<DateTime<Utc>>> {
+    let row: Option<(Option<i64>, Option<String>)> = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT auto_clip, auto_clip_since FROM live_room_settings WHERE room_id = ?1",
+                [room_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+        })
+        .ok()
+        .flatten();
+    match row {
+        // 主播单独设置过：开就用自己的起始时间（可能为空，表示从最早算）
+        Some((Some(flag), since)) => {
+            if flag == 0 {
+                return None;
+            }
+            let parsed = since
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc));
+            Some(parsed)
+        }
+        // 没设置过：跟随全局
+        _ => {
+            if global_enabled {
+                Some(global_since)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// 扫描最近几天已结束的场次，为尚未处理的场次创建自动切片任务
 fn auto_trigger(ctx: &ClipContext) -> Result<(), String> {
     let cfg = settings::load(&ctx.db);
-    if !cfg.clip.enabled {
-        return Ok(());
-    }
+    // 全局开关关闭时仍需扫描：主播可能单独开启了自动切片
+    let global_enabled = cfg.clip.enabled;
     let now = Utc::now();
     let since = (now - ChronoDuration::days(AUTO_LOOKBACK_DAYS)).to_rfc3339();
     let rows: Vec<(i64, String, String, String, Option<String>, Option<String>)> = ctx
@@ -1101,8 +1143,22 @@ fn auto_trigger(ctx: &ClipContext) -> Result<(), String> {
     let enabled_since = parse(&cfg.clip.enabled_since).unwrap_or(now);
     for (room, ids, ready, last_end) in sessions {
         let key = format!("{}:{}", room, ids[0]);
-        if !ready || now - last_end <= gap || last_end < enabled_since || existing.contains(&key) {
+        if !ready || now - last_end <= gap || existing.contains(&key) {
             continue;
+        }
+        let Some(room_since) = room_auto_clip_state(
+            &ctx.db,
+            &room,
+            global_enabled,
+            Some(enabled_since),
+        ) else {
+            continue;
+        };
+        // 只处理开启之后结束的场次，避免开启瞬间回溯分析历史录播
+        if let Some(since) = room_since {
+            if last_end < since {
+                continue;
+            }
         }
         let id = create_task(&ctx.db, &room, &ids, "AUTO", Some(&key))?;
         append_log(&ctx.app_log_path, &format!("auto_clip_task_created task_id={} session={} records={}", id, key, ids.len()));
@@ -1113,6 +1169,57 @@ fn auto_trigger(ctx: &ClipContext) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 主播级开关：未设置时跟随全局，设置后以主播为准
+    #[test]
+    fn room_auto_clip_follows_global_when_absent() {
+        let db = crate::db::Db::new(std::path::PathBuf::from(":memory:")).expect("init db");
+        let global_since = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 全局关、主播未设置 → 不启用
+        assert!(room_auto_clip_state(&db, "room1", false, None).is_none());
+        // 全局开、主播未设置 → 跟随全局并沿用全局起始时间
+        let state = room_auto_clip_state(&db, "room1", true, Some(global_since)).unwrap();
+        assert_eq!(state, Some(global_since));
+    }
+
+    #[test]
+    fn room_auto_clip_overrides_global() {
+        let db = crate::db::Db::new(std::path::PathBuf::from(":memory:")).expect("init db");
+        let global_since = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // 全局关但主播单独开启：按主播设置启用，起始时间取主播自己的
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO live_room_settings (room_id, auto_clip, auto_clip_since, update_time) \
+                 VALUES ('room1', 1, '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z')",
+                [],
+            )
+        })
+        .unwrap();
+        let state = room_auto_clip_state(&db, "room1", false, None).unwrap();
+        assert_eq!(
+            state,
+            Some(
+                DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+
+        // 全局开但主播单独关闭：不启用
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE live_room_settings SET auto_clip = 0 WHERE room_id = 'room1'",
+                [],
+            )
+        })
+        .unwrap();
+        assert!(room_auto_clip_state(&db, "room1", true, Some(global_since)).is_none());
+    }
 
     #[test]
     fn transcript_for_llm_uses_subtitle_edits() {

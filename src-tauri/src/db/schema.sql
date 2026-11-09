@@ -456,7 +456,9 @@ CREATE TABLE IF NOT EXISTS live_room_settings (
   keep_record_after INTEGER NOT NULL DEFAULT 0,
   update_time TEXT NOT NULL,
   clip_profile TEXT NOT NULL DEFAULT 'reaction',
-  voiceprint TEXT
+  voiceprint TEXT,
+  auto_clip INTEGER,
+  auto_clip_since TEXT
 );
 
 CREATE TABLE IF NOT EXISTS live_record_task (

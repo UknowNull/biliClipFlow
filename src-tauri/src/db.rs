@@ -301,6 +301,16 @@ impl Db {
             [],
         );
         let _ = conn.execute("ALTER TABLE live_room_settings ADD COLUMN voiceprint TEXT", []);
+        // 主播级自动切片开关；为空时沿用全局设置。auto_clip_since 记录开启时间，
+        // 避免刚开启就把历史录播全部回溯分析。
+        let _ = conn.execute(
+            "ALTER TABLE live_room_settings ADD COLUMN auto_clip INTEGER",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE live_room_settings ADD COLUMN auto_clip_since TEXT",
+            [],
+        );
         let _ = conn.execute(
             "ALTER TABLE live_record_task ADD COLUMN remux_status TEXT",
             [],

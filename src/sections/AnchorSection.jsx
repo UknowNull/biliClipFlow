@@ -521,6 +521,19 @@ export default function AnchorSection({ onFullPageChange }) {
     }
   };
 
+  const handleAutoClipToggle = async (anchor) => {
+    setMessage("");
+    try {
+      await invokeCommand("anchor_auto_clip_set", {
+        roomId: anchor.uid,
+        enabled: !anchor.autoClip,
+      });
+      await loadAnchors();
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
   const handleSyncToggle = async (anchor) => {
     setMessage("");
     if (!anchor.baiduSyncEnabled && !anchor.baiduSyncPath) {
@@ -1645,91 +1658,102 @@ export default function AnchorSection({ onFullPageChange }) {
               ) : (
                 <div className="mt-3 text-xs text-[var(--muted)]">当前未开播</div>
               )}
-              <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
-                <span>自动录制：{anchor.autoRecord ? "已开启" : "已关闭"}</span>
-                <button
-                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                  onClick={() => handleAutoRecordToggle(anchor)}
-                >
-                  {anchor.autoRecord ? "关闭" : "开启"}
-                </button>
-                <button
-                  className="cursor-pointer"
-                  onClick={() => handleOpenRecordConfig(anchor)}
-                >
-                  {renderRecordDateBadge(anchor)}
-                </button>
-                <span>同步上传：{anchor.baiduSyncEnabled ? "已开启" : "未开启"}</span>
-                <button
-                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                  onClick={() => handleSyncToggle(anchor)}
-                >
-                  {anchor.baiduSyncEnabled ? "关闭" : "开启"}
-                </button>
-                {anchor.baiduSyncEnabled && anchor.baiduSyncPath ? (
-                  <span>同步路径：{anchor.baiduSyncPath}</span>
-                ) : null}
-                <span>上次检查：{formatDateTime(anchor.lastCheckTime)}</span>
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2">
-                {anchor.recordingStatus ? (
-                  <button
-                    className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)]"
-                    onClick={() => handleStopRecord(anchor)}
-                  >
-                    停止录制
-                  </button>
-                ) : (
-                  <button
-                    className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)]"
-                    onClick={() => handleStartRecord(anchor)}
-                  >
-                    开始录制
-                  </button>
-                )}
-                <button
-                  className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)]"
-                  onClick={() => handleOpenRecordView(anchor)}
-                >
-                  录播管理
-                </button>
-                <button
-                  className="rounded-full bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:brightness-110"
-                  onClick={() => handleOpenRecordConfig(anchor)}
-                >
-                  录制日期
-                </button>
-                <button
-                  className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)]"
-                  onClick={() => handleOpenSubmissionConfig(anchor)}
-                >
-                  投稿配置
-                </button>
-                <button
-                  className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)]"
-                  onClick={() => handleUnsubscribe(anchor)}
-                >
-                  取消订阅
-                </button>
-                {anchor.baiduSyncEnabled ? (
-                  <button
-                    className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)]"
-                    onClick={() => handleOpenSyncConfig(anchor)}
-                  >
-                    同步配置
-                  </button>
-                ) : null}
-              </div>
-              {anchor.recordingFile ? (
-                <div className="mt-2 text-xs text-[var(--muted)]">
-                  当前文件：{anchor.recordingFile}
+              <div className="mt-3 grid gap-4 sm:grid-cols-[168px_minmax(0,1fr)]">
+                <div className="space-y-2.5 border-t border-black/5 pt-3 sm:border-t-0 sm:border-r sm:pt-0 sm:pr-4">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">自动化</div>
+                  {[
+                    ["自动录制", anchor.autoRecord, () => handleAutoRecordToggle(anchor)],
+                    ["自动切片", anchor.autoClip, () => handleAutoClipToggle(anchor)],
+                    ["同步上传", anchor.baiduSyncEnabled, () => handleSyncToggle(anchor)],
+                  ].map(([label, on, toggle]) => (
+                    <div key={label} className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-[var(--ink)]">{label}</span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={on}
+                        aria-label={label}
+                        className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
+                          on ? "bg-[var(--accent)]" : "bg-black/15"
+                        }`}
+                        onClick={toggle}
+                      >
+                        <span
+                          className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                            on ? "translate-x-5" : "translate-x-0"
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ) : null}
-              {anchor.recordingStartTime ? (
-                <div className="mt-1 text-xs text-[var(--muted)]">
-                  开始时间：{formatDateTime(anchor.recordingStartTime)}
+                <div className="space-y-2.5 border-t border-black/5 pt-3 sm:border-t-0 sm:pt-0">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">操作</div>
+                  <div className="flex flex-wrap gap-2">
+                    {anchor.recordingStatus ? (
+                      <button
+                        className="rounded-full bg-[#B42318] px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:brightness-110"
+                        onClick={() => handleStopRecord(anchor)}
+                      >
+                        停止录制
+                      </button>
+                    ) : (
+                      <button
+                        className="rounded-full bg-[#1F7A45] px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:brightness-110"
+                        onClick={() => handleStartRecord(anchor)}
+                      >
+                        开始录制
+                      </button>
+                    )}
+                    <button
+                      className="rounded-full border border-[#1F5BD8]/30 bg-[#EEF3FF] px-3 py-1.5 text-xs font-semibold text-[#1F4FB8] transition hover:border-[#1F5BD8]/50"
+                      onClick={() => handleOpenRecordView(anchor)}
+                    >
+                      录播管理
+                    </button>
+                    <button
+                      className="rounded-full border border-[#9A4A0C]/25 bg-[#FFF3E6] px-3 py-1.5 text-xs font-semibold text-[#9A4A0C] transition hover:border-[#9A4A0C]/45"
+                      onClick={() => handleOpenRecordConfig(anchor)}
+                    >
+                      录制日期
+                    </button>
+                    <button
+                      className="rounded-full border border-[#1F7A45]/30 bg-[#E8F5EE] px-3 py-1.5 text-xs font-semibold text-[#1F7A45] transition hover:border-[#1F7A45]/50"
+                      onClick={() => handleOpenSubmissionConfig(anchor)}
+                    >
+                      投稿配置
+                    </button>
+                    {anchor.baiduSyncEnabled ? (
+                      <button
+                        className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[#5B6170] transition hover:border-black/20"
+                        onClick={() => handleOpenSyncConfig(anchor)}
+                      >
+                        同步配置
+                      </button>
+                    ) : null}
+                    <button
+                      className="rounded-full border border-[#B42318]/25 bg-white px-3 py-1.5 text-xs font-semibold text-[#B42318] transition hover:border-[#B42318]/45"
+                      onClick={() => handleUnsubscribe(anchor)}
+                    >
+                      取消订阅
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[var(--muted)]">
+                    <button className="cursor-pointer hover:text-[var(--ink)]" onClick={() => handleOpenRecordConfig(anchor)}>
+                      {renderRecordDateBadge(anchor)}
+                    </button>
+                    <span>上次检查 {formatDateTime(anchor.lastCheckTime)}</span>
+                  </div>
+                  {anchor.recordingFile ? (
+                    <div className="text-xs text-[var(--muted)]">当前文件：{anchor.recordingFile}</div>
+                  ) : null}
+                  {anchor.recordingStartTime ? (
+                    <div className="text-xs text-[var(--muted)]">
+                      开始时间：{formatDateTime(anchor.recordingStartTime)}
+                    </div>
+                  ) : null}
                 </div>
-              ) : null}
+              </div>
             </div>
           ))}
         </div>
