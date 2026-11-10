@@ -243,15 +243,27 @@ export default function ClipReviewView({ anchor, session, onBack, onSubmitClip, 
   const segCuesOf = (seg) => (seg.cues ? seg.cues.map((c) => ({ ...c })) : toCues([seg]).map((c) => ({ start: c.start, end: c.end, text: c.text })));
   const indexIn = (list, cue) => list.findIndex((x) => Math.abs(x.start - cue.start) < 0.001);
   const round2 = (v) => Math.round(v * 100) / 100;
-  // 按逐句保存一个分段（列表为空表示这段字幕全删了）
-  const saveSegCues = async (seg, list) => {
+  // 按逐句保存一个分段（列表为空表示这段字幕全删了）。
+  // 只发请求，返回更新后的 segment，由调用方决定何时套用到 state
+  const persistSegCues = async (seg, list) => {
     const clean = list.filter((c) => c.text.trim() && c.end > c.start).sort((a, b) => a.start - b.start);
     await invokeCommand("anchor_clip_subtitle_edit", { roomId: anchor.uid, recordIds, key: seg.key, text: "", cues: clean });
     const orig = seg.orig ?? seg.text;
+    return { key: seg.key, cues: clean, text: clean.map((c) => c.text.trim()).join("，"), orig };
+  };
+  const applySegCues = (updates) => {
+    if (!updates.length) return;
+    const byKey = new Map(updates.map((u) => [u.key, u]));
     setCtx((prev) => ({
       ...prev,
-      segments: prev.segments.map((s) => (s.key !== seg.key ? s : { ...s, cues: clean, text: clean.map((c) => c.text.trim()).join("，"), orig })),
+      segments: prev.segments.map((s) => {
+        const u = byKey.get(s.key);
+        return u ? { ...s, cues: u.cues, text: u.text, orig: u.orig } : s;
+      }),
     }));
+  };
+  const saveSegCues = async (seg, list) => {
+    applySegCues([await persistSegCues(seg, list)]);
   };
   const deleteCue = async (cue) => {
     if (!(await dialogConfirm(`删除这句字幕？\n${cue.text}`, { title: "删除字幕" }))) return;
@@ -293,7 +305,13 @@ export default function ClipReviewView({ anchor, session, onBack, onSubmitClip, 
     if (next && end > next.start) edit(next, { start: end });
     edit(cue, { start, end });
     try {
-      for (const { seg, list } of changed.values()) await saveSegCues(seg, list);
+      // 先把所有分段存完再一次性更新 state：逐段更新会让面板在中间态闪掉，
+      // 用户得点两次才看到效果
+      const updates = [];
+      for (const { seg, list } of changed.values()) {
+        updates.push(await persistSegCues(seg, list));
+      }
+      applySegCues(updates);
       setMessage("");
       // 起点变了这句的编号也跟着变，保持时间编辑面板开着，方便连续微调
       setEditing({ key: String(Math.round(start * 1000)), mode: "time" });
