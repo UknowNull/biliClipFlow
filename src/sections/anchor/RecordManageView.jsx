@@ -107,6 +107,9 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
   const [filter, setFilter] = useState("all");
   const [openFiles, setOpenFiles] = useState({});
   const [eventsSession, setEventsSession] = useState(null);
+  // 删除确认弹窗：{ session, deleteClips }
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteClips, setDeleteClips] = useState(false);
   const [message, setMessage] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [profile, setProfile] = useState("reaction");
@@ -188,6 +191,27 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
       await loadSummaries();
     } catch (err) {
       setMessage(err?.message || "创建分析任务失败");
+    }
+  };
+
+  // 删除场次：只删数据库记录和可选切片产物，不动原始录播文件
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    const ids = deleteTarget.records.map((r) => r.id);
+    try {
+      await invokeCommand("anchor_record_delete", {
+        roomId: anchor.uid,
+        recordIds: ids,
+        deleteClips: deleteClips && deleteTarget.task?.clipCount > 0,
+        clipTaskId: deleteTarget.task?.taskId ?? null,
+      });
+      setMessage("已删除");
+      onReload?.();
+    } catch (err) {
+      setMessage(err?.message || "删除失败");
+    } finally {
+      setDeleteTarget(null);
+      setDeleteClips(false);
     }
   };
 
@@ -428,6 +452,16 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                         <button className="h-8 rounded-lg border border-black/10 bg-white px-2.5 text-sm hover:border-black/20" onClick={() => setEventsSession(s)}>
                           弹幕礼物
                         </button>
+                        <button
+                          className="h-8 rounded-lg border border-[#B42318]/25 bg-white px-2.5 text-sm text-[#B42318] hover:border-[#B42318]/45 disabled:opacity-50"
+                          disabled={st === "running"}
+                          onClick={() => {
+                            setDeleteTarget(s);
+                            setDeleteClips(false);
+                          }}
+                        >
+                          删除
+                        </button>
                       </span>
                     </div>
                     {open ? (
@@ -467,6 +501,46 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
           </div>
         )}
       </section>
+      {deleteTarget ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setDeleteTarget(null)}>
+          <div className="w-[440px] rounded-2xl bg-white p-5 text-sm shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="text-base font-semibold text-[var(--ink)]">删除这一场录播</div>
+            <div className="mt-2 text-xs text-[var(--muted)]">
+              {deleteTarget.day} · {deleteTarget.title || "未命名"}
+            </div>
+            <div className="mt-3 rounded-lg bg-[#FFF8EF] px-3 py-2 text-xs text-[#9A4A0C]">
+              只删除软件内的记录，不会删除磁盘上的原始录播文件。
+            </div>
+            {deleteTarget.task?.clipCount > 0 ? (
+              <label className="mt-3 flex items-start gap-2 text-xs text-[var(--ink)]">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={deleteClips}
+                  onChange={(e) => setDeleteClips(e.target.checked)}
+                />
+                <span>
+                  同时删除这一场的 {deleteTarget.task.clipCount} 条切片文件
+                  <span className="block text-[var(--muted)]">不勾选则只删录播记录，切片保留在磁盘上</span>
+                </span>
+              </label>
+            ) : null}
+            {!(deleteTarget.task?.clipCount > 0) ? (
+              <div className="mt-3 text-xs text-[var(--muted)]">
+                {deleteTarget.task ? "这一场还没有分析出切片" : "这一场还没有进行切片分析"}
+              </div>
+            ) : null}
+            <div className="mt-4 flex justify-end gap-2">
+              <button className="h-9 rounded-lg border border-black/10 px-4" onClick={() => setDeleteTarget(null)}>
+                取消
+              </button>
+              <button className="h-9 rounded-lg bg-[#B42318] px-4 font-semibold text-white" onClick={handleDelete}>
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {importOpen ? <ImportRecordsModal anchor={anchor} onClose={() => setImportOpen(false)} onImported={onReload} /> : null}
       {eventsSession ? <SessionEventsModal roomId={anchor.uid} session={eventsSession} onClose={() => setEventsSession(null)} /> : null}
     </div>
