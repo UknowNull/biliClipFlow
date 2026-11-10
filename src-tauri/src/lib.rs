@@ -252,6 +252,7 @@ pub fn run() {
             commands::anchor::anchor_clip_task_status,
             commands::anchor::anchor_clip_update_time,
             commands::anchor::anchor_clip_reclip,
+            commands::anchor::anchor_record_delete,
             commands::anchor::anchor_clip_delete,
             commands::anchor::anchor_clip_list,
             commands::anchor::anchor_clip_mark,

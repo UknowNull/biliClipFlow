@@ -1165,6 +1165,84 @@ pub fn anchor_clip_reclip(state: State<'_, AppState>, clip_id: i64) -> ApiRespon
     ApiResponse::success("已开始重新剪辑".to_string())
 }
 
+/// 删除录播记录。delete_clips 为真时一并删除对应切片任务与切片文件。
+/// clip_task_id 由调用方按场次匹配得到，避免只靠 record_ids 字符串比对。
+/// 只删数据库记录和切片产物，不动原始录播文件。
+#[tauri::command]
+pub fn anchor_record_delete(
+    state: State<'_, AppState>,
+    room_id: String,
+    record_ids: Vec<i64>,
+    delete_clips: bool,
+    clip_task_id: Option<i64>,
+) -> ApiResponse<usize> {
+    let ids = normalize_record_ids(&record_ids);
+    if ids.is_empty() {
+        return ApiResponse::error("未选择要删除的录播");
+    }
+    let room = room_id.trim().to_string();
+    if room.is_empty() {
+        return ApiResponse::error("房间号不能为空");
+    }
+
+    // 需要一并清理的切片文件：先读出来，数据库删完后逐个删
+    let clip_files: Vec<String> = if delete_clips {
+        match clip_task_id {
+            Some(task_id) if task_id > 0 => state
+                .db
+                .with_conn(|conn| {
+                    let mut stmt =
+                        conn.prepare("SELECT file_path FROM live_clip_item WHERE task_id = ?1")?;
+                    let rows = stmt.query_map([task_id], |r| r.get::<_, String>(0))?;
+                    rows.collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let result = state.db.with_conn_mut(|conn| {
+        let tx = conn.transaction()?;
+        for id in &ids {
+            tx.execute(
+                "DELETE FROM live_record_task WHERE id = ?1 AND room_id = ?2",
+                (id, &room),
+            )?;
+        }
+        if let (true, Some(task_id)) = (delete_clips, clip_task_id) {
+            if task_id > 0 {
+                // 只删属于本房间的任务，防止误传 id
+                tx.execute(
+                    "DELETE FROM live_clip_item WHERE task_id = ?1 \
+                     AND task_id IN (SELECT id FROM live_clip_task WHERE room_id = ?2)",
+                    (task_id, &room),
+                )?;
+                tx.execute(
+                    "DELETE FROM live_clip_task WHERE id = ?1 AND room_id = ?2",
+                    (task_id, &room),
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    });
+    if let Err(err) = result {
+        return ApiResponse::error(format!("删除录播失败: {}", err));
+    }
+
+    // 数据库删完后清理切片文件；单个失败不影响整体结果
+    for path in &clip_files {
+        let target = Path::new(path);
+        if target.is_file() {
+            let _ = std::fs::remove_file(target);
+        }
+    }
+
+    ApiResponse::success(ids.len())
+}
+
 #[tauri::command(async)]
 pub fn anchor_clip_delete(state: State<'_, AppState>, clip_id: i64) -> ApiResponse<String> {
     if clip_id <= 0 {
@@ -2046,6 +2124,44 @@ mod tests {
         let err = copy_srt_beside_video(&video, &srt).unwrap_err();
         assert!(err.contains("已存在"), "{}", err);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 删除录播时的 SQL 只作用于指定房间与任务，避免误删其他场次
+    #[test]
+    fn record_delete_scopes_to_room_and_task() {
+        let db = crate::db::Db::new(std::path::PathBuf::from(":memory:")).expect("init db");
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO live_record_task (id, room_id, status, file_path, segment_index, start_time, create_time, update_time) \
+                 VALUES (1, 'roomA', 'STOPPED', '/a.mp4', 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO live_record_task (id, room_id, status, file_path, segment_index, start_time, create_time, update_time) \
+                 VALUES (2, 'roomB', 'STOPPED', '/b.mp4', 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // 只删 roomA 的 1 号
+        db.with_conn(|c| {
+            c.execute(
+                "DELETE FROM live_record_task WHERE id = 1 AND room_id = 'roomA'",
+                [],
+            )
+        })
+        .unwrap();
+
+        let left: Vec<i64> = db
+            .with_conn(|c| {
+                let mut stmt = c.prepare("SELECT id FROM live_record_task ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+                rows.collect()
+            })
+            .unwrap();
+        assert_eq!(left, vec![2], "不应影响其他房间的记录");
     }
 
     #[test]
