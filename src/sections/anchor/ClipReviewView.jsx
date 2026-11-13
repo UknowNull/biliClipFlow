@@ -313,8 +313,12 @@ export default function ClipReviewView({ anchor, session, onBack, onSubmitClip, 
       }
       applySegCues(updates);
       setMessage("");
-      // 起点变了这句的编号也跟着变，保持时间编辑面板开着，方便连续微调
-      setEditing({ key: String(Math.round(start * 1000)), mode: "time" });
+      // 起点变了这句的编号也跟着变，保持时间编辑面板开着，方便连续微调。
+      // 但用户可能已经点「完成」把面板关了（点完成会先触发输入框失焦保存），
+      // 此时不能把面板重新打开，否则要再点一次才生效
+      setEditing((cur) =>
+        cur && cur.mode === "time" && cur.key === cue.key ? { key: String(Math.round(start * 1000)), mode: "time" } : cur,
+      );
     } catch (err) {
       setMessage(err?.message || "保存字幕时间失败");
     }
@@ -642,12 +646,14 @@ export default function ClipReviewView({ anchor, session, onBack, onSubmitClip, 
   useEffect(() => {
     if (playing) keepVisible(linesRef.current, linesRef.current?.querySelector('[data-now="1"]'), true);
   }, [t]);
-  // 进入或切换切片时，把切片内第一条字幕（连同"当前段"分隔条）滚到字幕栏最上方
+  // 进入或切换切片时，把切片内第一条字幕（连同"当前段"分隔条）滚到字幕栏最上方。
+  // 不要把 ctx.segments 放进依赖：保存字幕修订会更新 segments，effect 重跑会把
+  // 列表滚回切片开头，用户改完一句就被迫重新找位置
   useEffect(() => {
     const box = linesRef.current;
     const first = box?.querySelector('[data-first="1"]');
     if (box && first) box.scrollTop = first.offsetTop;
-  }, [selId, loading, ctx.segments, sideTab]);
+  }, [selId, loading, sideTab]);
   useEffect(() => {
     keepVisible(queueRef.current, queueRef.current?.querySelector(`[data-id="${selId}"]`), false);
   }, [selId, filter, sort, queueOpen]);
