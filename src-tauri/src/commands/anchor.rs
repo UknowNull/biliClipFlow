@@ -778,20 +778,32 @@ pub async fn anchor_record_import_scan(state: State<'_, AppState>, room_id: Stri
             };
             let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             let Some((room, start, title)) = parse_record_file_name(&stem) else {
-                // 解析不出标准格式：若还能猜到开始时间，交给用户补填标题后导入
-                if let Some(start) = guess_record_start(&stem) {
-                    let duration = probe_duration_seconds(&path_str).unwrap_or(0);
-                    item.status = "needs_manual".into();
-                    item.reason = Some("文件名缺少房间号，请确认开始时间与标题".into());
-                    item.guessed_start = Some(start.to_rfc3339());
-                    item.start_time = start.to_rfc3339();
-                    item.duration = duration;
-                    if duration > 0 {
-                        item.end_time = (start + Duration::seconds(duration)).to_rfc3339();
+                // 解析不出标准格式：交给用户手动填开始时间与标题。
+                // 开始时间优先从文件名猜，其次用「文件修改时间 - 时长」反推（录播通常录制完立即落盘）。
+                let duration = probe_duration_seconds(&path_str).unwrap_or(0);
+                let guessed = guess_record_start(&stem).or_else(|| {
+                    let mtime = std::fs::metadata(&path).ok()?.modified().ok()?;
+                    let end = DateTime::<Utc>::from(mtime);
+                    Some(if duration > 0 {
+                        end - Duration::seconds(duration)
+                    } else {
+                        end
+                    })
+                });
+                item.status = "needs_manual".into();
+                item.duration = duration;
+                match guessed {
+                    Some(start) => {
+                        item.reason = Some("文件名无法完整解析，请确认开始时间与标题".into());
+                        item.guessed_start = Some(start.to_rfc3339());
+                        item.start_time = start.to_rfc3339();
+                        if duration > 0 {
+                            item.end_time = (start + Duration::seconds(duration)).to_rfc3339();
+                        }
                     }
-                } else {
-                    item.status = "invalid".into();
-                    item.reason = Some("文件名里解析不出房间号和开始时间".into());
+                    None => {
+                        item.reason = Some("无法推断开始时间，请手动填写".into());
+                    }
                 }
                 items.push(item);
                 continue;
@@ -1173,6 +1185,8 @@ pub fn anchor_record_delete(
     state: State<'_, AppState>,
     room_id: String,
     record_ids: Vec<i64>,
+    delete_records: bool,
+    delete_files: bool,
     delete_clips: bool,
     clip_task_id: Option<i64>,
 ) -> ApiResponse<usize> {
@@ -1184,6 +1198,31 @@ pub fn anchor_record_delete(
     if room.is_empty() {
         return ApiResponse::error("房间号不能为空");
     }
+    if !delete_records && !delete_files && !delete_clips {
+        return ApiResponse::error("请至少选择一项要删除的内容");
+    }
+
+    // 需要删的原始录播文件：只取本次选中的记录
+    let record_files: Vec<String> = if delete_files {
+        state
+            .db
+            .with_conn(|conn| {
+                let mut out = Vec::new();
+                for id in &ids {
+                    if let Ok(path) = conn.query_row(
+                        "SELECT file_path FROM live_record_task WHERE id = ?1 AND room_id = ?2",
+                        (id, &room),
+                        |r| r.get::<_, String>(0),
+                    ) {
+                        out.push(path);
+                    }
+                }
+                Ok(out)
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     // 需要一并清理的切片文件：先读出来，数据库删完后逐个删
     let clip_files: Vec<String> = if delete_clips {
@@ -1205,11 +1244,13 @@ pub fn anchor_record_delete(
 
     let result = state.db.with_conn_mut(|conn| {
         let tx = conn.transaction()?;
-        for id in &ids {
-            tx.execute(
-                "DELETE FROM live_record_task WHERE id = ?1 AND room_id = ?2",
-                (id, &room),
-            )?;
+        if delete_records {
+            for id in &ids {
+                tx.execute(
+                    "DELETE FROM live_record_task WHERE id = ?1 AND room_id = ?2",
+                    (id, &room),
+                )?;
+            }
         }
         if let (true, Some(task_id)) = (delete_clips, clip_task_id) {
             if task_id > 0 {
@@ -1232,11 +1273,19 @@ pub fn anchor_record_delete(
         return ApiResponse::error(format!("删除录播失败: {}", err));
     }
 
-    // 数据库删完后清理切片文件；单个失败不影响整体结果
-    for path in &clip_files {
+    // 数据库处理完后清理磁盘文件；单个失败不影响整体结果
+    for path in record_files.iter().chain(clip_files.iter()) {
         let target = Path::new(path);
         if target.is_file() {
             let _ = std::fs::remove_file(target);
+        }
+    }
+
+    // 原始录播的 srt / 弹幕等伴生文件一并清掉
+    if delete_files {
+        for path in &record_files {
+            let base = Path::new(path);
+            let _ = std::fs::remove_file(base.with_extension("srt"));
         }
     }
 
