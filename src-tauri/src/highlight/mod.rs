@@ -35,7 +35,8 @@ use llm::{ChunkInput, TopicClip};
 use signals::{Candidate, Profile, Span};
 
 // v2：按逐字时间拆成单句
-const ASR_CACHE_VERSION: &str = "sv20240717-v2";
+// v3：srt_pass 不再合并短句，段数与旧缓存（合并版）对不上，整体换版本作废旧缓存
+const ASR_CACHE_VERSION: &str = "sv20240717-v3";
 const AUTO_SCAN_SECS: u64 = 300;
 const AUTO_LOOKBACK_DAYS: i64 = 3;
 

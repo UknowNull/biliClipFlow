@@ -945,26 +945,12 @@ pub fn refine_chinese(
 /// SRT 只有文字和时间：语种按中文处理（未登记声纹时全部视为主播），没有情绪、笑声和响度；
 /// 外部字幕常按半秒到一秒断句，相邻间隔很短的句子合并成整句，便于声纹判定和大模型阅读
 pub fn srt_pass(files: &[AudioFile]) -> Option<FullPass> {
-    const JOIN_GAP: f64 = 0.3;
-    const MAX_SECS: f64 = 10.0;
     let mut segments: Vec<AsrSegment> = Vec::new();
     for (file_idx, file) in files.iter().enumerate() {
         let text = std::fs::read_to_string(Path::new(file.path).with_extension("srt")).ok()?;
-        let mut last: Option<usize> = None;
+        // SRT 每块时间戳本来就是精确到句的，原样直通：评阅页直接用真实时间，
+        // 不做合并——合并后前端只能按字数比例估时，语速不均时字幕严重错位
         for (start, end, line) in parse_srt(&text) {
-            let merge = last.map(|i| {
-                let prev = &segments[i];
-                start - (prev.end - file.offset_start) <= JOIN_GAP && end - (prev.start - file.offset_start) <= MAX_SECS
-            });
-            if merge == Some(true) {
-                let prev = segments.last_mut().unwrap();
-                let ascii_edge = prev.text.ends_with(|c: char| c.is_ascii_alphanumeric()) && line.starts_with(|c: char| c.is_ascii_alphanumeric());
-                prev.text.push_str(if ascii_edge { " " } else { "" });
-                prev.text.push_str(&line);
-                prev.end = file.offset_start + end;
-                prev.zh_text = Some(prev.text.clone());
-                continue;
-            }
             segments.push(AsrSegment {
                 start: file.offset_start + start,
                 end: file.offset_start + end,
@@ -978,7 +964,6 @@ pub fn srt_pass(files: &[AudioFile]) -> Option<FullPass> {
                 streamer_secs: None,
                 sc: None,
             });
-            last = Some(segments.len() - 1);
         }
     }
     if segments.is_empty() {
@@ -1094,7 +1079,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn srt_pass_merges_short_lines() {
+    fn srt_pass_keeps_each_cue_with_its_own_timestamps() {
         let dir = std::env::temp_dir().join(format!("srt_pass_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("a.mp4");
@@ -1106,10 +1091,14 @@ mod tests {
         let path = video.to_string_lossy().to_string();
         let pass = srt_pass(&[AudioFile { path: &path, offset_start: 100.0 }]).unwrap();
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(pass.segments.len(), 2);
-        assert_eq!(pass.segments[0].text, "中午好你们吃了吗");
-        assert!((pass.segments[0].start - 112.22).abs() < 1e-6 && (pass.segments[0].end - 113.3).abs() < 1e-6);
-        assert_eq!(pass.segments[1].zh_text.as_deref(), Some("主包还没吃"));
+        // 每条 SRT 字幕单独成段，时间用原始值，序号不混进文本
+        assert_eq!(pass.segments.len(), 3);
+        assert_eq!(pass.segments[0].text, "中午好");
+        assert!((pass.segments[0].start - 112.22).abs() < 1e-6 && (pass.segments[0].end - 112.82).abs() < 1e-6);
+        assert_eq!(pass.segments[1].text, "你们吃了吗");
+        assert!((pass.segments[1].start - 112.82).abs() < 1e-6 && (pass.segments[1].end - 113.3).abs() < 1e-6);
+        assert_eq!(pass.segments[2].zh_text.as_deref(), Some("主包还没吃"));
+        assert!(!pass.segments.iter().any(|s| s.text.chars().next().is_some_and(|c| c.is_ascii_digit())));
     }
 
     #[test]

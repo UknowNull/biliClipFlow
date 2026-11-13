@@ -107,8 +107,10 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
   const [filter, setFilter] = useState("all");
   const [openFiles, setOpenFiles] = useState({});
   const [eventsSession, setEventsSession] = useState(null);
-  // 删除确认弹窗：{ session, deleteClips }
+  // 删除确认弹窗：记录 / 原始文件 / 切片可分别勾选
   const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteRecords, setDeleteRecords] = useState(true);
+  const [deleteFiles, setDeleteFiles] = useState(false);
   const [deleteClips, setDeleteClips] = useState(false);
   const [message, setMessage] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -202,6 +204,8 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
       await invokeCommand("anchor_record_delete", {
         roomId: anchor.uid,
         recordIds: ids,
+        deleteRecords,
+        deleteFiles,
         deleteClips: deleteClips && deleteTarget.task?.clipCount > 0,
         clipTaskId: deleteTarget.task?.taskId ?? null,
       });
@@ -211,6 +215,8 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
       setMessage(err?.message || "删除失败");
     } finally {
       setDeleteTarget(null);
+      setDeleteRecords(true);
+      setDeleteFiles(false);
       setDeleteClips(false);
     }
   };
@@ -393,7 +399,7 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
         ) : (
           <div className="overflow-x-auto">
             <div className="min-w-[940px]">
-              <div className="grid grid-cols-[120px_minmax(180px,1.6fr)_64px_150px_200px_330px] gap-3 border-b border-black/5 px-5 py-2.5 text-xs text-[var(--muted)]">
+              <div className="grid grid-cols-[110px_minmax(160px,1.6fr)_56px_130px_170px_minmax(360px,auto)] gap-3 border-b border-black/5 px-5 py-2.5 text-xs text-[var(--muted)]">
                 <span>日期</span>
                 <span>直播标题</span>
                 <span>时长</span>
@@ -407,7 +413,7 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                 const open = !!openFiles[s.key];
                 return (
                   <Fragment key={s.key}>
-                    <div className="grid grid-cols-[120px_minmax(180px,1.6fr)_64px_150px_200px_330px] items-center gap-3 border-b border-black/5 px-5 py-3 text-sm text-[var(--ink)]">
+                    <div className="grid grid-cols-[110px_minmax(160px,1.6fr)_56px_130px_170px_minmax(360px,auto)] items-center gap-3 border-b border-black/5 px-5 py-3 text-sm text-[var(--ink)]">
                       <span className="tabular-nums">{s.day}</span>
                       <span className="min-w-0">
                         <span className="block truncate font-semibold" title={s.title}>
@@ -430,33 +436,41 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                           </span>
                         ) : null}
                       </span>
-                      <span className="flex justify-end gap-1.5">
+                      <span className="flex flex-wrap items-center justify-end gap-1.5">
                         {st === "done" && s.task.clipCount > 0 ? (
-                          <button className="h-8 rounded-lg bg-[#1F5BD8] px-3 text-sm font-semibold text-white" onClick={() => onOpenReview({ ...s, task: s.task })}>
+                          <button
+                            className="h-8 whitespace-nowrap rounded-lg bg-[#1F5BD8] px-3 text-sm font-semibold text-white shadow-sm transition hover:brightness-110"
+                            onClick={() => onOpenReview({ ...s, task: s.task })}
+                          >
                             评阅切片
                           </button>
                         ) : null}
                         <button
-                          className="h-8 rounded-lg border border-black/10 bg-white px-2.5 text-sm hover:border-black/20 disabled:opacity-50"
+                          className="h-8 whitespace-nowrap rounded-lg border border-[#1F7A45]/30 bg-[#E8F5EE] px-2.5 text-sm font-semibold text-[#1F7A45] transition hover:border-[#1F7A45]/50 disabled:opacity-50"
                           disabled={st === "running"}
                           onClick={() => analyze(s)}
                         >
                           {st === "done" || st === "failed" ? "重新分析" : st === "running" ? "分析中" : "分析"}
                         </button>
                         <button
-                          className="h-8 rounded-lg border border-black/10 bg-white px-2.5 text-sm hover:border-black/20"
+                          className="h-8 whitespace-nowrap rounded-lg border border-[#1F5BD8]/30 bg-[#EEF3FF] px-2.5 text-sm font-semibold text-[#1F4FB8] transition hover:border-[#1F5BD8]/50"
                           onClick={() => setOpenFiles((prev) => ({ ...prev, [s.key]: !open }))}
                         >
                           {open ? "收起文件" : "录播文件"}
                         </button>
-                        <button className="h-8 rounded-lg border border-black/10 bg-white px-2.5 text-sm hover:border-black/20" onClick={() => setEventsSession(s)}>
+                        <button
+                          className="h-8 whitespace-nowrap rounded-lg border border-[#9A4A0C]/25 bg-[#FFF3E6] px-2.5 text-sm font-semibold text-[#9A4A0C] transition hover:border-[#9A4A0C]/45"
+                          onClick={() => setEventsSession(s)}
+                        >
                           弹幕礼物
                         </button>
                         <button
-                          className="h-8 rounded-lg border border-[#B42318]/25 bg-white px-2.5 text-sm text-[#B42318] hover:border-[#B42318]/45 disabled:opacity-50"
+                          className="h-8 whitespace-nowrap rounded-lg border border-[#B42318]/25 bg-white px-2.5 text-sm font-semibold text-[#B42318] transition hover:border-[#B42318]/45 disabled:opacity-50"
                           disabled={st === "running"}
                           onClick={() => {
                             setDeleteTarget(s);
+                            setDeleteRecords(true);
+                            setDeleteFiles(false);
                             setDeleteClips(false);
                           }}
                         >
@@ -478,13 +492,13 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                             </span>
                             <span className="flex justify-end gap-1.5">
                               <button
-                                className="h-7 rounded-md border border-black/10 bg-white px-2.5 hover:border-black/20"
+                                className="h-7 whitespace-nowrap rounded-md border border-[#1F5BD8]/30 bg-[#EEF3FF] px-2.5 font-semibold text-[#1F4FB8] transition hover:border-[#1F5BD8]/50"
                                 onClick={() => invokeCommand("anchor_open_record_file", { filePath: record.filePath }).catch((err) => setMessage(err?.message || "打开失败"))}
                               >
                                 播放
                               </button>
                               <button
-                                className="h-7 rounded-md border border-black/10 bg-white px-2.5 hover:border-black/20"
+                                className="h-7 whitespace-nowrap rounded-md border border-black/10 bg-white px-2.5 text-[#5B6170] transition hover:border-black/20"
                                 onClick={() => invokeCommand("anchor_open_record_dir", { filePath: record.filePath }).catch((err) => setMessage(err?.message || "打开失败"))}
                               >
                                 打开目录
@@ -508,33 +522,66 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
             <div className="mt-2 text-xs text-[var(--muted)]">
               {deleteTarget.day} · {deleteTarget.title || "未命名"}
             </div>
-            <div className="mt-3 rounded-lg bg-[#FFF8EF] px-3 py-2 text-xs text-[#9A4A0C]">
-              只删除软件内的记录，不会删除磁盘上的原始录播文件。
-            </div>
-            {deleteTarget.task?.clipCount > 0 ? (
-              <label className="mt-3 flex items-start gap-2 text-xs text-[var(--ink)]">
+            <div className="mt-3 space-y-2.5 rounded-lg border border-black/10 bg-white/70 px-3 py-3">
+              <label className="flex items-start gap-2 text-xs text-[var(--ink)]">
                 <input
                   type="checkbox"
                   className="mt-0.5"
-                  checked={deleteClips}
-                  onChange={(e) => setDeleteClips(e.target.checked)}
+                  checked={deleteRecords}
+                  onChange={(e) => setDeleteRecords(e.target.checked)}
                 />
                 <span>
-                  同时删除这一场的 {deleteTarget.task.clipCount} 条切片文件
-                  <span className="block text-[var(--muted)]">不勾选则只删录播记录，切片保留在磁盘上</span>
+                  删除数据库记录
+                  <span className="block text-[var(--muted)]">从录播列表中移除这一场</span>
                 </span>
               </label>
-            ) : null}
-            {!(deleteTarget.task?.clipCount > 0) ? (
-              <div className="mt-3 text-xs text-[var(--muted)]">
-                {deleteTarget.task ? "这一场还没有分析出切片" : "这一场还没有进行切片分析"}
-              </div>
+              <label className="flex items-start gap-2 text-xs text-[var(--ink)]">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={deleteFiles}
+                  onChange={(e) => setDeleteFiles(e.target.checked)}
+                />
+                <span>
+                  删除原始录播文件
+                  <span className="block text-[var(--muted)]">
+                    从磁盘删除 {deleteTarget.records.length} 个视频及其字幕，不可恢复
+                  </span>
+                </span>
+              </label>
+              {deleteTarget.task?.clipCount > 0 ? (
+                <label className="flex items-start gap-2 text-xs text-[var(--ink)]">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={deleteClips}
+                    onChange={(e) => setDeleteClips(e.target.checked)}
+                  />
+                  <span>
+                    删除切片文件
+                    <span className="block text-[var(--muted)]">
+                      删除这一场分析出的 {deleteTarget.task.clipCount} 条切片
+                    </span>
+                  </span>
+                </label>
+              ) : (
+                <div className="text-xs text-[var(--muted)]">
+                  {deleteTarget.task ? "这一场还没有分析出切片" : "这一场还没有进行切片分析"}
+                </div>
+              )}
+            </div>
+            {!deleteRecords && !deleteFiles && !(deleteClips && deleteTarget.task?.clipCount > 0) ? (
+              <div className="mt-2 text-xs text-rose-600">请至少选择一项要删除的内容</div>
             ) : null}
             <div className="mt-4 flex justify-end gap-2">
               <button className="h-9 rounded-lg border border-black/10 px-4" onClick={() => setDeleteTarget(null)}>
                 取消
               </button>
-              <button className="h-9 rounded-lg bg-[#B42318] px-4 font-semibold text-white" onClick={handleDelete}>
+              <button
+                className="h-9 rounded-lg bg-[#B42318] px-4 font-semibold text-white disabled:opacity-50"
+                disabled={!deleteRecords && !deleteFiles && !(deleteClips && deleteTarget.task?.clipCount > 0)}
+                onClick={handleDelete}
+              >
                 确认删除
               </button>
             </div>
