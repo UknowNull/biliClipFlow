@@ -1026,12 +1026,81 @@ pub(super) async fn fetch_remote_archive_part_count_by_status(
     Ok(None)
 }
 
+// 按 bvid 直接查单个稿件的分P数（创作中心接口，登录态可见全部状态）。
+// 投稿刚提交后要确认分P，以前靠翻整个稿件列表（最多 3 个状态 × 十几页），
+// 批量投稿时翻页请求太密会触发 -702 风控，导致任务卡在待远端校验。
+pub(super) async fn fetch_archive_part_count_by_bvid(
+    context: &UploadContext,
+    auth: &AuthInfo,
+    bvid: &str,
+) -> Result<Option<usize>, String> {
+    let bvid = bvid.trim();
+    if bvid.is_empty() {
+        return Ok(None);
+    }
+    let params = vec![("bvid".to_string(), bvid.to_string())];
+    let data = context
+        .bilibili
+        .get_json(
+            "https://member.bilibili.com/x/vupre/web/archive/view",
+            &params,
+            Some(auth),
+            false,
+        )
+        .await?;
+    let archive = data.get("archive");
+    let archive_bvid = archive
+        .and_then(|value| json_string_compatible(value.get("bvid")))
+        .unwrap_or_default();
+    if archive_bvid != bvid {
+        return Ok(None);
+    }
+    let archive_aid = archive
+        .and_then(|value| json_i64_compatible(value.get("aid")))
+        .unwrap_or(0);
+    let part_count = data
+        .get("videos")
+        .and_then(|value| value.as_array())
+        .or_else(|| data.get("pages").and_then(|value| value.as_array()))
+        .map(|items| items.len())
+        .unwrap_or(0);
+    if part_count == 0 {
+        return Ok(None);
+    }
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "submission_remote_part_count_found_by_bvid aid={} bvid={} parts={}",
+            archive_aid, archive_bvid, part_count
+        ),
+    );
+    Ok(Some(part_count))
+}
+
 pub(super) async fn fetch_remote_archive_part_count(
     context: &UploadContext,
     auth: &AuthInfo,
     bvid: &str,
     aid: i64,
 ) -> Result<Option<usize>, String> {
+    // 先直查单个稿件，避免批量投稿时反复翻列表触发风控
+    match fetch_archive_part_count_by_bvid(context, auth, bvid).await {
+        Ok(Some(count)) => return Ok(Some(count)),
+        Ok(None) => {}
+        Err(err) => {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_remote_part_count_by_bvid_fail bvid={} err={}",
+                    bvid.trim(),
+                    err
+                ),
+            );
+            if is_bilibili_risk_control_error(&err) {
+                return Err(err);
+            }
+        }
+    }
     for status in [
         REMOTE_AUDIT_STATUS_REVIEWING,
         REMOTE_AUDIT_STATUS_REJECTED,

@@ -368,7 +368,9 @@ async fn parse_http_response(response: reqwest::Response) -> Result<Value, Strin
 }
 
 fn is_archive_request_url(url: &str) -> bool {
-    url.contains("member.bilibili.com/x/web/archives") || is_season_archive_request_url(url)
+    url.contains("member.bilibili.com/x/web/archives")
+        || url.contains("member.bilibili.com/x/vupre/web/archive/view")
+        || is_season_archive_request_url(url)
 }
 
 fn is_season_archive_request_url(url: &str) -> bool {
