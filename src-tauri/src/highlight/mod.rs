@@ -870,6 +870,134 @@ pub fn session_events(db: &Db, room_id: &str, record_ids: &[i64]) -> Result<serd
 /// 评阅预览最多保留的文件数，超出时删除最旧的
 const PREVIEW_KEEP: usize = 6;
 
+/// 从识别缓存恢复整场转写（评阅页与单条重提共用）：ASR 缓存 + 声纹标注 + 中文精修文本，
+/// 人工修订过的字幕同步应用。没有识别缓存（分析未跑过/已清理）时返回 None。
+fn load_cached_pass(db: &Db, room_id: &str, record_ids: &[i64]) -> Option<FullPass> {
+    let segs = normalize_segments_for_analysis(load_record_segments(db, room_id, record_ids).ok()?, None);
+    let first = segs.first()?;
+    let cache = resolve_clips_dir(&first.file_path).ok()?.join(".cache");
+    let ids_key = record_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("-");
+    let mut pass: FullPass = std::fs::read(cache.join(format!("asr_{}_{}.json", ASR_CACHE_VERSION, ids_key)))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let speaker_key = room_voiceprint(db, room_id).map(|v| speaker::voiceprint_key(&v));
+    if let Some(key) = &speaker_key {
+        if let Some(secs) = std::fs::read(cache.join(format!("speaker_{}_{}_{}.json", key, ASR_CACHE_VERSION, ids_key)))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<Option<f64>>>(&b).ok())
+        {
+            pass.segments.iter_mut().zip(secs).for_each(|(s, v)| s.streamer_secs = v);
+        }
+    }
+    let key = speaker_key.unwrap_or_else(|| "lang".into());
+    if let Some(texts) = std::fs::read(cache.join(format!("refine_{}_{}_{}.json", ASR_CACHE_VERSION, ids_key, key)))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<Option<String>>>(&b).ok())
+    {
+        pass.segments.iter_mut().zip(texts).for_each(|(s, t)| s.zh_text = t);
+    }
+    apply_subtitle_edits(&mut pass.segments, &load_subtitle_edits(&cache, &ids_key));
+    pass.segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+    Some(pass)
+}
+
+/// 单条切片重提：用户对某条切片不满意时，只对这一条重新精修（起止/去留），不动其他切片。
+/// 输入 = 切片 ±90 秒的逐句转写 + 原话题/理由作为 hint；输出写回该切片的起止。
+/// keep=false 时只返回说明不改记录，去留由用户在评阅页决定。
+pub async fn refine_clip_once(
+    db: Arc<Db>,
+    cfg: settings::AutoClipSettings,
+    clip_id: i64,
+) -> Result<String, String> {
+    let (room_id, task_id, start_offset, end_offset, reason, topic): (String, i64, f64, f64, String, String) = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT i.room_id, i.task_id, i.start_offset, i.end_offset, i.reason, i.category FROM live_clip_item i WHERE i.id = ?1",
+                [clip_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, f64>(2)?,
+                        r.get::<_, f64>(3)?,
+                        r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    ))
+                },
+            )
+        })
+        .map_err(|e| format!("读取切片记录失败: {}", e))?;
+    let ids_json: String = db
+        .with_conn(|conn| conn.query_row("SELECT record_ids FROM live_clip_task WHERE id = ?1", [task_id], |r| r.get(0)))
+        .map_err(|e| format!("读取切片任务失败: {}", e))?;
+    let record_ids: Vec<i64> = serde_json::from_str(&ids_json).unwrap_or_default();
+    if record_ids.is_empty() {
+        return Err("切片任务没有关联的录播文件".into());
+    }
+    if !cfg.llm.is_configured() {
+        return Err("未配置大模型，无法重提".into());
+    }
+    let pass = blocking({
+        let db = Arc::clone(&db);
+        let room_id = room_id.clone();
+        let record_ids = record_ids.clone();
+        move || {
+            let Some(pass) = load_cached_pass(&db, &room_id, &record_ids) else {
+                return Err("没有本场次的识别缓存，请先重新分析该场次".into());
+            };
+            Ok(pass)
+        }
+    })
+    .await?;
+    let (_room_title, profile, streamer) = room_meta(&db, &room_id, record_ids.first().copied());
+    let chat_times: Vec<f64> = Vec::new(); // 单条重提不读弹幕缓存，行尾不带弹幕数（精修主要看转写）
+    let (idx, lines) = numbered_window(&pass.segments, &chat_times, start_offset - REFINE_PAD_SECS, end_offset + REFINE_PAD_SECS);
+    if idx.is_empty() {
+        return Err("该切片前后没有可用的转写文本".into());
+    }
+    let first = idx.iter().position(|&i| pass.segments[i].end > start_offset).unwrap_or(0);
+    let last = idx.iter().rposition(|&i| pass.segments[i].start < end_offset).unwrap_or(idx.len() - 1).max(first);
+    let session_end = pass.segments.last().map(|s| s.end).unwrap_or(end_offset);
+    let input = llm::RefineInput {
+        streamer: &streamer,
+        topic: &topic,
+        reason: &reason,
+        lines: &lines,
+        proposed: (first, last),
+        last_line: idx.len() - 1,
+    };
+    let mode = if cfg.llm.structured_output == "auto" {
+        llm::test_connection(&cfg.llm).await.mode
+    } else {
+        cfg.llm.structured_output.clone()
+    };
+    let mut r = llm::refine_clip(&cfg.llm, &mode, profile, &input).await;
+    if r.is_err() {
+        r = llm::refine_clip(&cfg.llm, &mode, profile, &input).await;
+    }
+    let x = r.map_err(|e| format!("重提失败：{}", e))?;
+    if !x.keep {
+        return Ok("模型判定这条内容不值得单独投稿；如确认不要，可在评阅页把它标记为淘汰".into());
+    }
+    if x.start_line > x.end_line || x.end_line >= idx.len() {
+        return Err("模型返回的起止行号无效，未改动".into());
+    }
+    let new_start = pass.segments[idx[x.start_line]].start.max(0.0);
+    let new_end = pass.segments[idx[x.end_line]].end.min(session_end);
+    if new_end - new_start < 3.0 {
+        return Err("重提出的新片段过短（不足 3 秒），未改动".into());
+    }
+    db.with_conn_mut(|conn| {
+        conn.execute(
+            "UPDATE live_clip_item SET start_offset = ?1, end_offset = ?2, duration = ?3 WHERE id = ?4",
+            (new_start, new_end, new_end - new_start, clip_id),
+        )?;
+        Ok(())
+    })
+    .map_err(|e| format!("更新切片时间失败: {}", e))?;
+    Ok(format!("已按重提结果调整边界：{} → {}，可点「重新剪辑」更新切片文件", hms(new_start, "-"), hms(new_end, "-")))
+}
+
 /// 生成评阅用的预览片段：从场次时间轴 [start, end) 所在录播文件中按关键帧直接复制，索引放在文件开头。
 /// 录播源文件太大且索引在末尾时，软件内播放器无法直接加载，预览文件只有几分钟，生成不到一秒。
 /// 返回预览文件路径及它在场次时间轴上的起止秒数。
