@@ -1160,6 +1160,47 @@ fn room_meta(db: &Db, room_id: &str, first_record: Option<i64>) -> (String, Prof
     (title, Profile::parse(&profile), nickname)
 }
 
+/// 标题等发布文案里的违禁词：大模型会复述直播原话，原话里的低俗/辱骂词跟着进标题
+/// 会在 B 站投稿审核被拦。入库前打码，长词优先替换（避免单字先把复合词拆坏）。
+const BANNED_TITLE_WORDS: &[&str] = &[
+    // 辱骂
+    "傻逼", "煞笔", "傻B", "傻b", "脑残", "智障", "弱智", "妈个逼", "妈了个逼", "你妈逼", "妈逼",
+    "操你妈", "肏你妈", "草你妈", "日你妈", "去你妈", "NMSL", "nmsl", "CNM", "cnm", "TMD", "tmd",
+    "SB", "sb", "狗东西", "杂种", "婊子养的", "死全家",
+    // 低俗
+    "鸡巴", "屌", "肏", "操逼", "做爱", "打炮", "口交", "肛交", "乳交", "阴茎", "阴蒂", "阴道",
+    // 赌毒
+    "冰毒", "海洛因", "摇头丸", "赌博", "百家乐",
+];
+
+/// 把文案里的违禁词替换成 ***（保留句子，只遮字眼）。长词优先替换，避免短词先把复合词拆坏。
+/// 大小写不敏感：在小写副本上定位，按原文字节切替换（词表只含 ASCII 与中文，小写化不改变字节数）。
+pub fn mask_banned_words(text: &str) -> (String, usize) {
+    let mut hits: Vec<&str> = BANNED_TITLE_WORDS
+        .iter()
+        .filter(|w| text.to_lowercase().contains(&w.to_lowercase()))
+        .copied()
+        .collect();
+    if hits.is_empty() {
+        return (text.to_string(), 0);
+    }
+    hits.sort_by_key(|w| std::cmp::Reverse(w.len()));
+    let mut masked = text.to_string();
+    for w in &hits {
+        let needle = w.to_lowercase();
+        loop {
+            let lower = masked.to_lowercase();
+            let Some(i) = lower.find(&needle) else { break };
+            let mut out = String::with_capacity(masked.len());
+            out.push_str(&masked[..i]);
+            out.push_str("***");
+            out.push_str(&masked[i + needle.len()..]);
+            masked = out;
+        }
+    }
+    (masked, hits.len())
+}
+
 /// 切片的投稿简介和标签：套用主播投稿设置里的简介、固定标签，简介补上直播日期、标题和直播间
 fn submission_meta(db: &Db, room_id: &str, room_title: &str, base_time: DateTime<Utc>) -> (String, Vec<String>) {
     let (desc, tags) = db
@@ -1212,7 +1253,14 @@ fn remove_previous_clips(db: &Db, task_id: i64, room_id: &str, ids_json: &str) {
 #[allow(clippy::too_many_arguments)]
 fn insert_item(db: &Db, task_id: i64, room_id: &str, seg: &LiveRecordSegment, output: &Path, p: &Picked, title: &str, meta: &(String, Vec<String>), ok: bool) {
     let j = p.clip.as_ref();
-    let titles = j.map(|j| j.titles.clone()).unwrap_or_else(|| vec![title.to_string()]);
+    // 发布文案入库前打违禁词：标题/封面字/推荐理由都是大模型照转写原话生成的，原话里的
+    // 辱骂/低俗词会一路带到 B 站投稿审核被打回；证据文本只进库不发布，不打码
+    let raw_titles = j.map(|j| j.titles.clone()).unwrap_or_else(|| vec![title.to_string()]);
+    let titles: Vec<String> = raw_titles.iter().map(|t| mask_banned_words(t).0).collect();
+    let (cover_text, reason) = match j {
+        Some(j) => (Some(mask_banned_words(&j.cover_text).0), Some(mask_banned_words(&j.reason).0)),
+        None => (None, None),
+    };
     // 固定标签在前，再补大模型给的具体标签
     let mut tags = meta.1.clone();
     for t in j.map(|j| j.tags.as_slice()).unwrap_or_default() {
@@ -1243,8 +1291,8 @@ fn insert_item(db: &Db, task_id: i64, room_id: &str, seg: &LiveRecordSegment, ou
                 serde_json::to_string(&titles).unwrap_or_default(),
                 meta.0,
                 tags.join(","),
-                j.map(|j| j.cover_text.clone()),
-                j.map(|j| j.reason.clone()),
+                cover_text,
+                reason,
                 j.map(|j| serde_json::to_string(&j.evidence).unwrap_or_default()),
                 p.ai_status,
             ],
@@ -1416,6 +1464,23 @@ mod tests {
         .unwrap();
         assert!(room_auto_clip_state(&db, "room1", true, Some(global_since)).is_none());
     }
+
+    #[test]
+    fn masks_banned_words_in_publish_copy() {
+        // 中文词
+        let (m, n) = mask_banned_words("他说了句傻逼然后笑了");
+        assert_eq!((m.as_str(), n), ("他说了句***然后笑了", 1));
+        // 大小写不敏感的 ASCII 词
+        let (m, _) = mask_banned_words("这是什么SB操作");
+        assert_eq!(m, "这是什么***操作");
+        // 长词优先：先替换复合词，短词不再命中
+        let (m, _) = mask_banned_words("他骂了一句你妈逼");
+        assert_eq!(m, "他骂了一句***");
+        // 干净文案原样返回
+        let (m, n) = mask_banned_words("奶姐毒奶中科大考研");
+        assert_eq!((m.as_str(), n), ("奶姐毒奶中科大考研", 0));
+    }
+
 
     #[test]
     fn merge_paras_joins_short_same_speaker_lines() {
