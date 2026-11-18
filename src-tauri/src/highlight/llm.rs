@@ -119,7 +119,8 @@ fn json_objects(text: &str) -> Vec<Value> {
     out
 }
 
-/// 解析模型输出：优先整体解析，否则取第一个不是 JSON Schema 本身的对象（模型有时会先复述 schema）
+/// 解析模型输出：优先整体解析，否则取第一个不是 JSON Schema 本身的对象（模型有时会先复述 schema）；
+/// 都失败时做一次「截断抢救」——输出被 max_tokens 截断时丢的通常只是尾部条目，补全括号/引号把前面的救回来
 fn parse_content(content: &str) -> Option<Value> {
     let trimmed = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
@@ -127,8 +128,79 @@ fn parse_content(content: &str) -> Option<Value> {
             return Some(v);
         }
     }
-    json_objects(trimmed).into_iter().find(|v| !looks_like_schema(v))
+    if let Some(v) = json_objects(trimmed).into_iter().find(|v| !looks_like_schema(v)) {
+        return Some(v);
+    }
+    salvage_truncated(trimmed)
 }
+
+/// 截断 JSON 抢救：截断通常只丢尾部条目。在最后一个「不在字符串内的逗号/闭合括号」处截掉半截的
+/// 尾部键值对，再闭合未配对的括号重新解析；解析不出完整 JSON 就放弃，绝不硬造内容。
+/// 借鉴竞品实测：直接判失败会白扔一次调用，前面的条目其实写完了。
+fn salvage_truncated(trimmed: &str) -> Option<Value> {
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut cut = 0usize;
+    for (i, ch) in trimmed.char_indices() {
+        if in_str {
+            match (escaped, ch) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            // 闭合括号与逗号都是安全切点；冒号可能是没写完的裸键，不作为切点
+            '}' | ']' | ',' => {
+                if ch == '}' || ch == ']' {
+                    depth = depth.saturating_sub(1);
+                }
+                cut = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if cut == 0 || depth == 0 {
+        return None; // 没有未闭合结构，说明问题不是截断
+    }
+    let fixed = trimmed[..cut].trim_end_matches(',');
+    // 重扫一遍闭合括号（跳过字符串内；此时 cut 之后的部分已丢掉，不可能再有未闭合字符串）
+    let (mut s2, mut esc2, mut stack) = (false, false, Vec::new());
+    for ch in fixed.chars() {
+        if s2 {
+            match (esc2, ch) {
+                (true, _) => esc2 = false,
+                (false, '\\') => esc2 = true,
+                (false, '"') => s2 = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => s2 = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => { stack.pop(); }
+            _ => {}
+        }
+    }
+    let mut cand = String::from(fixed);
+    for open in stack.into_iter().rev() {
+        cand.push(open);
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(&cand) {
+        if !looks_like_schema(&v) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 
 fn looks_like_schema(v: &Value) -> bool {
     v.get("properties").is_some() && v.get("type").and_then(|t| t.as_str()) == Some("object")
@@ -279,6 +351,9 @@ pub async fn list_models(settings: &LlmSettings) -> Result<Vec<String>, String> 
     Ok(ids)
 }
 
+/// 单块最多输出的话题条数：条目过多会把 JSON 挤到输出上限被截断，截断抢救救不回时整块丢失
+const MAX_CLIPS_PER_CHUNK: usize = 20;
+
 fn topics_schema(titles: usize) -> Value {
     let score = json!({"type": "integer", "minimum": 1, "maximum": 10});
     json!({
@@ -286,6 +361,7 @@ fn topics_schema(titles: usize) -> Value {
         "properties": {
             "clips": {
                 "type": "array",
+                "maxItems": MAX_CLIPS_PER_CHUNK,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -352,12 +428,13 @@ const MAX_TOPIC_SECS: i64 = 180;
 /// 把一段转写切成若干话题切片
 pub async fn segment_topics(settings: &LlmSettings, mode: &str, profile: Profile, titles: usize, input: &ChunkInput<'_>) -> Result<Vec<TopicClip>, String> {
     let system = format!(
-        "{}\n{}\n主播名字：{}。一件事通常 30~90 秒；内容连贯完整的可以更长，但不超过 {} 秒。每条给出 {} 个不同角度的标题。没有值得切的内容时 clips 为空数组。",
+        "{}\n{}\n主播名字：{}。一件事通常 30~90 秒；内容连贯完整的可以更长，但不超过 {} 秒。每条给出 {} 个不同角度的标题。没有值得切的内容时 clips 为空数组。本段最多输出 {} 条：高光多时优先保留最精彩的，条目过多会把 JSON 写到长度上限被截断，反而丢掉后面的所有内容。",
         BASE_RULES,
         profile_note(profile),
         input.streamer,
         input.max_secs.min(MAX_TOPIC_SECS),
-        titles
+        titles,
+        MAX_CLIPS_PER_CHUNK
     );
     let user = format!(
         "直播间标题：{}\n\n转写（每行：[起止秒][说话方|情绪/事件] 文本）：\n{}\n\n每分钟弹幕：\n{}",
@@ -498,5 +575,34 @@ mod tests {
         // 模型先复述 schema 再给结果
         let echoed = r#"{"type":"object","properties":{"ok":{"type":"boolean"}}} {"ok": true, "note": "a}b"}"#;
         assert_eq!(parse_content(echoed).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn salvages_truncated_topic_json() {
+        // 截断在键名中间：丢掉半截的键值对，前面的条目完整救回
+        let cut_key = r#"{"clips":[{"start":10,"end":20,"titles":["你好"],"eviden"#;
+        let v = parse_content(cut_key).unwrap();
+        let clips = v["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0]["titles"][0], "你好");
+
+        // 截断在字符串值中间：最后一个安全点是逗号，半截字符串整段丢掉
+        let cut_str = r#"{"clips": [{"start": 5, "titles": ["a", "b"#;
+        let v = parse_content(cut_str).unwrap();
+        assert_eq!(v["clips"][0]["titles"].as_array().unwrap().len(), 1);
+
+        // 多条话题救回前面的；尾部可能留一个半截条目（截断点落在条目内部的逗号），
+        // 由调用方按字段校验（end<=start / 时长下限）过滤，这里只验证不整块丢失
+        let cut_multi = r#"{"clips":[{"start":1,"end":2},{"start":3,"end":4},{"start":5,"end":"#;
+        let v = parse_content(cut_multi).unwrap();
+        assert!(v["clips"].as_array().unwrap().len() >= 2);
+
+        // 没有截断的正常 JSON 不走抢救
+        assert_eq!(parse_content(r#"{"ok": true}"#).unwrap()["ok"], true);
+
+        // 只有裸键没有任何安全切点：救不了
+        assert!(parse_content(r#"{"a":"#).is_none());
+        // 根本不是 JSON
+        assert!(parse_content("模型拒绝了请求").is_none());
     }
 }
