@@ -357,7 +357,7 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
             for (idx, dm) in dm_match::match_readings(&p.segments, &events) {
                 p.segments[idx].dm = Some(dm);
             }
-            topic_clips(ctx, task_id, &cfg, &mode, profile, &room_title, &streamer, &p, &events, has_danmaku, session_secs, &spans, &mut warnings).await?
+            topic_clips(ctx, task_id, &cfg, &mode, profile, &room_title, &streamer, &p, &events, has_danmaku, session_secs, &spans, &clips_dir, &ids_key, &mut warnings).await?
         }
         (_, p) => {
             set_stage(&db, task_id, "CANDIDATES", 60.0);
@@ -425,6 +425,8 @@ async fn topic_clips(
     has_danmaku: bool,
     session_secs: f64,
     spans: &[Span],
+    clips_dir: &Path,
+    ids_key: &str,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Picked>, String> {
     let per_min = signals::users_per_minute(events, session_secs);
@@ -549,7 +551,13 @@ async fn topic_clips(
         .map(|(clip, range, span, verified, r)| {
             let r = r.map(|(x, idx)| {
                 let new = boundary::snap(Range { start: p.segments[idx[x.start_line]].start, end: p.segments[idx[x.end_line]].end }, span, &p.segments);
-                (x, Range { start: new.start.max(span.start), ..boundary::fit_sc(new, &p.segments) })
+                let range = Range { start: new.start.max(span.start), ..boundary::fit_sc(new, &p.segments) };
+                // LLM 字幕纠错：orig 与转写原文一字不差、该句没有人工修订才写入评阅页修订缓存；
+                // 多条候选重复引用同一句由 edits map 去重，人工编辑永远优先
+                if !x.text_fixes.is_empty() {
+                    save_llm_text_fixes(clips_dir, ids_key, &p.segments, &idx, &x.text_fixes);
+                }
+                (x, range)
             });
             (clip, r.as_ref().map(|(_, rg)| *rg).unwrap_or(range), span, verified, r.map(|(x, _)| x))
         })
@@ -885,6 +893,41 @@ pub fn save_subtitle_edit(db: &Db, room_id: &str, record_ids: &[i64], key: &str,
         edits.insert(key.to_string(), json!(text.trim()));
     }
     std::fs::write(&path, serde_json::to_vec(&edits).unwrap_or_default()).map_err(|e| format!("保存字幕修订失败: {}", e))
+}
+
+/// 把大模型的字幕纠错建议写进评阅页修订缓存。逐条校验：行号越界丢弃、orig 与该句转写原文
+/// 一字不差才采纳（防模型乱改）、已有人工修订的句子不覆盖（人工编辑永远优先）。
+/// 同一句被多条候选引用时自然去重。任何失败静默跳过（建议不落地不影响出片）。
+fn save_llm_text_fixes(
+    clips_dir: &Path,
+    ids_key: &str,
+    segments: &[asr::AsrSegment],
+    idx: &[usize],
+    fixes: &[llm::TextFix],
+) {
+    let cache = clips_dir.join(".cache");
+    let path = cache.join(format!("subtitle_edits_{}.json", ids_key));
+    let mut edits: HashMap<String, SubtitleEdit> =
+        std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut changed = false;
+    for f in fixes {
+        let Some(&seg_idx) = idx.get(f.start_line) else { continue };
+        let Some(seg) = segments.get(seg_idx) else { continue };
+        let key = subtitle_key(seg);
+        if edits.contains_key(&key) {
+            continue;
+        }
+        if f.orig.trim() != seg.best_text().trim() || f.fixed.trim().is_empty() || f.orig.trim() == f.fixed.trim() {
+            continue;
+        }
+        edits.insert(key, SubtitleEdit::Text(f.fixed.trim().to_string()));
+        changed = true;
+    }
+    if changed {
+        if let Err(e) = std::fs::create_dir_all(&cache).and_then(|_| std::fs::write(&path, serde_json::to_vec(&edits).unwrap_or_default())) {
+            println!("[text_fixes] 写入纠错建议失败: {}", e);
+        }
+    }
 }
 
 /// 每分钟弹幕人数；解析整场弹幕较慢，结果缓存到切片目录，弹幕文件更新后重新计算
@@ -1463,6 +1506,51 @@ mod tests {
         })
         .unwrap();
         assert!(room_auto_clip_state(&db, "room1", true, Some(global_since)).is_none());
+    }
+
+    #[test]
+    fn llm_text_fixes_validate_orig_and_skip_manual_edits() {
+        // 临时缓存目录：验证纠错建议的校验与落盘规则
+        let dir = std::env::temp_dir().join(format!("clip_fixes_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seg = |start: f64, text: &str| asr::AsrSegment {
+            start,
+            end: start + 3.0,
+            file_idx: 0,
+            file_start: start,
+            lang: "zh".into(),
+            emotion: String::new(),
+            event: String::new(),
+            text: text.into(),
+            zh_text: None,
+            streamer_secs: None,
+            sc: None,
+            dm: None,
+        };
+        let segments = vec![seg(10.0, "擀甜的"), seg(13.0, "正确的话")];
+        let idx = [0usize, 1];
+        let fixes = vec![
+            // orig 一字不差 → 采纳
+            llm::TextFix { start_line: 0, orig: "擀甜的".into(), fixed: "齁甜的".into() },
+            // orig 与原文对不上 → 丢弃
+            llm::TextFix { start_line: 1, orig: "别的句子".into(), fixed: "改不了的".into() },
+            // fixed 与 orig 相同 → 无意义丢弃
+            llm::TextFix { start_line: 1, orig: "正确的话".into(), fixed: "正确的话".into() },
+            // 行号越界 → 丢弃
+            llm::TextFix { start_line: 9, orig: "x".into(), fixed: "y".into() },
+        ];
+        save_llm_text_fixes(&dir, "t1", &segments, &idx, &fixes);
+        let edits = load_subtitle_edits(&dir.join(".cache"), "t1");
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits.get("10000").map(|e| e.text()), Some("齁甜的".to_string()));
+
+        // 已有人工修订的句子不再被模型建议覆盖
+        let fixes2 = vec![llm::TextFix { start_line: 0, orig: "擀甜的".into(), fixed: "又改一版".into() }];
+        save_llm_text_fixes(&dir, "t1", &segments, &idx, &fixes2);
+        let edits = load_subtitle_edits(&dir.join(".cache"), "t1");
+        assert_eq!(edits.get("10000").map(|e| e.text()), Some("齁甜的".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

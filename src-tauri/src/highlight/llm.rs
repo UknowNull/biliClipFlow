@@ -458,6 +458,20 @@ pub struct Refined {
     pub grade: String,
     #[serde(default)]
     pub reason: String,
+    /// 字幕纠错建议：orig 与转写原文一字不差才采纳，服务端逐条校验后进评阅页
+    #[serde(default, rename = "textFixes")]
+    pub text_fixes: Vec<TextFix>,
+}
+
+/// 一条字幕纠错：orig 必须与字幕原文一字不差（防模型乱改），fixed 为整句修正
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TextFix {
+    #[serde(default)]
+    pub start_line: usize,
+    #[serde(default)]
+    pub orig: String,
+    #[serde(default)]
+    pub fixed: String,
 }
 
 const REFINE_RULES: &str = "你是B站直播切片编辑，正在精修一条候选切片的起止，并判断它值不值得投稿。给你候选切片前后各约 90 秒的逐句转写，每行开头是行号；「主播」是主播的话，「念SC」是主播在朗读观众的 SC（不是主播的表现），「念SC+主播」夹着主播自己的话，「念弹幕」是主播在念观众的普通弹幕（同样不是主播的表现，行尾附弹幕原文），「原片」是正在播放的视频或歌曲；行尾【弹幕N】是这句话前后几秒内的弹幕条数，观众反应一般比主播晚几秒，弹幕突然变多的地方通常是笑点。
@@ -470,7 +484,9 @@ const REFINE_RULES: &str = "你是B站直播切片编辑，正在精修一条候
    B＝主播有自己的笑点或鲜明观点，不看前后文能看懂，弹幕有反应；
    C＝其余情况，包括：看视频时插一两句吐槽、对剧情或史实的普通评论、观点平淡、弹幕没有反应、需要前文背景才能看懂。
    一场直播里通常 A 不超过一成、B 约三成，其余都是 C；拿不准时选低的一档。
-5. 只能依据转写判断，转写有识别错误时按上下文理解。reason 用一句话说明起止为什么选在这里、为什么是这个档位。";
+5. 只能依据转写判断，转写有识别错误时按上下文理解。reason 用一句话说明起止为什么选在这里、为什么是这个档位。
+6. 字幕纠错（可选，textFixes）：转写是语音识别生成的，规划时顺带保守纠错——只修「明显读不通、明显同音/形近错字、明显漏字」的句子，宁缺毋滥，没有就给空数组 []。
+   orig 必须与对应行的转写文字一字不差；fixed 是整句修正后的文字；不润色、不删语气词、不改写句式；最多 10 条，按错得最明显的挑。";
 
 /// 杂谈场的卖点常是完整的观点或答题，不一定有笑点，评级标准单独说明
 fn refine_profile_note(profile: Profile) -> &'static str {
@@ -503,7 +519,20 @@ pub async fn refine_clip(settings: &LlmSettings, mode: &str, profile: Profile, i
             "startLine": line, "endLine": line,
             "keep": {"type": "boolean"},
             "grade": {"type": "string", "enum": ["A", "B", "C"]},
-            "reason": {"type": "string"}
+            "reason": {"type": "string"},
+            "textFixes": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "startLine": {"type": "integer", "minimum": 0, "maximum": input.last_line},
+                        "orig": {"type": "string"},
+                        "fixed": {"type": "string"}
+                    },
+                    "required": ["startLine", "orig", "fixed"]
+                }
+            }
         },
         "required": ["startLine", "endLine", "keep", "grade", "reason"]
     });
