@@ -432,7 +432,10 @@ async fn topic_clips(
     let mut a = 0.0;
     while a < session_secs {
         let b = (a + CHUNK_SECS).min(session_secs);
-        let (lines, plain) = window_transcript(&p.segments, a, b);
+        let (lines, plain) = {
+            let (ls, plain) = transcript_lines(&p.segments, a, b);
+            (render_transcript(&merge_paras(ls)), plain)
+        };
         if !lines.is_empty() {
             let dm = if has_danmaku { signals::danmaku_lines(events, &per_min, a, b) } else { "（无弹幕数据）".to_string() };
             jobs.push((a, lines, plain, dm));
@@ -644,9 +647,30 @@ fn hms(secs: f64, sep: &str) -> String {
 
 /// 给大模型的纯原片句子最多保留的字数
 const ORIGINAL_LINE_CHARS: usize = 30;
+/// 碎句合并成段落的窗口：从段首起不超过该秒数（借鉴竞品实测：碎句直喂降低话题/事件识别召回）
+const MERGE_PARA_SECS: f64 = 45.0;
+/// 碎句合并成段落的字符上限
+const MERGE_PARA_CHARS: usize = 800;
+
+/// 转写里的一行：起止秒、说话方标签、显示文本、SC 原文附注（只挂在每组 SC 的第一行）
+#[derive(Clone, Debug)]
+struct TranscriptLine {
+    start: f64,
+    end: f64,
+    tag: String,
+    text: String,
+    sc_text: String,
+    /// 所属 SC 编号；非 SC 行为 None。合并时只并同一编号的行，SC 分组不被搅乱
+    sc_id: Option<usize>,
+}
 
 /// 每行：[起止秒][说话方|情绪/事件] 文本；同时返回纯文本用于证据校验
 fn window_transcript(segments: &[asr::AsrSegment], start: f64, end: f64) -> (String, String) {
+    let (lines, plain) = transcript_lines(segments, start, end);
+    (render_transcript(&lines), plain)
+}
+
+fn transcript_lines(segments: &[asr::AsrSegment], start: f64, end: f64) -> (Vec<TranscriptLine>, String) {
     let mut lines = Vec::new();
     let mut plain = String::new();
     let mut prev_sc: Option<usize> = None;
@@ -687,11 +711,43 @@ fn window_transcript(segments: &[asr::AsrSegment], start: f64, end: f64) -> (Str
                 s.dm.as_ref().map(|dm| format!("（弹幕原文：{}）", dm.text)).unwrap_or_default()
             });
         prev_sc = s.sc.as_ref().map(|sc| sc.id);
-        lines.push(format!("[{:.1}-{:.1}s][{}] {}{}", s.start, s.end, tag, shown, sc_text));
+        lines.push(TranscriptLine { start: s.start, end: s.end, tag, text: shown, sc_text, sc_id: s.sc.as_ref().map(|sc| sc.id) });
         plain.push_str(text);
         plain.push_str(&s.text);
     }
-    (lines.join("\n"), plain)
+    (lines, plain)
+}
+
+/// 同说话方、同 SC 组的相邻行合并成段落：段首起 45 秒或累计 800 字即断段。
+/// 纯原片行不并（只是铺垫提示，并了反而占提示词）；换说话方/换 SC 即断段。
+fn merge_paras(lines: Vec<TranscriptLine>) -> Vec<TranscriptLine> {
+    let mut out: Vec<TranscriptLine> = Vec::new();
+    for line in lines {
+        let mergeable = line.tag != "原片";
+        let fits = out.last().is_some_and(|cur| {
+            line.sc_id == cur.sc_id
+                && line.tag == cur.tag
+                && mergeable
+                && line.end - cur.start <= MERGE_PARA_SECS
+                && cur.text.chars().count() + line.text.chars().count() <= MERGE_PARA_CHARS
+        });
+        if fits {
+            let cur = out.last_mut().unwrap();
+            cur.text = format!("{} {}", cur.text, line.text);
+            cur.end = line.end;
+        } else {
+            out.push(line);
+        }
+    }
+    out
+}
+
+fn render_transcript(lines: &[TranscriptLine]) -> String {
+    lines
+        .iter()
+        .map(|l| format!("[{:.1}-{:.1}s][{}] {}{}", l.start, l.end, l.tag, l.text, l.sc_text))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 精修时给大模型看的候选前后转写长度
@@ -1359,6 +1415,46 @@ mod tests {
         })
         .unwrap();
         assert!(room_auto_clip_state(&db, "room1", true, Some(global_since)).is_none());
+    }
+
+    #[test]
+    fn merge_paras_joins_short_same_speaker_lines() {
+        let line = |start: f64, text: &str| TranscriptLine {
+            start,
+            end: start + 2.0,
+            tag: "主播".into(),
+            text: text.into(),
+            sc_text: String::new(),
+            sc_id: None,
+        };
+        // 同说话方的碎句合并成一段，时间范围取首尾
+        let merged = merge_paras(vec![line(10.0, "我们"), line(12.5, "来看一下"), line(14.0, "这波操作")]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "我们 来看一下 这波操作");
+        assert_eq!((merged[0].start, merged[0].end), (10.0, 16.0));
+
+        // 换说话方断段
+        let mut other = line(16.5, "游戏声音");
+        other.tag = "原片".into();
+        let merged = merge_paras(vec![line(10.0, "我们"), other]);
+        assert_eq!(merged.len(), 2);
+
+        // 段首起 45 秒即断段
+        let merged = merge_paras(vec![line(10.0, "a"), line(60.0, "b")]);
+        assert_eq!(merged.len(), 2);
+
+        // SC 行只与同一编号合并，不同 SC 不并
+        let sc_line = |id: usize, text: &str| TranscriptLine {
+            start: 10.0 + id as f64,
+            end: 12.0 + id as f64,
+            tag: "念SC".into(),
+            text: text.into(),
+            sc_text: String::new(),
+            sc_id: Some(id),
+        };
+        let merged = merge_paras(vec![sc_line(1, "谢谢"), sc_line(1, "的SC"), sc_line(2, "另一条")]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "谢谢 的SC");
     }
 
     #[test]
