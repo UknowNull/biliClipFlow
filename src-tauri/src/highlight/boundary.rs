@@ -272,6 +272,7 @@ mod tests {
             zh_text: None,
             streamer_secs: None,
             sc: None,
+            dm: None,
         }
     }
 

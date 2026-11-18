@@ -7,6 +7,7 @@ pub mod asr;
 pub mod boundary;
 pub mod cutter;
 pub mod danmaku;
+pub mod dm_match;
 pub mod llm;
 pub mod settings;
 pub mod signals;
@@ -352,7 +353,11 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
             apply_subtitle_edits(&mut p.segments, &load_subtitle_edits(&clips_dir.join(".cache"), &ids_key));
             let scs: Vec<(f64, String)> = events.iter().filter(|e| e.kind == danmaku::DanmakuKind::SuperChat).map(|e| (e.t, e.text.clone())).collect();
             boundary::mark_sc_readings(&mut p.segments, &scs);
-            topic_clips(ctx, task_id, &cfg, &mode, profile, &room_title, &streamer, &p, &events, has_danmaku, session_secs, &spans, &mut warnings).await?
+            // 主播念普通弹幕的配对标注（SC 已单独覆盖）：让观众原话进提示词，帮助识别"念观众发言"类互动
+            for (idx, dm) in dm_match::match_readings(&p.segments, &events) {
+                p.segments[idx].dm = Some(dm);
+            }
+            topic_clips(ctx, task_id, &cfg, &mode, profile, &room_title, &streamer, &p, &events, has_danmaku, session_secs, &spans, &clips_dir, &ids_key, &mut warnings).await?
         }
         (_, p) => {
             set_stage(&db, task_id, "CANDIDATES", 60.0);
@@ -420,6 +425,8 @@ async fn topic_clips(
     has_danmaku: bool,
     session_secs: f64,
     spans: &[Span],
+    clips_dir: &Path,
+    ids_key: &str,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Picked>, String> {
     let per_min = signals::users_per_minute(events, session_secs);
@@ -427,7 +434,10 @@ async fn topic_clips(
     let mut a = 0.0;
     while a < session_secs {
         let b = (a + CHUNK_SECS).min(session_secs);
-        let (lines, plain) = window_transcript(&p.segments, a, b);
+        let (lines, plain) = {
+            let (ls, plain) = transcript_lines(&p.segments, a, b);
+            (render_transcript(&merge_paras(ls)), plain)
+        };
         if !lines.is_empty() {
             let dm = if has_danmaku { signals::danmaku_lines(events, &per_min, a, b) } else { "（无弹幕数据）".to_string() };
             jobs.push((a, lines, plain, dm));
@@ -541,7 +551,13 @@ async fn topic_clips(
         .map(|(clip, range, span, verified, r)| {
             let r = r.map(|(x, idx)| {
                 let new = boundary::snap(Range { start: p.segments[idx[x.start_line]].start, end: p.segments[idx[x.end_line]].end }, span, &p.segments);
-                (x, Range { start: new.start.max(span.start), ..boundary::fit_sc(new, &p.segments) })
+                let range = Range { start: new.start.max(span.start), ..boundary::fit_sc(new, &p.segments) };
+                // LLM 字幕纠错：orig 与转写原文一字不差、该句没有人工修订才写入评阅页修订缓存；
+                // 多条候选重复引用同一句由 edits map 去重，人工编辑永远优先
+                if !x.text_fixes.is_empty() {
+                    save_llm_text_fixes(clips_dir, ids_key, &p.segments, &idx, &x.text_fixes);
+                }
+                (x, range)
             });
             (clip, r.as_ref().map(|(_, rg)| *rg).unwrap_or(range), span, verified, r.map(|(x, _)| x))
         })
@@ -639,9 +655,30 @@ fn hms(secs: f64, sep: &str) -> String {
 
 /// 给大模型的纯原片句子最多保留的字数
 const ORIGINAL_LINE_CHARS: usize = 30;
+/// 碎句合并成段落的窗口：从段首起不超过该秒数（借鉴竞品实测：碎句直喂降低话题/事件识别召回）
+const MERGE_PARA_SECS: f64 = 45.0;
+/// 碎句合并成段落的字符上限
+const MERGE_PARA_CHARS: usize = 800;
+
+/// 转写里的一行：起止秒、说话方标签、显示文本、SC 原文附注（只挂在每组 SC 的第一行）
+#[derive(Clone, Debug)]
+struct TranscriptLine {
+    start: f64,
+    end: f64,
+    tag: String,
+    text: String,
+    sc_text: String,
+    /// 所属 SC 编号；非 SC 行为 None。合并时只并同一编号的行，SC 分组不被搅乱
+    sc_id: Option<usize>,
+}
 
 /// 每行：[起止秒][说话方|情绪/事件] 文本；同时返回纯文本用于证据校验
 fn window_transcript(segments: &[asr::AsrSegment], start: f64, end: f64) -> (String, String) {
+    let (lines, plain) = transcript_lines(segments, start, end);
+    (render_transcript(&lines), plain)
+}
+
+fn transcript_lines(segments: &[asr::AsrSegment], start: f64, end: f64) -> (Vec<TranscriptLine>, String) {
     let mut lines = Vec::new();
     let mut plain = String::new();
     let mut prev_sc: Option<usize> = None;
@@ -649,6 +686,9 @@ fn window_transcript(segments: &[asr::AsrSegment], start: f64, end: f64) -> (Str
         // 原片句子里主播插了话（不到一半）时单独标出，免得大模型把主播的吐槽当成原片
         let speaker = if let Some(sc) = &s.sc {
             if sc.pure { "念SC" } else { "念SC+主播" }
+        } else if s.dm.is_some() {
+            // 配对成功的主播念弹幕句：内容和说话人都算观众的，主播只是转述
+            "念弹幕"
         } else if s.is_streamer() {
             "主播"
         } else if s.streamer_seconds() >= 1.0 {
@@ -674,13 +714,48 @@ fn window_transcript(segments: &[asr::AsrSegment], start: f64, end: f64) -> (Str
             .as_ref()
             .filter(|sc| !sc.text.is_empty() && !matches!(prev_sc, Some(id) if id == sc.id))
             .map(|sc| format!("（SC原文：{}）", sc.text))
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                // 念弹幕句附上弹幕原文（观众的原话，主播只是转述）；连续多句念同一条时逐句都带，方便大模型对齐
+                s.dm.as_ref().map(|dm| format!("（弹幕原文：{}）", dm.text)).unwrap_or_default()
+            });
         prev_sc = s.sc.as_ref().map(|sc| sc.id);
-        lines.push(format!("[{:.1}-{:.1}s][{}] {}{}", s.start, s.end, tag, shown, sc_text));
+        lines.push(TranscriptLine { start: s.start, end: s.end, tag, text: shown, sc_text, sc_id: s.sc.as_ref().map(|sc| sc.id) });
         plain.push_str(text);
         plain.push_str(&s.text);
     }
-    (lines.join("\n"), plain)
+    (lines, plain)
+}
+
+/// 同说话方、同 SC 组的相邻行合并成段落：段首起 45 秒或累计 800 字即断段。
+/// 纯原片行不并（只是铺垫提示，并了反而占提示词）；换说话方/换 SC 即断段。
+fn merge_paras(lines: Vec<TranscriptLine>) -> Vec<TranscriptLine> {
+    let mut out: Vec<TranscriptLine> = Vec::new();
+    for line in lines {
+        let mergeable = line.tag != "原片";
+        let fits = out.last().is_some_and(|cur| {
+            line.sc_id == cur.sc_id
+                && line.tag == cur.tag
+                && mergeable
+                && line.end - cur.start <= MERGE_PARA_SECS
+                && cur.text.chars().count() + line.text.chars().count() <= MERGE_PARA_CHARS
+        });
+        if fits {
+            let cur = out.last_mut().unwrap();
+            cur.text = format!("{} {}", cur.text, line.text);
+            cur.end = line.end;
+        } else {
+            out.push(line);
+        }
+    }
+    out
+}
+
+fn render_transcript(lines: &[TranscriptLine]) -> String {
+    lines
+        .iter()
+        .map(|l| format!("[{:.1}-{:.1}s][{}] {}{}", l.start, l.end, l.tag, l.text, l.sc_text))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 精修时给大模型看的候选前后转写长度
@@ -820,6 +895,41 @@ pub fn save_subtitle_edit(db: &Db, room_id: &str, record_ids: &[i64], key: &str,
     std::fs::write(&path, serde_json::to_vec(&edits).unwrap_or_default()).map_err(|e| format!("保存字幕修订失败: {}", e))
 }
 
+/// 把大模型的字幕纠错建议写进评阅页修订缓存。逐条校验：行号越界丢弃、orig 与该句转写原文
+/// 一字不差才采纳（防模型乱改）、已有人工修订的句子不覆盖（人工编辑永远优先）。
+/// 同一句被多条候选引用时自然去重。任何失败静默跳过（建议不落地不影响出片）。
+fn save_llm_text_fixes(
+    clips_dir: &Path,
+    ids_key: &str,
+    segments: &[asr::AsrSegment],
+    idx: &[usize],
+    fixes: &[llm::TextFix],
+) {
+    let cache = clips_dir.join(".cache");
+    let path = cache.join(format!("subtitle_edits_{}.json", ids_key));
+    let mut edits: HashMap<String, SubtitleEdit> =
+        std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut changed = false;
+    for f in fixes {
+        let Some(&seg_idx) = idx.get(f.start_line) else { continue };
+        let Some(seg) = segments.get(seg_idx) else { continue };
+        let key = subtitle_key(seg);
+        if edits.contains_key(&key) {
+            continue;
+        }
+        if f.orig.trim() != seg.best_text().trim() || f.fixed.trim().is_empty() || f.orig.trim() == f.fixed.trim() {
+            continue;
+        }
+        edits.insert(key, SubtitleEdit::Text(f.fixed.trim().to_string()));
+        changed = true;
+    }
+    if changed {
+        if let Err(e) = std::fs::create_dir_all(&cache).and_then(|_| std::fs::write(&path, serde_json::to_vec(&edits).unwrap_or_default())) {
+            println!("[text_fixes] 写入纠错建议失败: {}", e);
+        }
+    }
+}
+
 /// 每分钟弹幕人数；解析整场弹幕较慢，结果缓存到切片目录，弹幕文件更新后重新计算
 fn session_heat(segs: &[LiveRecordSegment], cache: &Path, ids_key: &str) -> Vec<usize> {
     let path = cache.join(format!("heat_{}.json", ids_key));
@@ -869,6 +979,134 @@ pub fn session_events(db: &Db, room_id: &str, record_ids: &[i64]) -> Result<serd
 
 /// 评阅预览最多保留的文件数，超出时删除最旧的
 const PREVIEW_KEEP: usize = 6;
+
+/// 从识别缓存恢复整场转写（评阅页与单条重提共用）：ASR 缓存 + 声纹标注 + 中文精修文本，
+/// 人工修订过的字幕同步应用。没有识别缓存（分析未跑过/已清理）时返回 None。
+fn load_cached_pass(db: &Db, room_id: &str, record_ids: &[i64]) -> Option<FullPass> {
+    let segs = normalize_segments_for_analysis(load_record_segments(db, room_id, record_ids).ok()?, None);
+    let first = segs.first()?;
+    let cache = resolve_clips_dir(&first.file_path).ok()?.join(".cache");
+    let ids_key = record_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("-");
+    let mut pass: FullPass = std::fs::read(cache.join(format!("asr_{}_{}.json", ASR_CACHE_VERSION, ids_key)))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let speaker_key = room_voiceprint(db, room_id).map(|v| speaker::voiceprint_key(&v));
+    if let Some(key) = &speaker_key {
+        if let Some(secs) = std::fs::read(cache.join(format!("speaker_{}_{}_{}.json", key, ASR_CACHE_VERSION, ids_key)))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<Option<f64>>>(&b).ok())
+        {
+            pass.segments.iter_mut().zip(secs).for_each(|(s, v)| s.streamer_secs = v);
+        }
+    }
+    let key = speaker_key.unwrap_or_else(|| "lang".into());
+    if let Some(texts) = std::fs::read(cache.join(format!("refine_{}_{}_{}.json", ASR_CACHE_VERSION, ids_key, key)))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<Option<String>>>(&b).ok())
+    {
+        pass.segments.iter_mut().zip(texts).for_each(|(s, t)| s.zh_text = t);
+    }
+    apply_subtitle_edits(&mut pass.segments, &load_subtitle_edits(&cache, &ids_key));
+    pass.segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+    Some(pass)
+}
+
+/// 单条切片重提：用户对某条切片不满意时，只对这一条重新精修（起止/去留），不动其他切片。
+/// 输入 = 切片 ±90 秒的逐句转写 + 原话题/理由作为 hint；输出写回该切片的起止。
+/// keep=false 时只返回说明不改记录，去留由用户在评阅页决定。
+pub async fn refine_clip_once(
+    db: Arc<Db>,
+    cfg: settings::AutoClipSettings,
+    clip_id: i64,
+) -> Result<String, String> {
+    let (room_id, task_id, start_offset, end_offset, reason, topic): (String, i64, f64, f64, String, String) = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT i.room_id, i.task_id, i.start_offset, i.end_offset, i.reason, i.category FROM live_clip_item i WHERE i.id = ?1",
+                [clip_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, f64>(2)?,
+                        r.get::<_, f64>(3)?,
+                        r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    ))
+                },
+            )
+        })
+        .map_err(|e| format!("读取切片记录失败: {}", e))?;
+    let ids_json: String = db
+        .with_conn(|conn| conn.query_row("SELECT record_ids FROM live_clip_task WHERE id = ?1", [task_id], |r| r.get(0)))
+        .map_err(|e| format!("读取切片任务失败: {}", e))?;
+    let record_ids: Vec<i64> = serde_json::from_str(&ids_json).unwrap_or_default();
+    if record_ids.is_empty() {
+        return Err("切片任务没有关联的录播文件".into());
+    }
+    if !cfg.llm.is_configured() {
+        return Err("未配置大模型，无法重提".into());
+    }
+    let pass = blocking({
+        let db = Arc::clone(&db);
+        let room_id = room_id.clone();
+        let record_ids = record_ids.clone();
+        move || {
+            let Some(pass) = load_cached_pass(&db, &room_id, &record_ids) else {
+                return Err("没有本场次的识别缓存，请先重新分析该场次".into());
+            };
+            Ok(pass)
+        }
+    })
+    .await?;
+    let (_room_title, profile, streamer) = room_meta(&db, &room_id, record_ids.first().copied());
+    let chat_times: Vec<f64> = Vec::new(); // 单条重提不读弹幕缓存，行尾不带弹幕数（精修主要看转写）
+    let (idx, lines) = numbered_window(&pass.segments, &chat_times, start_offset - REFINE_PAD_SECS, end_offset + REFINE_PAD_SECS);
+    if idx.is_empty() {
+        return Err("该切片前后没有可用的转写文本".into());
+    }
+    let first = idx.iter().position(|&i| pass.segments[i].end > start_offset).unwrap_or(0);
+    let last = idx.iter().rposition(|&i| pass.segments[i].start < end_offset).unwrap_or(idx.len() - 1).max(first);
+    let session_end = pass.segments.last().map(|s| s.end).unwrap_or(end_offset);
+    let input = llm::RefineInput {
+        streamer: &streamer,
+        topic: &topic,
+        reason: &reason,
+        lines: &lines,
+        proposed: (first, last),
+        last_line: idx.len() - 1,
+    };
+    let mode = if cfg.llm.structured_output == "auto" {
+        llm::test_connection(&cfg.llm).await.mode
+    } else {
+        cfg.llm.structured_output.clone()
+    };
+    let mut r = llm::refine_clip(&cfg.llm, &mode, profile, &input).await;
+    if r.is_err() {
+        r = llm::refine_clip(&cfg.llm, &mode, profile, &input).await;
+    }
+    let x = r.map_err(|e| format!("重提失败：{}", e))?;
+    if !x.keep {
+        return Ok("模型判定这条内容不值得单独投稿；如确认不要，可在评阅页把它标记为淘汰".into());
+    }
+    if x.start_line > x.end_line || x.end_line >= idx.len() {
+        return Err("模型返回的起止行号无效，未改动".into());
+    }
+    let new_start = pass.segments[idx[x.start_line]].start.max(0.0);
+    let new_end = pass.segments[idx[x.end_line]].end.min(session_end);
+    if new_end - new_start < 3.0 {
+        return Err("重提出的新片段过短（不足 3 秒），未改动".into());
+    }
+    db.with_conn_mut(|conn| {
+        conn.execute(
+            "UPDATE live_clip_item SET start_offset = ?1, end_offset = ?2, duration = ?3 WHERE id = ?4",
+            (new_start, new_end, new_end - new_start, clip_id),
+        )?;
+        Ok(())
+    })
+    .map_err(|e| format!("更新切片时间失败: {}", e))?;
+    Ok(format!("已按重提结果调整边界：{} → {}，可点「重新剪辑」更新切片文件", hms(new_start, "-"), hms(new_end, "-")))
+}
 
 /// 生成评阅用的预览片段：从场次时间轴 [start, end) 所在录播文件中按关键帧直接复制，索引放在文件开头。
 /// 录播源文件太大且索引在末尾时，软件内播放器无法直接加载，预览文件只有几分钟，生成不到一秒。
@@ -965,6 +1203,47 @@ fn room_meta(db: &Db, room_id: &str, first_record: Option<i64>) -> (String, Prof
     (title, Profile::parse(&profile), nickname)
 }
 
+/// 标题等发布文案里的违禁词：大模型会复述直播原话，原话里的低俗/辱骂词跟着进标题
+/// 会在 B 站投稿审核被拦。入库前打码，长词优先替换（避免单字先把复合词拆坏）。
+const BANNED_TITLE_WORDS: &[&str] = &[
+    // 辱骂
+    "傻逼", "煞笔", "傻B", "傻b", "脑残", "智障", "弱智", "妈个逼", "妈了个逼", "你妈逼", "妈逼",
+    "操你妈", "肏你妈", "草你妈", "日你妈", "去你妈", "NMSL", "nmsl", "CNM", "cnm", "TMD", "tmd",
+    "SB", "sb", "狗东西", "杂种", "婊子养的", "死全家",
+    // 低俗
+    "鸡巴", "屌", "肏", "操逼", "做爱", "打炮", "口交", "肛交", "乳交", "阴茎", "阴蒂", "阴道",
+    // 赌毒
+    "冰毒", "海洛因", "摇头丸", "赌博", "百家乐",
+];
+
+/// 把文案里的违禁词替换成 ***（保留句子，只遮字眼）。长词优先替换，避免短词先把复合词拆坏。
+/// 大小写不敏感：在小写副本上定位，按原文字节切替换（词表只含 ASCII 与中文，小写化不改变字节数）。
+pub fn mask_banned_words(text: &str) -> (String, usize) {
+    let mut hits: Vec<&str> = BANNED_TITLE_WORDS
+        .iter()
+        .filter(|w| text.to_lowercase().contains(&w.to_lowercase()))
+        .copied()
+        .collect();
+    if hits.is_empty() {
+        return (text.to_string(), 0);
+    }
+    hits.sort_by_key(|w| std::cmp::Reverse(w.len()));
+    let mut masked = text.to_string();
+    for w in &hits {
+        let needle = w.to_lowercase();
+        loop {
+            let lower = masked.to_lowercase();
+            let Some(i) = lower.find(&needle) else { break };
+            let mut out = String::with_capacity(masked.len());
+            out.push_str(&masked[..i]);
+            out.push_str("***");
+            out.push_str(&masked[i + needle.len()..]);
+            masked = out;
+        }
+    }
+    (masked, hits.len())
+}
+
 /// 切片的投稿简介和标签：套用主播投稿设置里的简介、固定标签，简介补上直播日期、标题和直播间
 fn submission_meta(db: &Db, room_id: &str, room_title: &str, base_time: DateTime<Utc>) -> (String, Vec<String>) {
     let (desc, tags) = db
@@ -1017,7 +1296,14 @@ fn remove_previous_clips(db: &Db, task_id: i64, room_id: &str, ids_json: &str) {
 #[allow(clippy::too_many_arguments)]
 fn insert_item(db: &Db, task_id: i64, room_id: &str, seg: &LiveRecordSegment, output: &Path, p: &Picked, title: &str, meta: &(String, Vec<String>), ok: bool) {
     let j = p.clip.as_ref();
-    let titles = j.map(|j| j.titles.clone()).unwrap_or_else(|| vec![title.to_string()]);
+    // 发布文案入库前打违禁词：标题/封面字/推荐理由都是大模型照转写原话生成的，原话里的
+    // 辱骂/低俗词会一路带到 B 站投稿审核被打回；证据文本只进库不发布，不打码
+    let raw_titles = j.map(|j| j.titles.clone()).unwrap_or_else(|| vec![title.to_string()]);
+    let titles: Vec<String> = raw_titles.iter().map(|t| mask_banned_words(t).0).collect();
+    let (cover_text, reason) = match j {
+        Some(j) => (Some(mask_banned_words(&j.cover_text).0), Some(mask_banned_words(&j.reason).0)),
+        None => (None, None),
+    };
     // 固定标签在前，再补大模型给的具体标签
     let mut tags = meta.1.clone();
     for t in j.map(|j| j.tags.as_slice()).unwrap_or_default() {
@@ -1048,8 +1334,8 @@ fn insert_item(db: &Db, task_id: i64, room_id: &str, seg: &LiveRecordSegment, ou
                 serde_json::to_string(&titles).unwrap_or_default(),
                 meta.0,
                 tags.join(","),
-                j.map(|j| j.cover_text.clone()),
-                j.map(|j| j.reason.clone()),
+                cover_text,
+                reason,
                 j.map(|j| serde_json::to_string(&j.evidence).unwrap_or_default()),
                 p.ai_status,
             ],
@@ -1223,6 +1509,108 @@ mod tests {
     }
 
     #[test]
+    fn llm_text_fixes_validate_orig_and_skip_manual_edits() {
+        // 临时缓存目录：验证纠错建议的校验与落盘规则
+        let dir = std::env::temp_dir().join(format!("clip_fixes_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seg = |start: f64, text: &str| asr::AsrSegment {
+            start,
+            end: start + 3.0,
+            file_idx: 0,
+            file_start: start,
+            lang: "zh".into(),
+            emotion: String::new(),
+            event: String::new(),
+            text: text.into(),
+            zh_text: None,
+            streamer_secs: None,
+            sc: None,
+            dm: None,
+        };
+        let segments = vec![seg(10.0, "擀甜的"), seg(13.0, "正确的话")];
+        let idx = [0usize, 1];
+        let fixes = vec![
+            // orig 一字不差 → 采纳
+            llm::TextFix { start_line: 0, orig: "擀甜的".into(), fixed: "齁甜的".into() },
+            // orig 与原文对不上 → 丢弃
+            llm::TextFix { start_line: 1, orig: "别的句子".into(), fixed: "改不了的".into() },
+            // fixed 与 orig 相同 → 无意义丢弃
+            llm::TextFix { start_line: 1, orig: "正确的话".into(), fixed: "正确的话".into() },
+            // 行号越界 → 丢弃
+            llm::TextFix { start_line: 9, orig: "x".into(), fixed: "y".into() },
+        ];
+        save_llm_text_fixes(&dir, "t1", &segments, &idx, &fixes);
+        let edits = load_subtitle_edits(&dir.join(".cache"), "t1");
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits.get("10000").map(|e| e.text()), Some("齁甜的".to_string()));
+
+        // 已有人工修订的句子不再被模型建议覆盖
+        let fixes2 = vec![llm::TextFix { start_line: 0, orig: "擀甜的".into(), fixed: "又改一版".into() }];
+        save_llm_text_fixes(&dir, "t1", &segments, &idx, &fixes2);
+        let edits = load_subtitle_edits(&dir.join(".cache"), "t1");
+        assert_eq!(edits.get("10000").map(|e| e.text()), Some("齁甜的".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn masks_banned_words_in_publish_copy() {
+        // 中文词
+        let (m, n) = mask_banned_words("他说了句傻逼然后笑了");
+        assert_eq!((m.as_str(), n), ("他说了句***然后笑了", 1));
+        // 大小写不敏感的 ASCII 词
+        let (m, _) = mask_banned_words("这是什么SB操作");
+        assert_eq!(m, "这是什么***操作");
+        // 长词优先：先替换复合词，短词不再命中
+        let (m, _) = mask_banned_words("他骂了一句你妈逼");
+        assert_eq!(m, "他骂了一句***");
+        // 干净文案原样返回
+        let (m, n) = mask_banned_words("奶姐毒奶中科大考研");
+        assert_eq!((m.as_str(), n), ("奶姐毒奶中科大考研", 0));
+    }
+
+
+    #[test]
+    fn merge_paras_joins_short_same_speaker_lines() {
+        let line = |start: f64, text: &str| TranscriptLine {
+            start,
+            end: start + 2.0,
+            tag: "主播".into(),
+            text: text.into(),
+            sc_text: String::new(),
+            sc_id: None,
+        };
+        // 同说话方的碎句合并成一段，时间范围取首尾
+        let merged = merge_paras(vec![line(10.0, "我们"), line(12.5, "来看一下"), line(14.0, "这波操作")]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "我们 来看一下 这波操作");
+        assert_eq!((merged[0].start, merged[0].end), (10.0, 16.0));
+
+        // 换说话方断段
+        let mut other = line(16.5, "游戏声音");
+        other.tag = "原片".into();
+        let merged = merge_paras(vec![line(10.0, "我们"), other]);
+        assert_eq!(merged.len(), 2);
+
+        // 段首起 45 秒即断段
+        let merged = merge_paras(vec![line(10.0, "a"), line(60.0, "b")]);
+        assert_eq!(merged.len(), 2);
+
+        // SC 行只与同一编号合并，不同 SC 不并
+        let sc_line = |id: usize, text: &str| TranscriptLine {
+            start: 10.0 + id as f64,
+            end: 12.0 + id as f64,
+            tag: "念SC".into(),
+            text: text.into(),
+            sc_text: String::new(),
+            sc_id: Some(id),
+        };
+        let merged = merge_paras(vec![sc_line(1, "谢谢"), sc_line(1, "的SC"), sc_line(2, "另一条")]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "谢谢 的SC");
+    }
+
+    #[test]
     fn transcript_for_llm_uses_subtitle_edits() {
         let seg = |start: f64, text: &str| asr::AsrSegment {
             start,
@@ -1236,6 +1624,7 @@ mod tests {
             zh_text: None,
             streamer_secs: None,
             sc: None,
+            dm: None,
         };
         let mut segments = vec![seg(3193.182, "到了"), seg(3196.67, "谢谢")];
         let edits = HashMap::from([("3193182".to_string(), SubtitleEdit::Text("爆了".to_string()))]);

@@ -527,6 +527,24 @@ export default function ClipReviewView({ anchor, session, onBack, onSubmitClip, 
 
   // 已保存新边界、但切片文件还没按新边界重新剪辑的切片
   const [stale, setStale] = useState({});
+  // 单条重提进行中
+  const [refining, setRefining] = useState(false);
+
+  // AI 重提：只对当前这条重新精修起止，不动其他切片；成功后按新边界重新剪辑
+  const refineOne = async () => {
+    if (!clip || refining) return;
+    setRefining(true);
+    setMessage("");
+    try {
+      const msg = await invokeCommand("anchor_clip_refine_one", { clipId: clip.id });
+      setMessage(typeof msg === "string" ? msg : msg?.message || "重提完成");
+      await loadClips();
+    } catch (err) {
+      setMessage(err?.message || "重提失败");
+    } finally {
+      setRefining(false);
+    }
+  };
 
   // 保存当前界面的全部改动（边界与投稿信息），只写记录不剪辑
   const saveAll = async (c = clip) => {
@@ -1112,6 +1130,14 @@ export default function ClipReviewView({ anchor, session, onBack, onSubmitClip, 
               </button>
               <button className="h-[34px] rounded-lg bg-[#1F5BD8] px-4 text-sm font-semibold text-white disabled:opacity-40" disabled={!dirty} onClick={() => saveAll()}>
                 保存
+              </button>
+              <button
+                className="h-[34px] rounded-lg border border-[#1F5BD8] bg-white px-3 text-sm text-[#1F5BD8] disabled:opacity-40"
+                disabled={refining || dirty}
+                title="让 AI 结合本条前后的字幕重新选定起止（不满意当前边界时使用）"
+                onClick={refineOne}
+              >
+                {refining ? "AI 重提中…" : "AI 重提边界"}
               </button>
               <span className={`text-xs ${dirty || stale[clip.id] ? "text-[#9A4A0C]" : "text-[var(--muted)]"}`}>
                 {dirty

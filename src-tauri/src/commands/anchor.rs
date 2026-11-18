@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::params_from_iter;
@@ -1131,6 +1132,23 @@ fn probe_video_size(path: &str) -> Option<(u32, u32)> {
     let text = String::from_utf8_lossy(&output.stdout);
     let (w, h) = text.trim().split_once('x')?;
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// 单条切片重提：对这一条重新精修起止（复用识别缓存与大模型），不动其他切片。
+/// 只改记录的起止；切片文件由用户在评阅页点「重新剪辑」更新。
+#[tauri::command(async)]
+pub async fn anchor_clip_refine_one(
+    state: State<'_, AppState>,
+    clip_id: i64,
+) -> Result<ApiResponse<String>, String> {
+    if clip_id <= 0 {
+        return Ok(ApiResponse::error("clip_id 无效"));
+    }
+    let cfg = crate::highlight::settings::load(&state.db);
+    match crate::highlight::refine_clip_once(Arc::clone(&state.db), cfg, clip_id).await {
+        Ok(message) => Ok(ApiResponse::success(message)),
+        Err(err) => Ok(ApiResponse::error(err)),
+    }
 }
 
 #[tauri::command(async)]

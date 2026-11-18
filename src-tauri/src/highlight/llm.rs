@@ -119,7 +119,8 @@ fn json_objects(text: &str) -> Vec<Value> {
     out
 }
 
-/// 解析模型输出：优先整体解析，否则取第一个不是 JSON Schema 本身的对象（模型有时会先复述 schema）
+/// 解析模型输出：优先整体解析，否则取第一个不是 JSON Schema 本身的对象（模型有时会先复述 schema）；
+/// 都失败时做一次「截断抢救」——输出被 max_tokens 截断时丢的通常只是尾部条目，补全括号/引号把前面的救回来
 fn parse_content(content: &str) -> Option<Value> {
     let trimmed = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
@@ -127,8 +128,79 @@ fn parse_content(content: &str) -> Option<Value> {
             return Some(v);
         }
     }
-    json_objects(trimmed).into_iter().find(|v| !looks_like_schema(v))
+    if let Some(v) = json_objects(trimmed).into_iter().find(|v| !looks_like_schema(v)) {
+        return Some(v);
+    }
+    salvage_truncated(trimmed)
 }
+
+/// 截断 JSON 抢救：截断通常只丢尾部条目。在最后一个「不在字符串内的逗号/闭合括号」处截掉半截的
+/// 尾部键值对，再闭合未配对的括号重新解析；解析不出完整 JSON 就放弃，绝不硬造内容。
+/// 借鉴竞品实测：直接判失败会白扔一次调用，前面的条目其实写完了。
+fn salvage_truncated(trimmed: &str) -> Option<Value> {
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut cut = 0usize;
+    for (i, ch) in trimmed.char_indices() {
+        if in_str {
+            match (escaped, ch) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            // 闭合括号与逗号都是安全切点；冒号可能是没写完的裸键，不作为切点
+            '}' | ']' | ',' => {
+                if ch == '}' || ch == ']' {
+                    depth = depth.saturating_sub(1);
+                }
+                cut = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if cut == 0 || depth == 0 {
+        return None; // 没有未闭合结构，说明问题不是截断
+    }
+    let fixed = trimmed[..cut].trim_end_matches(',');
+    // 重扫一遍闭合括号（跳过字符串内；此时 cut 之后的部分已丢掉，不可能再有未闭合字符串）
+    let (mut s2, mut esc2, mut stack) = (false, false, Vec::new());
+    for ch in fixed.chars() {
+        if s2 {
+            match (esc2, ch) {
+                (true, _) => esc2 = false,
+                (false, '\\') => esc2 = true,
+                (false, '"') => s2 = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => s2 = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => { stack.pop(); }
+            _ => {}
+        }
+    }
+    let mut cand = String::from(fixed);
+    for open in stack.into_iter().rev() {
+        cand.push(open);
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(&cand) {
+        if !looks_like_schema(&v) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 
 fn looks_like_schema(v: &Value) -> bool {
     v.get("properties").is_some() && v.get("type").and_then(|t| t.as_str()) == Some("object")
@@ -279,6 +351,9 @@ pub async fn list_models(settings: &LlmSettings) -> Result<Vec<String>, String> 
     Ok(ids)
 }
 
+/// 单块最多输出的话题条数：条目过多会把 JSON 挤到输出上限被截断，截断抢救救不回时整块丢失
+const MAX_CLIPS_PER_CHUNK: usize = 20;
+
 fn topics_schema(titles: usize) -> Value {
     let score = json!({"type": "integer", "minimum": 1, "maximum": 10});
     json!({
@@ -286,6 +361,7 @@ fn topics_schema(titles: usize) -> Value {
         "properties": {
             "clips": {
                 "type": "array",
+                "maxItems": MAX_CLIPS_PER_CHUNK,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -334,6 +410,7 @@ const BASE_RULES: &str = "你是B站直播切片编辑。给你一段直播录�
 10. 切片必须以主播的发言为主：「原片」行是正在播放的作品原声，不算主播内容；「原片+主播插话」行里有主播的话。原片情节再精彩，主播没怎么说话也不要切，原片只能作为主播吐槽、观点、反应的铺垫。streamer 分按主播实际说了什么、说了多少来打，主播行很少时 streamer 不超过 3。
 11. 观众点歌、让主播看视频的段落：从主播念这条点歌或请求开始，播放的歌或视频作为铺垫一起切进去（播放部分超过 60 秒的只保留与主播反应相关的部分），到主播评价完为止。
 12. 「念SC」行是主播在朗读观众的 SC，内容是观众写的，不是主播的表现；「念SC+主播」行里夹着主播自己的话；行尾的（SC原文：…）是这条 SC 的原文，识别有误时以原文为准。
+    「念弹幕」行同口径：主播在念观众的普通弹幕，行尾（弹幕原文：…）是那条弹幕的原文；由观众提问或吐槽引出的有趣回应，与「念SC」一样算好素材。
     - SC 写得再好笑，主播只是念完、附和或说“不知道”的，funny 和 streamer 都不超过 4，一般不要切；主播的回应只有一两句的也不要单独切。
     - 由 SC 引出的切片，start 取这条 SC 第一行「念SC」的起始秒（包括“谢谢某某的 SC”）；end 取主播回应这条 SC 的最后一句，不要包含下一条「念SC」。几条 SC 聊的是同一件事、主播连着回应的，可以合成一条。";
 
@@ -351,12 +428,13 @@ const MAX_TOPIC_SECS: i64 = 180;
 /// 把一段转写切成若干话题切片
 pub async fn segment_topics(settings: &LlmSettings, mode: &str, profile: Profile, titles: usize, input: &ChunkInput<'_>) -> Result<Vec<TopicClip>, String> {
     let system = format!(
-        "{}\n{}\n主播名字：{}。一件事通常 30~90 秒；内容连贯完整的可以更长，但不超过 {} 秒。每条给出 {} 个不同角度的标题。没有值得切的内容时 clips 为空数组。",
+        "{}\n{}\n主播名字：{}。一件事通常 30~90 秒；内容连贯完整的可以更长，但不超过 {} 秒。每条给出 {} 个不同角度的标题。没有值得切的内容时 clips 为空数组。本段最多输出 {} 条：高光多时优先保留最精彩的，条目过多会把 JSON 写到长度上限被截断，反而丢掉后面的所有内容。",
         BASE_RULES,
         profile_note(profile),
         input.streamer,
         input.max_secs.min(MAX_TOPIC_SECS),
-        titles
+        titles,
+        MAX_CLIPS_PER_CHUNK
     );
     let user = format!(
         "直播间标题：{}\n\n转写（每行：[起止秒][说话方|情绪/事件] 文本）：\n{}\n\n每分钟弹幕：\n{}",
@@ -380,9 +458,23 @@ pub struct Refined {
     pub grade: String,
     #[serde(default)]
     pub reason: String,
+    /// 字幕纠错建议：orig 与转写原文一字不差才采纳，服务端逐条校验后进评阅页
+    #[serde(default, rename = "textFixes")]
+    pub text_fixes: Vec<TextFix>,
 }
 
-const REFINE_RULES: &str = "你是B站直播切片编辑，正在精修一条候选切片的起止，并判断它值不值得投稿。给你候选切片前后各约 90 秒的逐句转写，每行开头是行号；「主播」是主播的话，「念SC」是主播在朗读观众的 SC（不是主播的表现），「念SC+主播」夹着主播自己的话，「原片」是正在播放的视频或歌曲；行尾【弹幕N】是这句话前后几秒内的弹幕条数，观众反应一般比主播晚几秒，弹幕突然变多的地方通常是笑点。
+/// 一条字幕纠错：orig 必须与字幕原文一字不差（防模型乱改），fixed 为整句修正
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TextFix {
+    #[serde(default)]
+    pub start_line: usize,
+    #[serde(default)]
+    pub orig: String,
+    #[serde(default)]
+    pub fixed: String,
+}
+
+const REFINE_RULES: &str = "你是B站直播切片编辑，正在精修一条候选切片的起止，并判断它值不值得投稿。给你候选切片前后各约 90 秒的逐句转写，每行开头是行号；「主播」是主播的话，「念SC」是主播在朗读观众的 SC（不是主播的表现），「念SC+主播」夹着主播自己的话，「念弹幕」是主播在念观众的普通弹幕（同样不是主播的表现，行尾附弹幕原文），「原片」是正在播放的视频或歌曲；行尾【弹幕N】是这句话前后几秒内的弹幕条数，观众反应一般比主播晚几秒，弹幕突然变多的地方通常是笑点。
 规则：
 1. 起点：从这件事的起因开始。由 SC、提问、点歌引出的，从这条「念SC」的第一行开始（包括“谢谢某某的SC”）；主播自己引出的，从主播开始说这件事的第一句开始。起因在候选范围之前的要往前补，前面无关的内容要去掉。
 2. 终点：到主播把这件事说完、笑点或金句落地、弹幕反应回落为止；遇到下一条无关的「念SC」或话题一转就停。不要为了凑时长带上无关内容，一件事 10 秒说完就切 10 秒。
@@ -392,7 +484,9 @@ const REFINE_RULES: &str = "你是B站直播切片编辑，正在精修一条候
    B＝主播有自己的笑点或鲜明观点，不看前后文能看懂，弹幕有反应；
    C＝其余情况，包括：看视频时插一两句吐槽、对剧情或史实的普通评论、观点平淡、弹幕没有反应、需要前文背景才能看懂。
    一场直播里通常 A 不超过一成、B 约三成，其余都是 C；拿不准时选低的一档。
-5. 只能依据转写判断，转写有识别错误时按上下文理解。reason 用一句话说明起止为什么选在这里、为什么是这个档位。";
+5. 只能依据转写判断，转写有识别错误时按上下文理解。reason 用一句话说明起止为什么选在这里、为什么是这个档位。
+6. 字幕纠错（可选，textFixes）：转写是语音识别生成的，规划时顺带保守纠错——只修「明显读不通、明显同音/形近错字、明显漏字」的句子，宁缺毋滥，没有就给空数组 []。
+   orig 必须与对应行的转写文字一字不差；fixed 是整句修正后的文字；不润色、不删语气词、不改写句式；最多 10 条，按错得最明显的挑。";
 
 /// 杂谈场的卖点常是完整的观点或答题，不一定有笑点，评级标准单独说明
 fn refine_profile_note(profile: Profile) -> &'static str {
@@ -425,7 +519,20 @@ pub async fn refine_clip(settings: &LlmSettings, mode: &str, profile: Profile, i
             "startLine": line, "endLine": line,
             "keep": {"type": "boolean"},
             "grade": {"type": "string", "enum": ["A", "B", "C"]},
-            "reason": {"type": "string"}
+            "reason": {"type": "string"},
+            "textFixes": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "startLine": {"type": "integer", "minimum": 0, "maximum": input.last_line},
+                        "orig": {"type": "string"},
+                        "fixed": {"type": "string"}
+                    },
+                    "required": ["startLine", "orig", "fixed"]
+                }
+            }
         },
         "required": ["startLine", "endLine", "keep", "grade", "reason"]
     });
@@ -497,5 +604,34 @@ mod tests {
         // 模型先复述 schema 再给结果
         let echoed = r#"{"type":"object","properties":{"ok":{"type":"boolean"}}} {"ok": true, "note": "a}b"}"#;
         assert_eq!(parse_content(echoed).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn salvages_truncated_topic_json() {
+        // 截断在键名中间：丢掉半截的键值对，前面的条目完整救回
+        let cut_key = r#"{"clips":[{"start":10,"end":20,"titles":["你好"],"eviden"#;
+        let v = parse_content(cut_key).unwrap();
+        let clips = v["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0]["titles"][0], "你好");
+
+        // 截断在字符串值中间：最后一个安全点是逗号，半截字符串整段丢掉
+        let cut_str = r#"{"clips": [{"start": 5, "titles": ["a", "b"#;
+        let v = parse_content(cut_str).unwrap();
+        assert_eq!(v["clips"][0]["titles"].as_array().unwrap().len(), 1);
+
+        // 多条话题救回前面的；尾部可能留一个半截条目（截断点落在条目内部的逗号），
+        // 由调用方按字段校验（end<=start / 时长下限）过滤，这里只验证不整块丢失
+        let cut_multi = r#"{"clips":[{"start":1,"end":2},{"start":3,"end":4},{"start":5,"end":"#;
+        let v = parse_content(cut_multi).unwrap();
+        assert!(v["clips"].as_array().unwrap().len() >= 2);
+
+        // 没有截断的正常 JSON 不走抢救
+        assert_eq!(parse_content(r#"{"ok": true}"#).unwrap()["ok"], true);
+
+        // 只有裸键没有任何安全切点：救不了
+        assert!(parse_content(r#"{"a":"#).is_none());
+        // 根本不是 JSON
+        assert!(parse_content("模型拒绝了请求").is_none());
     }
 }
