@@ -7,6 +7,7 @@ pub mod asr;
 pub mod boundary;
 pub mod cutter;
 pub mod danmaku;
+pub mod dm_match;
 pub mod llm;
 pub mod settings;
 pub mod signals;
@@ -352,6 +353,10 @@ async fn run_task(ctx: &Arc<ClipContext>, task_id: i64) -> Result<(usize, Vec<St
             apply_subtitle_edits(&mut p.segments, &load_subtitle_edits(&clips_dir.join(".cache"), &ids_key));
             let scs: Vec<(f64, String)> = events.iter().filter(|e| e.kind == danmaku::DanmakuKind::SuperChat).map(|e| (e.t, e.text.clone())).collect();
             boundary::mark_sc_readings(&mut p.segments, &scs);
+            // 主播念普通弹幕的配对标注（SC 已单独覆盖）：让观众原话进提示词，帮助识别"念观众发言"类互动
+            for (idx, dm) in dm_match::match_readings(&p.segments, &events) {
+                p.segments[idx].dm = Some(dm);
+            }
             topic_clips(ctx, task_id, &cfg, &mode, profile, &room_title, &streamer, &p, &events, has_danmaku, session_secs, &spans, &mut warnings).await?
         }
         (_, p) => {
@@ -649,6 +654,9 @@ fn window_transcript(segments: &[asr::AsrSegment], start: f64, end: f64) -> (Str
         // 原片句子里主播插了话（不到一半）时单独标出，免得大模型把主播的吐槽当成原片
         let speaker = if let Some(sc) = &s.sc {
             if sc.pure { "念SC" } else { "念SC+主播" }
+        } else if s.dm.is_some() {
+            // 配对成功的主播念弹幕句：内容和说话人都算观众的，主播只是转述
+            "念弹幕"
         } else if s.is_streamer() {
             "主播"
         } else if s.streamer_seconds() >= 1.0 {
@@ -674,7 +682,10 @@ fn window_transcript(segments: &[asr::AsrSegment], start: f64, end: f64) -> (Str
             .as_ref()
             .filter(|sc| !sc.text.is_empty() && !matches!(prev_sc, Some(id) if id == sc.id))
             .map(|sc| format!("（SC原文：{}）", sc.text))
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                // 念弹幕句附上弹幕原文（观众的原话，主播只是转述）；连续多句念同一条时逐句都带，方便大模型对齐
+                s.dm.as_ref().map(|dm| format!("（弹幕原文：{}）", dm.text)).unwrap_or_default()
+            });
         prev_sc = s.sc.as_ref().map(|sc| sc.id);
         lines.push(format!("[{:.1}-{:.1}s][{}] {}{}", s.start, s.end, tag, shown, sc_text));
         plain.push_str(text);
@@ -1364,6 +1375,7 @@ mod tests {
             zh_text: None,
             streamer_secs: None,
             sc: None,
+            dm: None,
         };
         let mut segments = vec![seg(3193.182, "到了"), seg(3196.67, "谢谢")];
         let edits = HashMap::from([("3193182".to_string(), SubtitleEdit::Text("爆了".to_string()))]);

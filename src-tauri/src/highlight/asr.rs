@@ -695,6 +695,9 @@ pub struct AsrSegment {
     /// 这句是主播在念观众的 SC（分析时按弹幕里的 SC 原文标注，不缓存）
     #[serde(skip)]
     pub sc: Option<ScRead>,
+    /// 这句是主播在念观众的普通弹幕（分析时按保序字符覆盖配对标注，不缓存）
+    #[serde(skip)]
+    pub dm: Option<super::dm_match::DmRead>,
 }
 
 impl AsrSegment {
@@ -860,6 +863,7 @@ pub fn full_pass(
                                 zh_text: None,
                                 streamer_secs: None,
                                 sc: None,
+                                dm: None,
                             });
                         }
                     }
@@ -963,6 +967,7 @@ pub fn srt_pass(files: &[AudioFile]) -> Option<FullPass> {
                 zh_text: Some(line),
                 streamer_secs: None,
                 sc: None,
+                dm: None,
             });
         }
     }
