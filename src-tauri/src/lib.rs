@@ -280,6 +280,7 @@ pub fn run() {
             commands::competitor::competitor_up_list,
             commands::competitor::competitor_up_save,
             commands::competitor::competitor_up_delete,
+            commands::competitor::competitor_clip_reassign,
             commands::competitor_run::competitor_compare_run,
             commands::competitor_run::competitor_compare_get,
             commands::auto_clip::anchor_voiceprint_enroll,

@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 
+import { convertFileSrc } from "@tauri-apps/api/core";
+
 import { invokeCommand } from "../../lib/tauri";
+import CompetitorClipDetail from "./CompetitorClipDetail";
 
 /** 覆盖档位 → 展示样式 */
 const COVERAGE_META = {
@@ -44,6 +47,8 @@ export default function CompetitorCompareView({ anchor, task, onBack, onOpenClip
   const [filter, setFilter] = useState("all");
   const [message, setMessage] = useState("");
   const [advice, setAdvice] = useState({});
+  // 正在双屏对比的条目
+  const [detailItem, setDetailItem] = useState(null);
 
   const load = async () => {
     setLoading(true);
@@ -109,6 +114,30 @@ export default function CompetitorCompareView({ anchor, task, onBack, onOpenClip
       FULL: list.filter((i) => i.coverage === "FULL").length,
     };
   }, [report]);
+
+  if (detailItem) {
+    return (
+      <CompetitorClipDetail
+        mine={{
+          id: detailItem.mineClipId,
+          title: detailItem.mineTitle,
+          start: detailItem.mineStart,
+          end: detailItem.mineEnd,
+          videoPath: detailItem.mineVideoPath ? convertFileSrc(detailItem.mineVideoPath) : "",
+        }}
+        theirs={{
+          title: detailItem.title,
+          start: detailItem.located?.start,
+          end: detailItem.located?.end,
+          videoPath: detailItem.competitorVideoPath
+            ? convertFileSrc(detailItem.competitorVideoPath)
+            : "",
+        }}
+        onBack={() => setDetailItem(null)}
+        onOpenClip={onOpenClip}
+      />
+    );
+  }
 
   return (
     <div className="space-y-3">
@@ -189,6 +218,7 @@ export default function CompetitorCompareView({ anchor, task, onBack, onOpenClip
                 advice={advice[item.competitorClipId]}
                 onGenerate={() => generateOne(item)}
                 onOpenClip={onOpenClip}
+                onOpenDetail={() => setDetailItem(item)}
               />
             ))}
             {items.length === 0 ? (
@@ -217,7 +247,7 @@ function SummaryCard({ label, value, sub, tone }) {
   );
 }
 
-function CompareCard({ item, advice, onGenerate, onOpenClip }) {
+function CompareCard({ item, advice, onGenerate, onOpenClip, onOpenDetail }) {
   const meta = COVERAGE_META[item.coverage] || COVERAGE_META.SKIP;
   const layer = item.reasonLayer ? LAYER_META[item.reasonLayer] : null;
   const theirsDur = item.located ? item.located.end - item.located.start : item.durationSecs;
@@ -296,14 +326,21 @@ function CompareCard({ item, advice, onGenerate, onOpenClip }) {
             <div className="flex-1" />
             <button
               className="h-6 rounded border border-black/10 bg-[#F6F8FA] px-2 text-[11px] font-semibold text-[#5B6170] hover:bg-[#EEF1F4]"
-              onClick={() => onOpenClip?.(item.mineClipId, true)}
+              onClick={onOpenDetail}
             >
-              查看详情
+              双屏对比
             </button>
           </div>
         ) : item.coverage === "ZERO" ? (
           <div className="flex items-center gap-1.5 border-t border-dashed border-black/10 pt-1.5 text-[10.5px] text-[#B42318]">
             <span>你在该时段没有切片</span>
+            <div className="flex-1" />
+            <button
+              className="h-6 rounded border border-black/10 bg-[#F6F8FA] px-2 text-[11px] font-semibold text-[#5B6170] hover:bg-[#EEF1F4]"
+              onClick={onOpenDetail}
+            >
+              查看详情
+            </button>
           </div>
         ) : null}
       </div>

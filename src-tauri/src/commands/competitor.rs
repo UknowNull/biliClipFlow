@@ -303,10 +303,147 @@ mod tests {
     }
 
     #[test]
+    fn reassign_voids_old_report() {
+        let db = mem_db();
+        let now = now_rfc3339();
+        // 两条任务 + 一条竞品切片 + 一条旧报告
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO live_clip_task (id, room_id, record_ids, date_label, status, clip_count, create_time, update_time, session_key) \
+                 VALUES (1, 'r', '[]', 'd1', 'DONE', 0, ?1, ?1, 's1')",
+                [&now],
+            )?;
+            conn.execute(
+                "INSERT INTO live_clip_task (id, room_id, record_ids, date_label, status, clip_count, create_time, update_time, session_key) \
+                 VALUES (2, 'r', '[]', 'd2', 'DONE', 0, ?1, ?1, 's2')",
+                [&now],
+            )?;
+            conn.execute(
+                "INSERT INTO competitor_clip (room_id, up_uid, bvid, title, task_id, session_key, create_time, update_time) \
+                 VALUES ('r', 'u', 'BV1a', 't', 1, 's1', ?1, ?1)",
+                [&now],
+            )?;
+            conn.execute(
+                "INSERT INTO competitor_compare (task_id, room_id, status, create_time, update_time) \
+                 VALUES (1, 'r', 'DONE', ?1, ?1)",
+                [&now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let clip_id: i64 = db
+            .with_conn(|conn| conn.query_row("SELECT id FROM competitor_clip", [], |r| r.get(0)))
+            .unwrap();
+
+        reassign(&db, "r", clip_id, 2, "s2").unwrap();
+
+        let (task, status): (i64, String) = db
+            .with_conn(|conn| {
+                let t = conn.query_row(
+                    "SELECT task_id FROM competitor_clip WHERE id = ?1", [clip_id], |r| r.get(0))?;
+                let s = conn.query_row(
+                    "SELECT status FROM competitor_compare WHERE task_id = 1", [], |r| r.get(0))?;
+                Ok((t, s))
+            })
+            .unwrap();
+        assert_eq!(task, 2, "归属应改到新场次");
+        assert_eq!(status, "VOID", "旧场次报告应作废");
+    }
+
+    #[test]
+    fn reassign_to_same_task_keeps_report() {
+        let db = mem_db();
+        let now = now_rfc3339();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO competitor_clip (room_id, up_uid, bvid, title, task_id, session_key, create_time, update_time) \
+                 VALUES ('r', 'u', 'BV1b', 't', 1, 's1', ?1, ?1)",
+                [&now],
+            )?;
+            conn.execute(
+                "INSERT INTO competitor_compare (task_id, room_id, status, create_time, update_time) \
+                 VALUES (1, 'r', 'DONE', ?1, ?1)",
+                [&now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let clip_id: i64 = db
+            .with_conn(|conn| conn.query_row("SELECT id FROM competitor_clip", [], |r| r.get(0)))
+            .unwrap();
+        reassign(&db, "r", clip_id, 1, "s1").unwrap();
+        let status: String = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT status FROM competitor_compare WHERE task_id = 1", [], |r| r.get(0))
+            })
+            .unwrap();
+        assert_eq!(status, "DONE", "归属没变时报告不该作废");
+    }
+
+    #[test]
     fn rejects_empty_uid() {
         let db = mem_db();
         let mut bad = input("25034104", "82679456");
         bad.up_uid = "   ".into();
         assert!(save(&db, &bad).is_err());
+    }
+}
+
+
+/// 修改竞品切片的归属场次。
+///
+/// 归属变了，旧报告就不能再用——标记 VOID，由调用方触发新场次重新对比。
+pub fn reassign(
+    db: &Db,
+    room_id: &str,
+    clip_id: i64,
+    task_id: i64,
+    session_key: &str,
+) -> Result<(), String> {
+    let now = now_rfc3339();
+    db.with_conn_mut(|conn| {
+        let tx = conn.transaction()?;
+        let old_task: Option<i64> = tx
+            .query_row(
+                "SELECT task_id FROM competitor_clip WHERE id = ?1 AND room_id = ?2",
+                (clip_id, room_id),
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+        tx.execute(
+            "UPDATE competitor_clip SET task_id = ?1, session_key = ?2, update_time = ?3 \
+             WHERE id = ?4 AND room_id = ?5",
+            (task_id, session_key, &now, clip_id, room_id),
+        )?;
+        // 旧场次的报告作废
+        if let Some(old) = old_task {
+            if old != task_id {
+                tx.execute(
+                    "UPDATE competitor_compare SET status = 'VOID', update_time = ?1 \
+                     WHERE task_id = ?2 AND status = 'DONE'",
+                    (&now, old),
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .map_err(|err| format!("修改归属场次失败: {}", err))?;
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub fn competitor_clip_reassign(
+    state: State<'_, AppState>,
+    room_id: String,
+    clip_id: i64,
+    task_id: i64,
+    session_key: String,
+) -> ApiResponse<bool> {
+    match reassign(&state.db, &room_id, clip_id, task_id, &session_key) {
+        Ok(_) => ApiResponse::success(true),
+        Err(err) => ApiResponse::error(err),
     }
 }

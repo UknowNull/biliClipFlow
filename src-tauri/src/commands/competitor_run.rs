@@ -42,6 +42,8 @@ struct CompetitorRow {
     status: String,
     status_note: String,
     asr_path: String,
+    /// 竞品视频本地路径
+    file_path: String,
 }
 
 fn load_competitor_rows(db: &Db, task_id: i64) -> Result<Vec<CompetitorRow>, String> {
@@ -49,7 +51,7 @@ fn load_competitor_rows(db: &Db, task_id: i64) -> Result<Vec<CompetitorRow>, Str
         let mut stmt = conn.prepare(
             "SELECT c.id, c.bvid, COALESCE(c.title,''), c.up_uid, COALESCE(u.up_name,''), \
                     COALESCE(c.cover_url,''), COALESCE(c.duration_secs, 0), c.status, \
-                    COALESCE(c.status_note,''), COALESCE(c.asr_path,'') \
+                    COALESCE(c.status_note,''), COALESCE(c.asr_path,''), COALESCE(c.file_path,'') \
              FROM competitor_clip c \
              LEFT JOIN competitor_up u ON u.room_id = c.room_id AND u.up_uid = c.up_uid \
              WHERE c.task_id = ?1 ORDER BY c.pub_time ASC, c.id ASC",
@@ -66,6 +68,7 @@ fn load_competitor_rows(db: &Db, task_id: i64) -> Result<Vec<CompetitorRow>, Str
                 status: row.get(7)?,
                 status_note: row.get(8)?,
                 asr_path: row.get(9)?,
+                file_path: row.get(10)?,
             })
         })?;
         rows.collect()
@@ -163,6 +166,8 @@ pub fn run_compare(db: &Db, room_id: &str, task_id: i64, max_candidates: usize) 
                 reason: format!("竞品未处理完成（{}）", status_label(&row.status)),
                 suggestions: Vec::new(),
                 status_note: row.status_note.clone(),
+                mine_video_path: String::new(),
+                competitor_video_path: String::new(),
             });
             continue;
         }
@@ -188,6 +193,8 @@ pub fn run_compare(db: &Db, room_id: &str, task_id: i64, max_candidates: usize) 
                 reason: "本场识别数据已清理，无法定位竞品内容".into(),
                 suggestions: Vec::new(),
                 status_note: String::new(),
+                mine_video_path: String::new(),
+                competitor_video_path: String::new(),
             });
             continue;
         };
@@ -225,6 +232,8 @@ pub fn run_compare(db: &Db, room_id: &str, task_id: i64, max_candidates: usize) 
                 reason: "本场转写里找不到竞品内容，可能归属错了场次".into(),
                 suggestions: Vec::new(),
                 status_note: String::new(),
+                mine_video_path: String::new(),
+                competitor_video_path: String::new(),
             });
             continue;
         };
@@ -288,6 +297,11 @@ pub fn run_compare(db: &Db, room_id: &str, task_id: i64, max_candidates: usize) 
             reason,
             suggestions,
             status_note: String::new(),
+            mine_video_path: mine_clip
+                .as_ref()
+                .map(|clip| clip.file_path.clone())
+                .unwrap_or_default(),
+            competitor_video_path: row.file_path.clone(),
         });
     }
 

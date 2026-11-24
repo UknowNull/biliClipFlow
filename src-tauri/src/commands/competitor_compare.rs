@@ -74,6 +74,12 @@ pub struct ClipComparison {
     /// 用户可采纳的优化建议
     pub suggestions: Vec<String>,
     pub status_note: String,
+    /// 本地切片预览路径（双屏对比用）
+    #[serde(default)]
+    pub mine_video_path: String,
+    /// 竞品视频路径（双屏对比用）
+    #[serde(default)]
+    pub competitor_video_path: String,
 }
 
 /// 交并比：(交集 / 并集)。两段完全不重叠时为 0。
@@ -220,6 +226,8 @@ pub struct LocalClip {
     pub title: String,
     pub start: f64,
     pub end: f64,
+    /// 切片视频的本地路径
+    pub file_path: String,
 }
 
 /// 找与给定区间交并比最高的本地切片
@@ -333,7 +341,7 @@ pub fn suggestions_for(
 pub fn load_local_clips(db: &Db, task_id: i64) -> Result<Vec<LocalClip>, String> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, COALESCE(titles, ''), start_offset, end_offset \
+            "SELECT id, COALESCE(titles, ''), start_offset, end_offset, COALESCE(file_path, '') \
              FROM live_clip_item WHERE task_id = ?1 AND status = 'SUCCESS' ORDER BY start_offset",
         )?;
         let rows = stmt.query_map([task_id], |row| {
@@ -347,6 +355,7 @@ pub fn load_local_clips(db: &Db, task_id: i64) -> Result<Vec<LocalClip>, String>
                 title,
                 start: row.get(2)?,
                 end: row.get(3)?,
+                file_path: row.get(4)?,
             })
         })?;
         rows.collect()
@@ -431,9 +440,9 @@ mod tests {
     #[test]
     fn best_local_clip_picks_highest_overlap() {
         let clips = vec![
-            LocalClip { id: 1, title: "A".into(), start: 0.0, end: 30.0 },
-            LocalClip { id: 2, title: "B".into(), start: 100.0, end: 160.0 },
-            LocalClip { id: 3, title: "C".into(), start: 500.0, end: 510.0 },
+            LocalClip { id: 1, title: "A".into(), start: 0.0, end: 30.0, file_path: String::new() },
+            LocalClip { id: 2, title: "B".into(), start: 100.0, end: 160.0, file_path: String::new() },
+            LocalClip { id: 3, title: "C".into(), start: 500.0, end: 510.0, file_path: String::new() },
         ];
         let (clip, score) = best_local_clip((105.0, 155.0), &clips).unwrap();
         assert_eq!(clip.id, 2);
