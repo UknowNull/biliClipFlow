@@ -39,16 +39,57 @@ export default function CompetitorConfigModal({ roomId, roomName, onClose }) {
     }
   };
 
+  /** 查 UP 昵称与头像；失败返回 null，不阻塞配置流程 */
+  const fetchUpInfo = async (uid) => {
+    try {
+      const info = await invokeCommand("competitor_up_info", { upUid: uid });
+      if (info?.avatarUrl) {
+        // B站图片有防盗链，走本地代理转成 data URL
+        try {
+          const proxied = await invokeCommand("video_proxy_image", { url: info.avatarUrl });
+          if (proxied) return { ...info, avatarData: proxied };
+        } catch {
+          // 头像取不到不影响昵称
+        }
+      }
+      return info;
+    } catch {
+      return null;
+    }
+  };
+
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
+  // 已保存但缺昵称的 UP（例如早期版本存的），打开时补查一次
+  useEffect(() => {
+    const missing = ups.filter((item) => !item.upName && item.upUid);
+    if (!missing.length) return;
+    let cancelled = false;
+    (async () => {
+      for (const item of missing) {
+        const info = await fetchUpInfo(item.upUid);
+        if (cancelled || !info) continue;
+        setUps((prev) =>
+          prev.map((row) =>
+            row.upUid === item.upUid ? { ...row, upName: info.upName } : row,
+          ),
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ups.length]);
+
   const patchUp = (index, patch) => {
     setUps((prev) => prev.map((item, i) => (i === index ? { ...item, ...patch } : item)));
   };
 
-  const addUp = () => {
+  const addUp = async () => {
     const uid = newUid.trim();
     if (!uid) {
       setMessage("请输入竞品 UP 主的 UID 或空间链接");
@@ -61,13 +102,17 @@ export default function CompetitorConfigModal({ roomId, roomName, onClose }) {
       setMessage("该 UP 主已添加");
       return;
     }
+    setMessage("正在查询该 UP 主…");
+    // 先查昵称和头像再插入，避免界面上出现「待识别昵称」
+    const info = await fetchUpInfo(normalized);
     setUps((prev) => [
       ...prev.map((item) => ({ ...item, collapsed: true })),
       {
         id: 0,
         roomId,
         upUid: normalized,
-        upName: "",
+        upName: info?.upName || "",
+        avatarData: info?.avatarData || "",
         relation: "OR",
         titleKeywords: [],
         tagKeywords: [],
@@ -78,7 +123,7 @@ export default function CompetitorConfigModal({ roomId, roomName, onClose }) {
       },
     ]);
     setNewUid("");
-    setMessage("");
+    setMessage(info ? "" : `UID ${normalized} 查不到用户信息，可稍后重试`);
   };
 
   const removeUp = (index) => {
@@ -182,12 +227,20 @@ export default function CompetitorConfigModal({ roomId, roomName, onClose }) {
                     className="flex cursor-pointer items-center gap-2.5 bg-[#fafcfd] px-3 py-2.5"
                     onClick={() => patchUp(index, { collapsed: !up.collapsed })}
                   >
-                    <span className="flex h-7 w-7 flex-none items-center justify-center rounded-full bg-[#d8e6ee] text-[11px] font-bold text-[#4a7c96]">
-                      {(up.upName || up.upUid).slice(0, 1)}
-                    </span>
+                    {up.avatarData ? (
+                      <img
+                        src={up.avatarData}
+                        alt=""
+                        className="h-7 w-7 flex-none rounded-full object-cover"
+                      />
+                    ) : (
+                      <span className="flex h-7 w-7 flex-none items-center justify-center rounded-full bg-[#d8e6ee] text-[11px] font-bold text-[#4a7c96]">
+                        {(up.upName || up.upUid).slice(0, 1)}
+                      </span>
+                    )}
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-xs font-semibold text-[var(--ink)]">
-                        {up.upName || "待识别昵称"}
+                        {up.upName || "未查询到昵称"}
                       </div>
                       <div className="text-[11px] text-[var(--muted)]">UID {up.upUid}</div>
                     </div>
@@ -275,12 +328,12 @@ export default function CompetitorConfigModal({ roomId, roomName, onClose }) {
               value={newUid}
               onChange={(event) => setNewUid(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter") addUp();
+                if (event.key === "Enter") void addUp();
               }}
             />
             <button
               className="h-9 rounded-lg bg-[#1F5BD8] px-3 text-xs font-semibold text-white hover:brightness-110"
-              onClick={addUp}
+              onClick={() => void addUp()}
             >
               添加
             </button>

@@ -447,3 +447,59 @@ pub fn competitor_clip_reassign(
         Err(err) => ApiResponse::error(err),
     }
 }
+
+
+/// 竞品 UP 主的基本信息，用于配置弹窗回显头像和昵称。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompetitorUpInfo {
+    pub up_uid: String,
+    pub up_name: String,
+    pub avatar_url: String,
+}
+
+/// 查 B站用户信息（昵称 + 头像）。
+/// 用主播信息同一套接口，避免为竞品单独引一套调用。
+#[tauri::command(async)]
+pub async fn competitor_up_info(
+    state: State<'_, AppState>,
+    up_uid: String,
+) -> Result<ApiResponse<CompetitorUpInfo>, String> {
+    let uid = up_uid.trim().to_string();
+    if uid.is_empty() {
+        return Ok(ApiResponse::error("UID 不能为空"));
+    }
+    let params = vec![("uid".to_string(), uid.clone())];
+    let data = match state
+        .bilibili
+        .get_json(
+            "https://api.live.bilibili.com/live_user/v1/Master/info",
+            &params,
+            None,
+            false,
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => return Ok(ApiResponse::error(format!("查询 UP 信息失败: {}", err))),
+    };
+    let info = data.get("info").cloned().unwrap_or(serde_json::Value::Null);
+    let name = info
+        .get("uname")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let avatar = info
+        .get("face")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return Ok(ApiResponse::error(format!("UID {} 查不到用户信息", uid)));
+    }
+    Ok(ApiResponse::success(CompetitorUpInfo {
+        up_uid: uid,
+        up_name: name,
+        avatar_url: avatar,
+    }))
+}
