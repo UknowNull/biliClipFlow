@@ -22,9 +22,11 @@ const STRUCTURED_OPTIONS = [
   { value: "prompt", label: "仅提示词" },
 ];
 
+// 思考档位：不同网关接受的枚举值不一致。
+// "none" 在 OpenAI 与多数中转网关都可用；"off" 是旧写法，部分网关会直接 400。
 const REASONING_OPTIONS = [
-  { value: "", label: "不指定" },
-  { value: "off", label: "关闭（off）" },
+  { value: "", label: "不指定（由服务端决定）" },
+  { value: "none", label: "关闭（none）" },
   { value: "low", label: "低（low）" },
   { value: "medium", label: "中（medium）" },
   { value: "high", label: "高（high）" },

@@ -225,8 +225,14 @@ async fn chat_json_inner(settings: &LlmSettings, mode: &str, system: &str, user:
         // 推理类模型会把思考过程计入输出长度，上限过小会截断 JSON
         "max_tokens": 16384,
     });
-    if !settings.reasoning_effort.is_empty() {
-        body["reasoning_effort"] = json!(settings.reasoning_effort);
+    // "off" 是旧写法：部分网关（api.site 等）收到它会直接 400，
+    // 统一映射成 "none"（OpenAI 与多数中转网关都接受）。
+    let effort = match settings.reasoning_effort.trim() {
+        "off" => "none",
+        other => other,
+    };
+    if !effort.is_empty() {
+        body["reasoning_effort"] = json!(effort);
     }
     match mode {
         "json_schema" => {
