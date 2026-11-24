@@ -1206,6 +1206,7 @@ pub fn anchor_record_delete(
     delete_records: bool,
     delete_files: bool,
     delete_clips: bool,
+    delete_competitor: bool,
     clip_task_id: Option<i64>,
 ) -> ApiResponse<usize> {
     let ids = normalize_record_ids(&record_ids);
@@ -1268,6 +1269,13 @@ pub fn anchor_record_delete(
                     "DELETE FROM live_record_task WHERE id = ?1 AND room_id = ?2",
                     (id, &room),
                 )?;
+            }
+        }
+        if let (true, Some(task_id)) = (delete_competitor, clip_task_id) {
+            if task_id > 0 {
+                // 竞品切片与对比报告都归属到场次，一并清掉，避免孤儿数据
+                tx.execute("DELETE FROM competitor_clip WHERE task_id = ?1", [task_id])?;
+                tx.execute("DELETE FROM competitor_compare WHERE task_id = ?1", [task_id])?;
             }
         }
         if let (true, Some(task_id)) = (delete_clips, clip_task_id) {

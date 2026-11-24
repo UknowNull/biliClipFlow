@@ -1,6 +1,11 @@
 pub mod anchor;
 pub mod app_update;
 pub mod auto_clip;
+pub mod competitor;
+pub mod competitor_discover;
+pub mod competitor_compare;
+pub mod competitor_media;
+pub mod competitor_run;
 pub mod auth;
 pub mod baidu_sync;
 pub mod download;

@@ -3,6 +3,8 @@ import { confirm as dialogConfirm } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../../lib/tauri";
 import SessionEventsModal from "./SessionEventsModal";
 import ImportRecordsModal from "./ImportRecordsModal";
+import CompetitorConfigModal from "./CompetitorConfigModal";
+import CompetitorCompareView from "./CompetitorCompareView";
 
 const SESSION_GAP_MS = 30 * 60 * 1000;
 const ACTIVE = ["RUNNING", "QUEUED"];
@@ -102,6 +104,9 @@ function Spark({ heat }) {
 
 export default function RecordManageView({ anchor, records, loading, error, onBack, onOpenReview, onReload }) {
   const [importOpen, setImportOpen] = useState(false);
+  const [competitorOpen, setCompetitorOpen] = useState(false);
+  // 正在查看竞品对比的场次；为 null 时显示场次列表
+  const [compareSession, setCompareSession] = useState(null);
   const [summaries, setSummaries] = useState([]);
   const [heat, setHeat] = useState({});
   const [filter, setFilter] = useState("all");
@@ -112,6 +117,8 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
   const [deleteRecords, setDeleteRecords] = useState(true);
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [deleteClips, setDeleteClips] = useState(false);
+  // 竞品切片默认勾选，避免残留指向已删场次的孤儿数据
+  const [deleteCompetitor, setDeleteCompetitor] = useState(true);
   const [message, setMessage] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [profile, setProfile] = useState("reaction");
@@ -207,6 +214,7 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
         deleteRecords,
         deleteFiles,
         deleteClips: deleteClips && deleteTarget.task?.clipCount > 0,
+        deleteCompetitor: deleteCompetitor && Boolean(deleteTarget.task?.taskId),
         clipTaskId: deleteTarget.task?.taskId ?? null,
       });
       setMessage("已删除");
@@ -218,6 +226,7 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
       setDeleteRecords(true);
       setDeleteFiles(false);
       setDeleteClips(false);
+      setDeleteCompetitor(true);
     }
   };
 
@@ -248,6 +257,31 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
     return ["未分析", "bg-black/5 text-[var(--muted)]"];
   };
 
+  // 查看某个场次的竞品对比报告时，整页替换为报告视图
+  if (compareSession) {
+    return (
+      <div className="space-y-4">
+        <CompetitorCompareView
+          anchor={anchor}
+          task={{
+            id: compareSession.task?.taskId,
+            dateLabel: compareSession.day,
+            clipCount: compareSession.task?.clipCount ?? 0,
+          }}
+          onBack={() => setCompareSession(null)}
+          onOpenClip={(clipId) => onOpenReview({ ...compareSession, task: compareSession.task, focusClipId: clipId })}
+        />
+        {competitorOpen ? (
+          <CompetitorConfigModal
+            roomId={anchor.uid}
+            roomName={anchor.nickname}
+            onClose={() => setCompetitorOpen(false)}
+          />
+        ) : null}
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
       <section className="flex flex-wrap items-center gap-4 rounded-2xl bg-[var(--surface)]/90 p-5 shadow-sm ring-1 ring-black/5">
@@ -266,8 +300,17 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
           <span className={`h-2 w-2 rounded-full ${running ? "bg-amber-500" : "bg-emerald-600"}`} />
           分析队列：{queueText}
         </span>
-        <button className="h-9 rounded-lg border border-black/10 bg-white px-3 text-sm text-[var(--ink)] hover:border-black/20" onClick={() => setImportOpen(true)}>
+        <button
+          className="h-9 rounded-lg bg-[#1F5BD8] px-3 text-sm font-semibold text-white hover:brightness-110"
+          onClick={() => setImportOpen(true)}
+        >
           导入录播
+        </button>
+        <button
+          className="h-9 rounded-lg border border-[rgba(31,79,184,0.32)] bg-[#EEF3FF] px-3 text-sm font-semibold text-[#1F4FB8] hover:bg-[#E3ECFF]"
+          onClick={() => setCompetitorOpen(true)}
+        >
+          竞品分析
         </button>
         <button
           className={`h-9 rounded-lg border px-3 text-sm ${settingsOpen ? "border-blue-300 bg-blue-50 text-blue-700" : "border-black/10 bg-white text-[var(--ink)] hover:border-black/20"}`}
@@ -445,6 +488,14 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                             评阅切片
                           </button>
                         ) : null}
+                        {st === "done" && s.task.clipCount > 0 ? (
+                          <button
+                            className="h-8 whitespace-nowrap rounded-lg border border-[rgba(31,79,184,0.32)] bg-[#EEF3FF] px-2.5 text-sm font-semibold text-[#1F4FB8] transition hover:bg-[#E3ECFF]"
+                            onClick={() => setCompareSession(s)}
+                          >
+                            竞品对比
+                          </button>
+                        ) : null}
                         <button
                           className="h-8 whitespace-nowrap rounded-lg border border-[#1F7A45]/30 bg-[#E8F5EE] px-2.5 text-sm font-semibold text-[#1F7A45] transition hover:border-[#1F7A45]/50 disabled:opacity-50"
                           disabled={st === "running"}
@@ -472,6 +523,7 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                             setDeleteRecords(true);
                             setDeleteFiles(false);
                             setDeleteClips(false);
+                            setDeleteCompetitor(true);
                           }}
                         >
                           删除
@@ -569,8 +621,24 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                   {deleteTarget.task ? "这一场还没有分析出切片" : "这一场还没有进行切片分析"}
                 </div>
               )}
+              {deleteTarget.task?.taskId ? (
+                <label className="flex items-start gap-2 border-t border-black/10 pt-2.5 text-xs text-[var(--ink)]">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={deleteCompetitor}
+                    onChange={(e) => setDeleteCompetitor(e.target.checked)}
+                  />
+                  <span>
+                    删除竞品切片
+                    <span className="block text-[var(--muted)]">
+                      删除这一场归属的竞品视频、转写和对比报告
+                    </span>
+                  </span>
+                </label>
+              ) : null}
             </div>
-            {!deleteRecords && !deleteFiles && !(deleteClips && deleteTarget.task?.clipCount > 0) ? (
+            {!deleteRecords && !deleteFiles && !(deleteClips && deleteTarget.task?.clipCount > 0) && !deleteCompetitor ? (
               <div className="mt-2 text-xs text-rose-600">请至少选择一项要删除的内容</div>
             ) : null}
             <div className="mt-4 flex justify-end gap-2">
@@ -589,6 +657,13 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
         </div>
       ) : null}
       {importOpen ? <ImportRecordsModal anchor={anchor} onClose={() => setImportOpen(false)} onImported={onReload} /> : null}
+      {competitorOpen ? (
+        <CompetitorConfigModal
+          roomId={anchor.uid}
+          roomName={anchor.nickname}
+          onClose={() => setCompetitorOpen(false)}
+        />
+      ) : null}
       {eventsSession ? <SessionEventsModal roomId={anchor.uid} session={eventsSession} onClose={() => setEventsSession(null)} /> : null}
     </div>
   );

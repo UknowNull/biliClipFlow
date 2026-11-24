@@ -620,6 +620,78 @@ CREATE TABLE IF NOT EXISTS live_clip_item (
 
 CREATE INDEX IF NOT EXISTS idx_live_clip_item_task_id ON live_clip_item (task_id);
 
+-- ============ 竞品分析 ============
+-- 竞品 UP 主配置：每个主播（room_id）独立一份，规则互不影响
+CREATE TABLE IF NOT EXISTS competitor_up (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id       TEXT NOT NULL,              -- 所属主播房间号（数据隔离）
+  up_uid        TEXT NOT NULL,              -- 竞品 UP 主的 UID
+  up_name       TEXT DEFAULT '',            -- 昵称（展示用，可被刷新覆盖）
+  relation      TEXT NOT NULL DEFAULT 'OR', -- OR / AND：标题与标签之间的关系
+  title_keywords TEXT DEFAULT '[]',         -- JSON 数组：标题关键字
+  tag_keywords   TEXT DEFAULT '[]',         -- JSON 数组：标签关键字
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  enabled_since TEXT DEFAULT '',            -- 只处理此时间之后的投稿（首次配置为当天）
+  last_scan_at  TEXT DEFAULT '',            -- 上次轮询时间，用于增量发现
+  create_time   TEXT NOT NULL,
+  update_time   TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_competitor_up_room_uid
+  ON competitor_up (room_id, up_uid);
+
+-- 竞品切片：一条竞品视频对应一行
+CREATE TABLE IF NOT EXISTS competitor_clip (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id       TEXT NOT NULL,              -- 归属主播
+  up_uid        TEXT NOT NULL,              -- 来源竞品 UP
+  bvid          TEXT NOT NULL,
+  aid           INTEGER DEFAULT 0,
+  cid           INTEGER DEFAULT 0,
+  title         TEXT DEFAULT '',
+  tags          TEXT DEFAULT '[]',          -- JSON 数组：B站标签
+  cover_url     TEXT DEFAULT '',            -- B站封面地址
+  cover_path    TEXT DEFAULT '',            -- 本地缓存封面
+  duration_secs REAL DEFAULT 0,
+  pub_time      TEXT DEFAULT '',            -- 竞品投稿时间（归属依据）
+  -- 归属场次：投稿时间之前、最近结束的那一场
+  task_id       INTEGER,                    -- 归属的 live_clip_task.id
+  session_key   TEXT DEFAULT '',
+  -- 处理状态：PENDING → DOWNLOADING → TRANSCRIBING → DONE / FAILED / SKIPPED
+  status        TEXT NOT NULL DEFAULT 'PENDING',
+  status_note   TEXT DEFAULT '',            -- 失败或跳过原因
+  file_path     TEXT DEFAULT '',            -- 本地视频路径
+  asr_path      TEXT DEFAULT '',            -- 转写结果 JSON 路径
+  create_time   TEXT NOT NULL,
+  update_time   TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_competitor_clip_bvid
+  ON competitor_clip (room_id, bvid);
+CREATE INDEX IF NOT EXISTS idx_competitor_clip_task
+  ON competitor_clip (task_id, status);
+
+-- 对比报告索引：明细放 JSON 文件，这里只存可检索的摘要
+CREATE TABLE IF NOT EXISTS competitor_compare (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id       INTEGER NOT NULL,           -- 对应场次切片任务
+  room_id       TEXT NOT NULL,
+  -- VOID：归属变更后作废；DONE：有效报告
+  status        TEXT NOT NULL DEFAULT 'DONE',
+  total_clips   INTEGER DEFAULT 0,          -- 参与对比的竞品切片数
+  full_count    INTEGER DEFAULT 0,          -- 完全覆盖
+  part_count    INTEGER DEFAULT 0,          -- 部分覆盖
+  zero_count    INTEGER DEFAULT 0,          -- 未覆盖
+  skip_count    INTEGER DEFAULT 0,          -- 跳过
+  report_path   TEXT DEFAULT '',            -- 报告明细 JSON
+  create_time   TEXT NOT NULL,
+  update_time   TEXT NOT NULL
+);
+
+-- 只约束「有效」报告：同一场次最多一份 DONE，历史 VOID 可以共存
+CREATE UNIQUE INDEX IF NOT EXISTS idx_competitor_compare_task_done
+  ON competitor_compare (task_id) WHERE status = 'DONE';
+
 INSERT OR IGNORE INTO workflow_configurations (
   config_id,
   config_name,

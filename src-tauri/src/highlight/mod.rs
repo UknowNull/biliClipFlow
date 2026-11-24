@@ -982,7 +982,7 @@ const PREVIEW_KEEP: usize = 6;
 
 /// 从识别缓存恢复整场转写（评阅页与单条重提共用）：ASR 缓存 + 声纹标注 + 中文精修文本，
 /// 人工修订过的字幕同步应用。没有识别缓存（分析未跑过/已清理）时返回 None。
-fn load_cached_pass(db: &Db, room_id: &str, record_ids: &[i64]) -> Option<FullPass> {
+pub fn load_cached_pass(db: &Db, room_id: &str, record_ids: &[i64]) -> Option<FullPass> {
     let segs = normalize_segments_for_analysis(load_record_segments(db, room_id, record_ids).ok()?, None);
     let first = segs.first()?;
     let cache = resolve_clips_dir(&first.file_path).ok()?.join(".cache");
