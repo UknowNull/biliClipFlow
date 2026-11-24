@@ -97,17 +97,30 @@ pub async fn fetch_up_videos(
         )
         .await?;
 
-    let code = value.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        return Err(format!(
-            "获取 UP 投稿列表失败: code={} {}",
-            code,
-            value.get("message").and_then(|v| v.as_str()).unwrap_or("")
-        ));
+    // 两种响应形态都要兼容：
+    //   标准形态 { "code":0, "data": { "list": { "vlist": [...] } } }
+    //   部分网关/风控通道直接平铺 { "list": { "vlist": [...] }, "page": {...} }
+    // 后者没有 code 字段，若按 code!=0 判失败会永远拿不到数据。
+    let has_code = value.get("code").and_then(|v| v.as_i64());
+    if let Some(code) = has_code {
+        if code != 0 {
+            let body = value.to_string();
+            return Err(format!(
+                "获取 UP 投稿列表失败: code={} msg={} body={}",
+                code,
+                value.get("message").and_then(|v| v.as_str()).unwrap_or(""),
+                body.chars().take(200).collect::<String>()
+            ));
+        }
     }
-    let list = value
-        .get("data")
-        .and_then(|d| d.get("list"))
+    // 平铺形态下 list 在顶层；标准形态在 data 下
+    let root = if value.get("list").is_some() {
+        &value
+    } else {
+        value.get("data").unwrap_or(&value)
+    };
+    let list = root
+        .get("list")
         .and_then(|l| l.get("vlist"))
         .and_then(|v| v.as_array())
         .cloned()
@@ -301,6 +314,34 @@ mod tests {
             enabled_since: String::new(),
             last_scan_at: String::new(),
         }
+    }
+
+    /// 平铺响应（无 code 字段）也要能取到投稿列表。
+    /// B站部分通道直接返回 {list:{vlist:[...]}}，没有 {code,data} 包装。
+    #[test]
+    fn parses_flat_and_wrapped_list_shapes() {
+        let extract = |v: &serde_json::Value| {
+            let root = if v.get("list").is_some() { v } else { v.get("data").unwrap_or(v) };
+            root.get("list")
+                .and_then(|l| l.get("vlist"))
+                .and_then(|x| x.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0)
+        };
+
+        // 标准包装
+        let wrapped = serde_json::json!({
+            "code": 0,
+            "data": { "list": { "vlist": [{"bvid":"BV1"}, {"bvid":"BV2"}] } }
+        });
+        assert_eq!(extract(&wrapped), 2);
+
+        // 平铺（真实遇到的情况）
+        let flat = serde_json::json!({
+            "list": { "slist": [], "tlist": {}, "vlist": [{"bvid":"BV1"}] },
+            "page": { "count": 1 }
+        });
+        assert_eq!(extract(&flat), 1, "平铺形态不应被当成空列表");
     }
 
     #[test]
