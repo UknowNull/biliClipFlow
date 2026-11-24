@@ -265,17 +265,43 @@ async fn chat_json_inner(settings: &LlmSettings, mode: &str, system: &str, user:
         if !status.is_success() {
             return Err(format!("HTTP {}: {}", status, truncate(&text, 300)));
         }
-        let data: Value = serde_json::from_str(&text).map_err(|_| format!("响应不是 JSON: {}", truncate(&text, 200)))?;
+        let data: Value = serde_json::from_str(&text)
+            .map_err(|_| format!("响应不是 JSON: {}", truncate(&text, 200)))?;
+        if let Some(err) = diagnose_empty_output(&data) {
+            return Err(err);
+        }
         let content = data["choices"][0]["message"]["content"].as_str().unwrap_or("");
         if let Some(v) = parse_content(content) {
             return Ok(v);
         }
-        if data["choices"][0]["finish_reason"].as_str() == Some("length") {
-            return Err("模型输出被截断（达到输出长度上限）".to_string());
-        }
         return Err(format!("{}{}", NOT_JSON, truncate(content, 200)));
     }
     Err(last_err)
+}
+
+/// 判断这次响应是不是「模型没给出可用内容」，返回明确的失败原因。
+///
+/// 推理模型（如 glm-5.3-flash）把思考写进 reasoning_content，思考同样计入
+/// max_tokens；额度被思考吃光时 content 是空字符串。这种情况若笼统报
+/// 「被截断」会让人误以为是 JSON 太长，实际是模型类型不合适。
+fn diagnose_empty_output(data: &Value) -> Option<String> {
+    let choice = &data["choices"][0];
+    let message = &choice["message"];
+    let content = message["content"].as_str().unwrap_or("");
+    let reasoning = message["reasoning_content"].as_str().unwrap_or("");
+    let finish = choice["finish_reason"].as_str().unwrap_or("");
+
+    if content.trim().is_empty() && !reasoning.trim().is_empty() {
+        return Some(
+            "模型把输出额度都用在思考上，没有返回实际内容。\
+             该模型是推理模型，请换用非推理模型，或显著提高输出长度上限"
+                .to_string(),
+        );
+    }
+    if finish == "length" {
+        return Some("模型输出被截断（达到输出长度上限）".to_string());
+    }
+    None
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -604,6 +630,52 @@ mod tests {
         // 模型先复述 schema 再给结果
         let echoed = r#"{"type":"object","properties":{"ok":{"type":"boolean"}}} {"ok": true, "note": "a}b"}"#;
         assert_eq!(parse_content(echoed).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn diagnoses_reasoning_only_response() {
+        // 真实抓到的 glm-5.3-flash 响应：content 为空，思考占了全部额度
+        let data = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "content": "", "reasoning_content": "The user is asking me..." }
+            }]
+        });
+        let err = diagnose_empty_output(&data).expect("应判定为失败");
+        assert!(err.contains("思考"), "应指出额度被思考占用: {err}");
+    }
+
+    #[test]
+    fn reasoning_with_content_is_not_an_error() {
+        // 思考后给出了内容，正常
+        let data = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": { "content": "{\"ok\":true}", "reasoning_content": "thinking..." }
+            }]
+        });
+        assert!(diagnose_empty_output(&data).is_none());
+    }
+
+    #[test]
+    fn plain_truncation_still_reported_as_length() {
+        // 非推理模型被截断：没有 reasoning，content 有内容但被切断
+        let data = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "content": "{\"clips\":[{\"start\":1" }
+            }]
+        });
+        let err = diagnose_empty_output(&data).expect("应报截断");
+        assert!(err.contains("截断"), "{err}");
+    }
+
+    #[test]
+    fn normal_response_passes_diagnosis() {
+        let data = serde_json::json!({
+            "choices": [{ "finish_reason": "stop", "message": { "content": "{}" } }]
+        });
+        assert!(diagnose_empty_output(&data).is_none());
     }
 
     #[test]
