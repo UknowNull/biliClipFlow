@@ -65,7 +65,11 @@ fn is_local(base_url: &str) -> bool {
 }
 
 fn client(settings: &LlmSettings) -> Result<Client, String> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(settings.timeout_secs));
+    // 必须带 User-Agent：部分 API 网关（如 api.site）对空 UA 的请求直接返回 502，
+    // 而 reqwest 默认不发 UA，表现为「配置正确但请求总是失败」。
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(settings.timeout_secs))
+        .user_agent(concat!("bili-clip-flow/", env!("CARGO_PKG_VERSION")));
     if is_local(&settings.base_url) {
         builder = builder.no_proxy();
     }
