@@ -926,6 +926,347 @@ pub(super) fn should_use_output_segments_upload(
         || (is_non_segmented_task(&detail.task) && !detail.output_segments.is_empty())
 }
 
+/// 读取远端稿件当前的分P列表（cid/文件名/标题，按远端顺序）。
+/// 更新投稿必须以此为准：B站编辑接口 `/x/vu/web/edit` 的 `videos` 是整份分P全量替换，
+/// 若只用本地库里上次提交的 cid/文件名，会把用户在B站网页上替换过的分P覆盖回旧视频。
+pub(super) async fn fetch_remote_archive_parts(
+    context: &UploadContext,
+    auth: &AuthInfo,
+    bvid: &str,
+) -> Result<Vec<UploadedVideoPart>, String> {
+    let bvid = bvid.trim();
+    if bvid.is_empty() {
+        return Err("当前任务缺少BVID，无法读取远端分P".to_string());
+    }
+    let params = vec![("bvid".to_string(), bvid.to_string())];
+    let data = context
+        .bilibili
+        .get_json(
+            "https://member.bilibili.com/x/vupre/web/archive/view",
+            &params,
+            Some(auth),
+            false,
+        )
+        .await?;
+    let archive_bvid = data
+        .get("archive")
+        .and_then(|value| json_string_compatible(value.get("bvid")))
+        .unwrap_or_default();
+    if !archive_bvid.is_empty() && archive_bvid != bvid {
+        return Err(format!(
+            "远端稿件BVID不一致（期望={}，实际={}）",
+            bvid, archive_bvid
+        ));
+    }
+    let mut parts = Vec::new();
+    if let Some(list) = data
+        .get("videos")
+        .and_then(|value| value.as_array())
+        .or_else(|| data.get("pages").and_then(|value| value.as_array()))
+    {
+        for (index, page) in list.iter().enumerate() {
+            let cid = json_i64_compatible(page.get("cid")).unwrap_or(0);
+            if cid <= 0 {
+                continue;
+            }
+            let filename = json_string_compatible(page.get("filename"))
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default();
+            let title = json_string_compatible(page.get("title"))
+                .or_else(|| json_string_compatible(page.get("part")))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("P{}", index + 1));
+            parts.push(UploadedVideoPart {
+                filename,
+                cid,
+                title,
+            });
+        }
+    }
+    append_log(
+        &context.app_log_path,
+        &format!(
+            "submission_update_remote_parts bvid={} parts={} cids={}",
+            bvid,
+            parts.len(),
+            parts
+                .iter()
+                .map(|part| part.cid.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    );
+    Ok(parts)
+}
+
+/// 更新投稿的分P对账结果。
+pub(super) struct ReconcileUpdatePartsOutcome {
+    pub(super) parts: Vec<UploadedVideoPart>,
+    /// 已按远端纠正的本地分P标识：(segment_id, cid, filename)。
+    pub(super) identity_updates: Vec<(String, i64, String)>,
+    /// 本地独有、被追加到末尾的分P标题（仅记录，便于排查）。
+    pub(super) appended_local_titles: Vec<String>,
+}
+
+/// 把本地分P与远端分P对账，生成最终提交给B站的 `videos` 列表。
+///
+/// B站编辑接口 `/x/vu/web/edit` 的 `videos` 是整份分P全量替换，所以这里以远端为唯一基准：
+/// 1. 提交列表 = 远端现有分P（顺序、cid、文件名全部取自远端） + 本地独有分P；
+/// 2. 本地“上次已提交”的分P先按 cid 对位，数量一致时再按位置对位
+///    （对应“在B站网页上给某个分P换了新文件”，该分P cid 变了但位置不变）；
+///    对位后本地只贡献兜底标题，cid/文件名一律使用远端值，绝不回写旧标识；
+/// 3. 本地独有分P（远端没有）一律追加在末尾，只新增不覆盖，不会顶掉远端任何分P；
+/// 4. 读不到远端分P直接报错中止，避免远端状态未知时盲写全量列表。
+pub(super) fn reconcile_update_parts_with_remote(
+    remote_parts: &[UploadedVideoPart],
+    local_parts: &[(String, bool, UploadedVideoPart)],
+) -> Result<ReconcileUpdatePartsOutcome, String> {
+    if remote_parts.is_empty() {
+        return Err("未读取到远端分P，已中止更新以避免覆盖B站已有分P".to_string());
+    }
+
+    let pre_local: Vec<usize> = local_parts
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, is_new, _))| !*is_new)
+        .map(|(index, _)| index)
+        .collect();
+    let mut local_match: Vec<Option<usize>> = vec![None; local_parts.len()];
+    let mut remote_match: Vec<Option<usize>> = vec![None; remote_parts.len()];
+
+    // pass1: cid 完全相同
+    for &local_index in &pre_local {
+        let cid = local_parts[local_index].2.cid;
+        if let Some(remote_index) = remote_parts
+            .iter()
+            .position(|part| part.cid == cid)
+            .filter(|index| remote_match[*index].is_none())
+        {
+            local_match[local_index] = Some(remote_index);
+            remote_match[remote_index] = Some(local_index);
+        }
+    }
+
+    // pass2: 剩余未对位的按位置顺序兜底（网页替换过视频的分P cid 会变，但位置通常不变）。
+    // 只影响“本地分P与远端分P的对应关系”，最终 cid/文件名始终取远端，不会覆盖数据。
+    let unmatched_local: Vec<usize> = pre_local
+        .iter()
+        .copied()
+        .filter(|index| local_match[*index].is_none())
+        .collect();
+    let unmatched_remote: Vec<usize> = (0..remote_parts.len())
+        .filter(|index| remote_match[*index].is_none())
+        .collect();
+    for (local_index, remote_index) in unmatched_local.into_iter().zip(unmatched_remote) {
+        local_match[local_index] = Some(remote_index);
+        remote_match[remote_index] = Some(local_index);
+    }
+
+    let mut parts: Vec<UploadedVideoPart> = Vec::with_capacity(remote_parts.len() + local_parts.len());
+    let mut identity_updates: Vec<(String, i64, String)> = Vec::new();
+    for (remote_index, remote_part) in remote_parts.iter().enumerate() {
+        let matched = remote_match[remote_index].map(|local_index| {
+            (
+                local_parts[local_index].0.clone(),
+                local_parts[local_index].2.clone(),
+            )
+        });
+        let mut filename = remote_part.filename.trim().to_string();
+        let mut title = remote_part.title.trim().to_string();
+        if let Some((_, local_part)) = matched.as_ref() {
+            // 仅在 cid 相同（同一上传单元）时才用本地文件名兜底，
+            // 否则会把旧文件的 filename 配到远端新 cid 上。
+            if filename.is_empty() && local_part.cid == remote_part.cid {
+                filename = local_part.filename.trim().to_string();
+            }
+            if title.is_empty() {
+                title = local_part.title.trim().to_string();
+            }
+        }
+        if filename.is_empty() {
+            return Err(format!(
+                "远端第{}个分P缺少文件名，已中止更新以避免覆盖B站已有分P",
+                remote_index + 1
+            ));
+        }
+        if title.is_empty() {
+            title = format!("P{}", remote_index + 1);
+        }
+        if let Some((segment_id, local_part)) = matched {
+            // 只回写“同一个上传单元（cid 相同）”的文件名修正。
+            // 按位置兜底匹配到的分P其 cid 已变，属于B站侧另一个文件，
+            // 不能把远端 cid 写到本地这条记录上，否则后续重传会反过来覆盖远端。
+            if local_part.cid == remote_part.cid && local_part.filename.trim() != filename {
+                identity_updates.push((segment_id, remote_part.cid, filename.clone()));
+            }
+        }
+        parts.push(UploadedVideoPart {
+            filename,
+            cid: remote_part.cid,
+            title,
+        });
+    }
+
+    // 本地独有分P（远端没有同 cid）：一律追加在末尾，只新增不覆盖。
+    let remote_cids: HashSet<i64> = remote_parts.iter().map(|part| part.cid).collect();
+    let mut appended_local_titles: Vec<String> = Vec::new();
+    for &local_index in &pre_local {
+        if local_match[local_index].is_some() {
+            continue;
+        }
+        let part = &local_parts[local_index].2;
+        if remote_cids.contains(&part.cid) {
+            continue;
+        }
+        if part.filename.trim().is_empty() {
+            return Err("存在本地分P缺少上传文件名，请重新上传".to_string());
+        }
+        appended_local_titles.push(part.title.clone());
+        parts.push(part.clone());
+    }
+
+    // 本次新上传的分P追加在末尾
+    for (_, is_new, part) in local_parts {
+        if !*is_new {
+            continue;
+        }
+        // 同一 cid 已在提交列表中（重试场景）：不重复提交。
+        if remote_cids.contains(&part.cid) {
+            continue;
+        }
+        if part.filename.trim().is_empty() {
+            return Err("存在本地分P缺少上传文件名，请重新上传".to_string());
+        }
+        parts.push(part.clone());
+    }
+
+    // 兜底去重：同一 cid 只提交一次（重复 cid 会被B站判为重复分P）。
+    let mut seen_cids: HashSet<i64> = HashSet::new();
+    parts.retain(|part| seen_cids.insert(part.cid));
+
+    Ok(ReconcileUpdatePartsOutcome {
+        parts,
+        identity_updates,
+        appended_local_titles,
+    })
+}
+
+/// 把对账得到的远端 cid/文件名回写本地分P，保持本地与远端一致。
+pub(super) fn sync_segment_upload_identity(
+    context: &SubmissionContext,
+    updates: &[(String, i64, String)],
+) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    context
+        .db
+        .with_conn(|conn| {
+            for (segment_id, cid, filename) in updates {
+                conn.execute(
+                    "UPDATE task_output_segment SET cid = ?1, file_name = ?2, upload_status = 'SUCCESS' WHERE segment_id = ?3",
+                    (cid, filename, segment_id),
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|err| err.to_string())
+}
+
+pub(super) fn is_remote_part_content_mismatch_error(err: &str) -> bool {
+    err.contains("远程分P内容与本次提交不一致")
+}
+
+fn summarize_cid_list(cids: &[i64]) -> String {
+    let preview = cids
+        .iter()
+        .take(5)
+        .map(|cid| cid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if cids.len() > 5 {
+        format!("{}...", preview)
+    } else {
+        preview
+    }
+}
+
+/// 提交后按 cid 集合校验远端分P，确保B站实际生效的分P与本次提交一致。
+/// 只比数量无法发现“远端某个分P被换成了另一个视频”。
+pub(super) async fn verify_remote_part_cids(
+    context: &UploadContext,
+    auth: &AuthInfo,
+    task_id: &str,
+    bvid: &str,
+    expected_cids: &[i64],
+) -> Result<(), String> {
+    let mut expected = expected_cids.to_vec();
+    expected.sort_unstable();
+    let mut last_error: Option<String> = None;
+    for attempt in 1..=REMOTE_PART_VERIFY_RETRY_LIMIT {
+        match fetch_remote_archive_parts(context, auth, bvid).await {
+            Ok(remote_parts) => {
+                let mut actual: Vec<i64> = remote_parts.iter().map(|part| part.cid).collect();
+                actual.sort_unstable();
+                if actual == expected {
+                    append_log(
+                        &context.app_log_path,
+                        &format!(
+                            "submission_remote_part_cids_verified task_id={} attempt={} parts={}",
+                            task_id,
+                            attempt,
+                            actual.len()
+                        ),
+                    );
+                    return Ok(());
+                }
+                last_error = Some(if actual.len() != expected.len() {
+                    format!(
+                        "远程分P数量与本地不一致（本地={}，远程={}）",
+                        expected.len(),
+                        actual.len()
+                    )
+                } else {
+                    format!(
+                        "远程分P内容与本次提交不一致（提交={}，远程={}）",
+                        summarize_cid_list(&expected),
+                        summarize_cid_list(&actual)
+                    )
+                });
+            }
+            Err(err) => {
+                if is_rate_limit_error(&err) {
+                    append_log(
+                        &context.app_log_path,
+                        &format!(
+                            "submission_remote_part_cids_rate_limited task_id={} attempt={} err={}",
+                            task_id, attempt, err
+                        ),
+                    );
+                    return Err(err);
+                }
+                last_error = Some(err);
+            }
+        }
+        if attempt < REMOTE_PART_VERIFY_RETRY_LIMIT
+            && should_retry_remote_part_verification(last_error.as_deref())
+        {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_remote_part_cids_retry task_id={} attempt={} reason={}",
+                    task_id,
+                    attempt,
+                    last_error.as_deref().unwrap_or("unknown")
+                ),
+            );
+            sleep(Duration::from_secs(REMOTE_PART_VERIFY_RETRY_WAIT_SECS)).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "远程分P内容校验失败".to_string()))
+}
+
 pub(super) fn parse_remote_archive_part_count(
     item: &Value,
     expected_bvid: &str,
@@ -1380,6 +1721,26 @@ pub(super) async fn run_submission_upload(context: UploadContext, task_id: Strin
     let client = build_submission_upload_client(context.app_log_path.as_ref());
     let mut parts: Vec<UploadedVideoPart> = Vec::new();
     let use_output_segments_upload = should_use_output_segments_upload(&detail, is_update_workflow);
+    // 更新流程需要区分“上次已提交到B站的分P”与“本次新上传的分P”：
+    // 前者可能与远端身份（cid/文件名）不一致，以后者只能追加在末尾。
+    let previously_submitted_segment_ids: HashSet<String> = if is_update_workflow {
+        detail
+            .output_segments
+            .iter()
+            .filter(|segment| {
+                segment.upload_status == "SUCCESS"
+                    && segment.cid.unwrap_or(0) > 0
+                    && segment
+                        .file_name
+                        .as_deref()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .map(|segment| segment.segment_id.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     if use_output_segments_upload {
         auth = match load_auth_or_refresh_for_task(&context, &task_id, "submission_upload_loop")
@@ -1627,21 +1988,90 @@ pub(super) async fn run_submission_upload(context: UploadContext, task_id: Strin
             )?;
             return Err("存在分段缺少上传信息，请重新上传".to_string());
         }
+        // 与远端分P对账：远端 cid/文件名权威，本次新分P只追加在末尾。
+        // 不做这一步时，编辑接口的整份全量替换会把用户在B站网页替换过的分P覆盖回旧视频。
+        let fresh_detail = load_task_detail(&submission_context, &task_id)?;
+        if fresh_detail.output_segments.len() != parts.len() {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_update_reconcile_count_mismatch task_id={} segments={} parts={}",
+                    task_id,
+                    fresh_detail.output_segments.len(),
+                    parts.len()
+                ),
+            );
+            update_submission_status_with_reason(
+                &submission_context,
+                &task_id,
+                "FAILED",
+                Some("分P与上传结果数量不一致，请重新上传"),
+            )?;
+            return Err("分P与上传结果数量不一致，请重新上传".to_string());
+        }
+        let bvid = detail.task.bvid.clone().unwrap_or_default();
+        let remote_parts = fetch_remote_archive_parts(&context, &auth, &bvid).await?;
+        let local_parts: Vec<(String, bool, UploadedVideoPart)> = fresh_detail
+            .output_segments
+            .iter()
+            .zip(parts.iter())
+            .map(|(segment, part)| {
+                let is_new = !previously_submitted_segment_ids.contains(&segment.segment_id);
+                (segment.segment_id.clone(), is_new, part.clone())
+            })
+            .collect();
+        let reconciled = reconcile_update_parts_with_remote(&remote_parts, &local_parts)?;
+        append_log(
+            &context.app_log_path,
+            &format!(
+                "submission_update_reconcile task_id={} remote_parts={} local_parts={} final_parts={} identity_updates={} appended_local={}",
+                task_id,
+                remote_parts.len(),
+                local_parts.len(),
+                reconciled.parts.len(),
+                reconciled.identity_updates.len(),
+                reconciled.appended_local_titles.len()
+            ),
+        );
+        if !reconciled.appended_local_titles.is_empty() {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_update_reconcile_append_local task_id={} titles={}",
+                    task_id,
+                    reconciled.appended_local_titles.join("|")
+                ),
+            );
+        }
+        if let Err(err) =
+            sync_segment_upload_identity(&submission_context, &reconciled.identity_updates)
+        {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_update_reconcile_sync_fail task_id={} err={}",
+                    task_id, err
+                ),
+            );
+        }
+        parts = reconciled.parts;
+        let expected_cids: Vec<i64> = parts.iter().map(|part| part.cid).collect();
         let submit_result =
             submit_video_update_in_batches(&context, &auth, &detail.task, &parts, aid, &csrf).await;
         match submit_result {
             Ok(()) => {
-                if let Err(err) = verify_remote_part_count(
+                if let Err(err) = verify_remote_part_cids(
                     &context,
                     &auth,
                     &task_id,
                     detail.task.bvid.as_deref().unwrap_or(""),
-                    aid,
-                    parts.len(),
+                    &expected_cids,
                 )
                 .await
                 {
-                    if !is_remote_part_count_mismatch_error(&err) {
+                    if !is_remote_part_count_mismatch_error(&err)
+                        && !is_remote_part_content_mismatch_error(&err)
+                    {
                         update_submission_status_with_reason(
                             &submission_context,
                             &task_id,

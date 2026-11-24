@@ -1676,6 +1676,103 @@ mod tests {
     }
 
     #[test]
+    fn update_reconcile_keeps_remote_cids_and_appends_new_parts() {
+        // 场景：B站网页把 P2 换成了新文件（远端 cid=22），本地仍记着旧 cid=2；
+        // 本次在项目里新增一个分P（本地 cid=33）。
+        let remote_parts = vec![
+            UploadedVideoPart {
+                filename: "remote-1".to_string(),
+                cid: 11,
+                title: "P1".to_string(),
+            },
+            UploadedVideoPart {
+                filename: "remote-2-new".to_string(),
+                cid: 22,
+                title: "P2".to_string(),
+            },
+        ];
+        let local_parts = vec![
+            (
+                "seg-1".to_string(),
+                false,
+                UploadedVideoPart {
+                    filename: "remote-1".to_string(),
+                    cid: 11,
+                    title: "P1".to_string(),
+                },
+            ),
+            (
+                "seg-2".to_string(),
+                false,
+                UploadedVideoPart {
+                    filename: "old-2".to_string(),
+                    cid: 2,
+                    title: "P2".to_string(),
+                },
+            ),
+            (
+                "seg-3".to_string(),
+                true,
+                UploadedVideoPart {
+                    filename: "new-3".to_string(),
+                    cid: 33,
+                    title: "P3".to_string(),
+                },
+            ),
+        ];
+        let outcome = reconcile_update_parts_with_remote(&remote_parts, &local_parts)
+            .expect("reconcile should succeed");
+
+        let cids: Vec<i64> = outcome.parts.iter().map(|part| part.cid).collect();
+        assert_eq!(cids, vec![11, 22, 33], "远端 cid 必须保留，新分P追加在末尾");
+        assert_eq!(
+            outcome.parts[1].filename, "remote-2-new",
+            "网页替换过的分P不能被本地旧文件名覆盖"
+        );
+        assert!(
+            outcome.identity_updates.is_empty(),
+            "按位置兜底匹配到的分P不能把远端 cid 回写到本地旧记录"
+        );
+    }
+
+    #[test]
+    fn update_reconcile_keeps_remote_part_unknown_to_local() {
+        // 网页上手工新增的分P（本地没有）必须原样保留，否则更新会把它删掉。
+        let remote_parts = vec![
+            UploadedVideoPart {
+                filename: "remote-1".to_string(),
+                cid: 11,
+                title: "P1".to_string(),
+            },
+            UploadedVideoPart {
+                filename: "remote-web-added".to_string(),
+                cid: 99,
+                title: "网页新增".to_string(),
+            },
+        ];
+        let local_parts = vec![(
+            "seg-1".to_string(),
+            true,
+            UploadedVideoPart {
+                filename: "new-2".to_string(),
+                cid: 22,
+                title: "P2".to_string(),
+            },
+        )];
+        let outcome = reconcile_update_parts_with_remote(&remote_parts, &local_parts)
+            .expect("reconcile should succeed");
+
+        let cids: Vec<i64> = outcome.parts.iter().map(|part| part.cid).collect();
+        assert_eq!(
+            cids,
+            vec![11, 99, 22],
+            "网页新增的分P必须保留，本地新分P追加在末尾"
+        );
+        assert_eq!(outcome.parts[1].title, "网页新增");
+        assert_eq!(outcome.parts[2].cid, 22);
+    }
+
+    #[test]
     fn rate_limit_detection_includes_submission_code_minus_702() {
         assert!(is_rate_limit_error("请求频率过高，请稍后再试 (code: -702)"));
         assert!(is_rate_limit_error("request was banned (code: -412)"));

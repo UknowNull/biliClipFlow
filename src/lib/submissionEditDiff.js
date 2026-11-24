@@ -164,6 +164,20 @@ export function validateSourceVideos({ items, parseHmsToSeconds, isVideoFilePath
     return { valid: false, message: "百度网盘源视频缺少远程路径", validSources: [] };
   }
   if (invalidSource) {
+    // 诊断：这条提示历史上被误用过（真实原因常是 sourceFilePath 为空或类型不对），
+    // 把失败项的关键字段写进日志，避免再靠猜。同步函数内不等待，日志失败不影响校验结果。
+    try {
+      import("./clientLog")
+        .then(({ clientLog }) =>
+          clientLog(
+            `source_validate_invalid path=${JSON.stringify(invalidSource.sourceFilePath)} ` +
+              `type=${invalidSource.sourceType} ` +
+              `remoteVideoUrl=${JSON.stringify(invalidSource.remoteVideoUrl)} ` +
+              `remotePath=${JSON.stringify(invalidSource.remotePath)}`,
+          ),
+        )
+        .catch(() => {});
+    } catch (_) {}
     return { valid: false, message: "源视频仅支持常见视频格式", validSources: [] };
   }
   const invalidTime = validSources.find((item) => {

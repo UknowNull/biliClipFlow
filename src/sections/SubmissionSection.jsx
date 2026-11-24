@@ -485,6 +485,19 @@ export default function SubmissionSection({
     return `${normalizedTaskDir}/integrated_sources/${fileName}`;
   };
 
+  // 第三方直链源视频的落盘路径：下载动作会把它存到 integrated_sources/<标题>.<扩展名>，
+  // sourceFilePath 必须先有合法文件名，校验（isVideoFilePath）与后端下载都靠它定位。
+  const buildDirectSourceFilePath = (taskDir, direct) => {
+    const title = sanitizeLocalFileName(String(direct?.title || "第三方视频").trim()) || "第三方视频";
+    const extension =
+      String(direct?.extension || "mp4").trim().replace(/^\./, "") || "mp4";
+    const fileName = `${title}.${extension}`;
+    const normalizedTaskDir = String(taskDir || "").trim();
+    return normalizedTaskDir
+      ? `${normalizedTaskDir}/integrated_sources/${fileName}`
+      : `integrated_sources/${fileName}`;
+  };
+
   const resolveSourceBindingFilePath = async (preview, page) => {
     if (sourcePartPickerTarget === "update") {
       return buildIntegratedSourceFilePath(updateTaskDir, preview, page);
@@ -636,6 +649,12 @@ export default function SubmissionSection({
       setMessage("请输入有效的第三方下载链接（http/https 直链）");
       return;
     }
+    // 与批量导入、B站绑定保持一致：直链源也要有 sourceFilePath 占位，
+    // 否则 validateSourceVideos 会把它当成"没有源视频"而拒绝提交。
+    const bindingPath = buildDirectSourceFilePath(
+      isUpdateTarget ? updateTaskDir : "",
+      direct,
+    );
     // 与批量导入(handleUpdateImportQuery)、B站绑定(applySourceRemoteBinding)保持一致：
     // 探测时长并在结束时间为空时自动填充，让第三方源与 B站源在剪辑/合并/投稿中一视同仁。
     setSourcePartPickerLoadingId(current.localId);
@@ -658,6 +677,8 @@ export default function SubmissionSection({
           (!String(item.endTime || "").trim() || item.endTime === "00:00:00");
         return {
           ...item,
+          sourceType: "DIRECT",
+          sourceFilePath: bindingPath || item.sourceFilePath || "",
           remoteVideoUrl: direct.url,
           remoteBvid: "",
           remoteAid: 0,
@@ -2119,19 +2140,10 @@ export default function SubmissionSection({
   
   const buildUpdateImportedSourcePath = (preview, page) =>
     preview?.sourceType === "DIRECT"
-      ? (() => {
-          const title = sanitizeLocalFileName(
-            String(page?.partName || preview?.title || "第三方视频").trim(),
-          ) || "第三方视频";
-          const extension = String(page?.extension || preview?.extension || "mp4")
-            .trim()
-            .replace(/^\./, "") || "mp4";
-          const normalizedTaskDir = String(updateTaskDir || "").trim();
-          const fileName = `${title}.${extension}`;
-          return normalizedTaskDir
-            ? `${normalizedTaskDir}/integrated_sources/${fileName}`
-            : `integrated_sources/${fileName}`;
-        })()
+      ? buildDirectSourceFilePath(updateTaskDir, {
+          title: String(page?.partName || preview?.title || "第三方视频").trim(),
+          extension: page?.extension || preview?.extension || "mp4",
+        })
       : buildIntegratedSourceFilePath(updateTaskDir, preview, page);
 
   
