@@ -85,10 +85,14 @@ pub fn process_pending(db: &Arc<Db>, model_dir: &Path, threads: i32, log_path: &
     // 取出待处理的竞品切片，连同归属场次的目录一起查出来
     let pending: Vec<(i64, String, String, String)> = db
         .with_conn(|conn| {
+            // 从场次的录播记录取文件路径：不能依赖 live_clip_item，
+            // 场次可能还没分析完（QUEUED/FAILED），那时一条切片都没有。
             let mut stmt = conn.prepare(
                 "SELECT c.id, c.bvid, COALESCE(c.title,''), \
-                        COALESCE((SELECT i.source_file_path FROM live_clip_item i \
-                                  WHERE i.task_id = c.task_id LIMIT 1), '') \
+                        COALESCE((SELECT r.file_path FROM live_clip_task t \
+                                  JOIN json_each(t.record_ids) j ON j.value = r.id \
+                                  JOIN live_record_task r ON r.id = j.value \
+                                  WHERE t.id = c.task_id LIMIT 1), '') \
                  FROM competitor_clip c \
                  WHERE c.status = 'PENDING' ORDER BY c.id ASC LIMIT 10",
             )?;
@@ -180,8 +184,11 @@ pub fn resume_downloading(
     let rows: Vec<(i64, String, String)> = db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT c.id, c.bvid, COALESCE((SELECT i.source_file_path FROM live_clip_item i \
-                        WHERE i.task_id = c.task_id LIMIT 1), '') \
+                "SELECT c.id, c.bvid, \
+                        COALESCE((SELECT r.file_path FROM live_clip_task t \
+                                  JOIN json_each(t.record_ids) j ON j.value = r.id \
+                                  JOIN live_record_task r ON r.id = j.value \
+                                  WHERE t.id = c.task_id LIMIT 1), '') \
                  FROM competitor_clip c WHERE c.status = 'DOWNLOADING' LIMIT 10",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -282,8 +289,10 @@ async fn run_once(app: &tauri::AppHandle, app_data_dir: &std::path::Path) {
         let source_file: String = db
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT COALESCE(i.source_file_path,'') FROM live_clip_item i \
-                     JOIN competitor_clip c ON c.task_id = i.task_id \
+                    "SELECT COALESCE(r.file_path,'') FROM competitor_clip c \
+                     JOIN live_clip_task t ON t.id = c.task_id \
+                     JOIN json_each(t.record_ids) j ON j.value = r.id \
+                     JOIN live_record_task r ON r.id = j.value \
                      WHERE c.id = ?1 LIMIT 1",
                     [id],
                     |r| r.get(0),

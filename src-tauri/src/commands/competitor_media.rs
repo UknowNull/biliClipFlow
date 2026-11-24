@@ -134,6 +134,51 @@ pub fn load_transcript(path: &Path) -> Option<Value> {
 mod tests {
     use super::*;
 
+    /// 场次还没分析出切片时，也要能定位到竞品存放目录。
+    /// 归属信息应来自 live_record_task，而不是 live_clip_item（后者此时为空）。
+    #[test]
+    fn locates_dir_even_when_session_has_no_clips() {
+        let db = Db::new(std::path::PathBuf::from(":memory:")).unwrap();
+        let now = now_rfc3339();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO live_record_task (id, room_id, status, file_path, segment_index, \
+                    start_time, end_time, create_time, update_time) \
+                 VALUES (1, 'r', 'STOPPED', '/rec/a.mp4', 1, '2026-11-24T10:00:00+00:00', \
+                    '2026-11-24T12:00:00+00:00', ?1, ?1)",
+                [&now],
+            )?;
+            // 场次失败，一条切片都没有
+            conn.execute(
+                "INSERT INTO live_clip_task (id, room_id, record_ids, date_label, status, clip_count, \
+                    create_time, update_time, session_key) \
+                 VALUES (10, 'r', '[1]', 'd', 'FAILED', 0, ?1, ?1, 's')",
+                [&now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // 新查询：从场次取录播路径
+        let path: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(r.file_path,'') FROM live_clip_task t \
+                     JOIN json_each(t.record_ids) j ON j.value = r.id \
+                     JOIN live_record_task r ON r.id = j.value \
+                     WHERE t.id = 10 LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(path, "/rec/a.mp4");
+        assert_eq!(
+            competitor_dir_of(&path).unwrap().to_string_lossy(),
+            "/rec/competitor"
+        );
+    }
+
     #[test]
     fn competitor_dir_sits_next_to_source() {
         let dir = competitor_dir_of("/data/25034104/20261122/录制-a.mp4").unwrap();
