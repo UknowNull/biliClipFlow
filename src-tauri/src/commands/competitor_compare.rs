@@ -299,7 +299,6 @@ pub fn attribute_missing(
 pub fn suggestions_for(
     layer: &ReasonLayer,
     competitor_dur: f64,
-    mine_dur: f64,
     full_mine: f64,
 ) -> Vec<String> {
     match layer {
@@ -468,13 +467,13 @@ mod tests {
 
     #[test]
     fn no_suggestions_for_asr_missing() {
-        let tips = suggestions_for(&ReasonLayer::AsrMissing, 60.0, 0.0, 0.0);
+        let tips = suggestions_for(&ReasonLayer::AsrMissing, 60.0, 0.0);
         assert!(tips.is_empty(), "ASR 缺失属于识别问题，不该给提示词建议");
     }
 
     #[test]
     fn duration_gap_generates_tip() {
-        let tips = suggestions_for(&ReasonLayer::Rule, 55.4, 0.0, 28.1);
+        let tips = suggestions_for(&ReasonLayer::Rule, 55.4, 28.1);
         assert!(tips.iter().any(|t| t.contains("时长差异")));
     }
 }

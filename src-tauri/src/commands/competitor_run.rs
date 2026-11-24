@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use super::competitor_compare::{
-    ClipComparison, Coverage, LocalClip, ReasonLayer, attribute_missing, best_local_clip,
+    ClipComparison, Coverage, ReasonLayer, attribute_missing, best_local_clip,
     coverage_of, load_local_clips, locate_in_session, session_segments, suggestions_for,
 };
 use crate::api::ApiResponse;
@@ -245,7 +245,7 @@ pub fn run_compare(db: &Db, room_id: &str, task_id: i64, max_candidates: usize) 
                     &rejected_ranges,
                     max_candidates,
                 );
-                let tips = suggestions_for(&layer, row.duration_secs, 0.0, 0.0);
+                let tips = suggestions_for(&layer, row.duration_secs, 0.0);
                 (Some(layer), msg, tips)
             }
             Coverage::Part => {
@@ -253,7 +253,7 @@ pub fn run_compare(db: &Db, room_id: &str, task_id: i64, max_candidates: usize) 
                     .as_ref()
                     .map(|clip| clip.end - clip.start)
                     .unwrap_or(0.0);
-                let tips = suggestions_for(&ReasonLayer::Rule, row.duration_secs, mine_dur, mine_dur);
+                let tips = suggestions_for(&ReasonLayer::Rule, row.duration_secs, mine_dur);
                 (
                     None,
                     format!(

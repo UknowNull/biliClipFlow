@@ -1709,6 +1709,40 @@ async fn handle_integration_download(
     }
 }
 
+/// 供竞品分析调用：把一条 B站视频登记到下载队列，存到指定目录。
+/// 只负责入队，进度与完成由现有下载队列维护。
+pub async fn enqueue_competitor_download(
+    state: &AppState,
+    bvid: &str,
+    title: &str,
+    target_dir: &str,
+) -> Result<i64, String> {
+    let context = DownloadContext::from_state(state);
+    let request = DownloadRequest {
+        video_url: format!("https://www.bilibili.com/video/{}", bvid),
+        parts: vec![DownloadPart {
+            cid: 0,
+            title: title.to_string(),
+            duration: None,
+            target_path: Some(format!("{}/{}.mp4", target_dir.trim_end_matches('/'), bvid)),
+        }],
+        config: DownloadConfig {
+            download_name: Some(bvid.to_string()),
+            download_path: Some(target_dir.to_string()),
+            resolution: None,
+            codec: None,
+            format: Some("mp4".to_string()),
+            content: None,
+        },
+        source_type: Some("COMPETITOR".to_string()),
+    };
+    let records = create_download_tasks(context, request).await?;
+    records
+        .first()
+        .map(|record| record.id)
+        .ok_or_else(|| "未能创建下载任务".to_string())
+}
+
 async fn create_download_task(
     context: DownloadContext,
     request: DownloadRequest,
@@ -1720,7 +1754,7 @@ async fn create_download_task(
         .ok_or_else(|| "No download task created".to_string())
 }
 
-async fn create_download_tasks(
+pub(super) async fn create_download_tasks(
     context: DownloadContext,
     request: DownloadRequest,
 ) -> Result<Vec<DownloadTaskCreateResult>, String> {

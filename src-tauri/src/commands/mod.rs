@@ -6,6 +6,7 @@ pub mod competitor_discover;
 pub mod competitor_compare;
 pub mod competitor_media;
 pub mod competitor_run;
+pub mod competitor_worker;
 pub mod auth;
 pub mod baidu_sync;
 pub mod download;

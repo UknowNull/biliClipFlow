@@ -176,6 +176,20 @@ pub fn delete(db: &Db, room_id: &str, id: i64) -> Result<(), String> {
     .map_err(|err| format!("删除竞品配置失败: {}", err))
 }
 
+/// 记录本次扫描时间，用于排查「为什么没抓到新投稿」。
+pub fn save_scan_time(db: &Db, id: i64) -> Result<(), String> {
+    let now = now_rfc3339();
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE competitor_up SET last_scan_at = ?1, update_time = ?1 WHERE id = ?2",
+            (&now, id),
+        )?;
+        Ok(())
+    })
+    .map_err(|err| format!("记录扫描时间失败: {}", err))?;
+    Ok(())
+}
+
 // ============ Tauri 命令 ============
 
 #[tauri::command(async)]

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::competitor::{CompetitorUp, list_for_room};
+use super::competitor::CompetitorUp;
 use crate::bilibili::client::BilibiliClient;
 use crate::db::Db;
 use crate::utils::now_rfc3339;

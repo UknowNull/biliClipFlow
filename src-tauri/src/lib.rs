@@ -208,6 +208,7 @@ pub fn run() {
                 app_log_path: Arc::clone(&app.state::<AppState>().app_log_path),
                 app_data_dir: app_dir.clone(),
             });
+            commands::competitor_worker::start(app.handle().clone(), app_dir.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
