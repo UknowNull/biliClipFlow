@@ -176,8 +176,16 @@ export default function CompetitorCompareView({ anchor, task, onBack, onOpenClip
         </div>
       ) : !report ? (
         <EmptyState
-          title="还没有对比结果"
-          desc="竞品切片下载并转写完成后，点「开始对比」生成报告。若本场识别数据已清理，则无法对比。"
+          title={
+            (task.clipCount ?? 0) > 0
+              ? "还没有对比结果"
+              : "本场还没有切片，无法对比"
+          }
+          desc={
+            (task.clipCount ?? 0) > 0
+              ? "竞品切片下载并转写完成后，点「开始对比」生成报告。若本场识别数据已清理，则无法对比。"
+              : "本场切片分析未成功（或尚未开始），没有可对比的切片。可先重新分析本场，或到「竞品切片」查看已下载的竞品。"
+          }
         />
       ) : (
         <>

@@ -125,6 +125,8 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
   const [voiceprint, setVoiceprint] = useState(null);
   const [voiceForm, setVoiceForm] = useState(null);
   const [voiceBusy, setVoiceBusy] = useState(false);
+  // 每个场次的竞品切片数（taskId → 数量），决定「竞品对比」按钮是否出现
+  const [competitorCounts, setCompetitorCounts] = useState({});
 
   const sessions = useMemo(() => groupSessions(records || []), [records]);
 
@@ -133,8 +135,14 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
       .then((list) => setSummaries(list || []))
       .catch((err) => setMessage(err?.message || "读取切片任务失败"));
 
+  const loadCompetitorCounts = () =>
+    invokeCommand("competitor_clip_counts", { roomId: anchor.uid })
+      .then((map) => setCompetitorCounts(map || {}))
+      .catch(() => {});
+
   useEffect(() => {
     loadSummaries();
+    loadCompetitorCounts();
     invokeCommand("anchor_clip_profile_get", { roomId: anchor.uid })
       .then((value) => setProfile(value || "reaction"))
       .catch(() => {});
@@ -488,14 +496,21 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                             评阅切片
                           </button>
                         ) : null}
-                        {st === "done" && s.task.clipCount > 0 ? (
-                          <button
-                            className="h-8 whitespace-nowrap rounded-lg border border-[rgba(31,79,184,0.32)] bg-[#EEF3FF] px-2.5 text-sm font-semibold text-[#1F4FB8] transition hover:bg-[#E3ECFF]"
-                            onClick={() => setCompareSession(s)}
-                          >
-                            竞品对比
-                          </button>
-                        ) : null}
+                        {(() => {
+                          // 有切片、或有竞品切片，都允许进入对比页：
+                          // 本场分析失败时仍能查看竞品下载情况与漏切原因。
+                          const clipCount = s.task?.clipCount ?? 0;
+                          const compCount = competitorCounts[s.task?.taskId] || 0;
+                          if (!(st === "done" && clipCount > 0) && compCount === 0) return null;
+                          return (
+                            <button
+                              className="h-8 whitespace-nowrap rounded-lg border border-[rgba(31,79,184,0.32)] bg-[#EEF3FF] px-2.5 text-sm font-semibold text-[#1F4FB8] transition hover:bg-[#E3ECFF]"
+                              onClick={() => setCompareSession(s)}
+                            >
+                              竞品对比{compCount > 0 ? ` ${compCount}` : ""}
+                            </button>
+                          );
+                        })()}
                         <button
                           className="h-8 whitespace-nowrap rounded-lg border border-[#1F7A45]/30 bg-[#E8F5EE] px-2.5 text-sm font-semibold text-[#1F7A45] transition hover:border-[#1F7A45]/50 disabled:opacity-50"
                           disabled={st === "running"}

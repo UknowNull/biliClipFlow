@@ -503,3 +503,27 @@ pub async fn competitor_up_info(
         avatar_url: avatar,
     }))
 }
+
+
+/// 某主播每个场次的竞品切片数量，供录播管理列表决定是否显示「竞品对比」。
+/// 返回 task_id → 数量。
+#[tauri::command(async)]
+pub fn competitor_clip_counts(
+    state: State<'_, AppState>,
+    room_id: String,
+) -> ApiResponse<std::collections::HashMap<i64, i64>> {
+    let result = state.db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT task_id, COUNT(*) FROM competitor_clip \
+             WHERE room_id = ?1 AND task_id IS NOT NULL GROUP BY task_id",
+        )?;
+        let rows = stmt.query_map([room_id.trim()], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<Result<std::collections::HashMap<i64, i64>, _>>()
+    });
+    match result {
+        Ok(map) => ApiResponse::success(map),
+        Err(err) => ApiResponse::error(format!("统计竞品切片失败: {}", err)),
+    }
+}
