@@ -539,7 +539,7 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                                 className="h-8 whitespace-nowrap rounded-lg border border-black/10 bg-[#F6F8FA] px-2.5 text-sm font-semibold text-[#5B6170] transition hover:bg-[#EEF1F4]"
                                 onClick={() => setClipsSession(s)}
                               >
-                                竞品切片 {compCount}
+                                竞品切片
                               </button>
                               {canCompare ? (
                                 <button

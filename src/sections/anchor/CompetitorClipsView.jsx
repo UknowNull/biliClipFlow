@@ -30,6 +30,32 @@ export default function CompetitorClipsView({ anchor, task, onBack, onOpenCompar
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
   const [selected, setSelected] = useState(null);
+  // 封面需要走本地代理：B站图片有防盗链，直接 <img src> 会被拦
+  const [covers, setCovers] = useState({});
+
+  useEffect(() => {
+    const missing = clips.filter((c) => c.coverUrl && !covers[c.id]);
+    if (!missing.length) return;
+    let cancelled = false;
+    // 并发加载：逐张串行时几张 260KB 的图会明显卡顿
+    void Promise.all(
+      missing.map(async (clip) => {
+        try {
+          const data = await invokeCommand("video_proxy_image", { url: clip.coverUrl });
+          if (!cancelled && data) {
+            setCovers((prev) => ({ ...prev, [clip.id]: data }));
+          }
+        } catch (err) {
+          // 单张失败不影响其他封面，控制台留痕便于排查
+          console.warn("cover load failed", clip.bvid, err);
+        }
+      }),
+    );
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clips]);
 
   const load = async () => {
     setLoading(true);
@@ -117,6 +143,7 @@ export default function CompetitorClipsView({ anchor, task, onBack, onOpenCompar
               <ClipCard
                 key={clip.id}
                 clip={clip}
+                cover={covers[clip.id]}
                 selected={selected?.id === clip.id}
                 onSelect={() => setSelected(clip)}
               />
@@ -132,7 +159,7 @@ export default function CompetitorClipsView({ anchor, task, onBack, onOpenCompar
   );
 }
 
-function ClipCard({ clip, selected, onSelect }) {
+function ClipCard({ clip, cover, selected, onSelect }) {
   const meta = STATUS_META[clip.status] || STATUS_META.PENDING;
   return (
     <button
@@ -144,18 +171,11 @@ function ClipCard({ clip, selected, onSelect }) {
       onClick={onSelect}
     >
       <div className="relative flex aspect-video items-center justify-center overflow-hidden bg-[linear-gradient(135deg,#dfe8ee,#c8d8e3)]">
-        {clip.coverUrl ? (
-          <img
-            src={clip.coverUrl}
-            alt=""
-            className="h-full w-full object-cover"
-            onError={(event) => {
-              event.currentTarget.style.display = "none";
-            }}
-          />
+        {cover ? (
+          <img src={cover} alt="" className="h-full w-full object-cover" />
         ) : (
           <span className="text-[10px] font-semibold uppercase tracking-wider text-[#7d95a5]">
-            无封面
+            {clip.coverUrl ? "封面加载中…" : "无封面"}
           </span>
         )}
         <span className={`absolute left-1.5 top-1.5 rounded px-1.5 py-0.5 text-[10px] font-bold ${meta.cls}`}>
