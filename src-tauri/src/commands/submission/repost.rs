@@ -151,7 +151,7 @@ pub async fn submission_repost(
             )
             .await;
         }
-        let missing_sources = collect_missing_source_files(&detail.source_videos);
+        let missing_sources = collect_missing_source_files(&context, &task_id, &detail.source_videos);
         if !missing_sources.is_empty() {
             return handle_full_reprocess_missing_sources(
                 &state,
@@ -244,7 +244,7 @@ pub async fn submission_repost(
             request.merged_video_id,
         );
         let sources_ready = !reprocess_source_paths.is_empty()
-            && collect_missing_source_paths(&reprocess_source_paths).is_empty();
+            && collect_unready_source_paths(&context, &detail.task.task_id, &reprocess_source_paths).is_empty();
         let source_override = if mode == ReprocessMode::Specified {
             Some(reprocess_source_paths.clone())
         } else {
@@ -948,7 +948,7 @@ pub async fn submission_repost(
         return Ok(ApiResponse::error("请至少添加一个源视频"));
     }
 
-    let missing_sources = collect_missing_source_files(&detail.source_videos);
+    let missing_sources = collect_missing_source_files(&context, &task_id, &detail.source_videos);
     if !missing_sources.is_empty() {
         if let Some(response) = try_repost_with_existing_merged_assets(
             &state,
@@ -996,8 +996,13 @@ pub async fn submission_repost(
     Ok(ApiResponse::success("重新投稿已启动".to_string()))
 }
 
-pub(super) fn collect_missing_source_files(sources: &[TaskSourceVideoRecord]) -> Vec<String> {
+pub(super) fn collect_missing_source_files(
+    context: &SubmissionContext,
+    task_id: &str,
+    sources: &[TaskSourceVideoRecord],
+) -> Vec<String> {
     let mut missing = Vec::new();
+    let mut existing_paths = Vec::new();
     for source in sources {
         if source.source_file_path.trim().is_empty() {
             continue;
@@ -1005,6 +1010,15 @@ pub(super) fn collect_missing_source_files(sources: &[TaskSourceVideoRecord]) ->
         let path = Path::new(&source.source_file_path);
         if !path.exists() {
             missing.push(source.source_file_path.clone());
+        } else {
+            existing_paths.push(source.source_file_path.clone());
+        }
+    }
+    // 文件存在但只下载了一部分的源视频，同样必须重新下载补齐：
+    // 否则会拿半截文件切段，产出损坏码流导致B站转码失败。
+    for partial in collect_partial_source_paths(context, task_id, &existing_paths) {
+        if !missing.contains(&partial) {
+            missing.push(partial);
         }
     }
     missing
@@ -1014,16 +1028,25 @@ pub(super) fn collect_missing_source_files(sources: &[TaskSourceVideoRecord]) ->
 ///
 /// 只看 `exists()` 不够：aria2c 中断后留下的是半截文件，文件存在但内容残缺，
 /// 直接拿去 copy 切段会切出损坏码流，合并后整条投稿被B站判转码失败。
-/// 这里用「文件实际大小 < 下载记录总大小」判定未就绪，
-/// 同时容忍记录滞后（文件已补全但记录仍停在暂停进度）的情况。
+/// 这里用「文件实际大小明显小于下载记录总大小」判定未就绪。
+///
+/// 容差是必要的：DASH 源的 `progress_total` 是 video+audio 两个流的 content-length 之和，
+/// 而合并时会重编码音轨（如 320k→192k），产物天然小于总和（实测约 98.4%）。
+/// 没有容差会把这类完整文件误判为半截，进而删掉完整的 4.5GB 文件重新下载。
 pub(super) fn is_partial_download_file(path: &Path, expected_total: i64) -> bool {
     if expected_total <= 0 {
         return false;
     }
-    match fs::metadata(path) {
-        Ok(meta) => (meta.len() as i64) < expected_total,
-        Err(_) => false,
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    let actual = meta.len() as i64;
+    if actual >= expected_total {
+        return false;
     }
+    // 允许 4MB 或 2% 的偏差（取较大者），覆盖 DASH 音轨重编码带来的体积缩小。
+    let tolerance = (expected_total / 50).max(4 * 1024 * 1024);
+    expected_total - actual > tolerance
 }
 
 pub(super) fn collect_missing_source_paths(paths: &[String]) -> Vec<String> {
@@ -1040,6 +1063,30 @@ pub(super) fn collect_missing_source_paths(paths: &[String]) -> Vec<String> {
     missing
 }
 
+/// 在上面「文件不存在」的基础上，叠加「文件存在但内容不完整」的判定。
+/// 重新投稿/重分段路径必须用这个版本，否则半截文件会被当成就绪直接切段。
+pub(super) fn collect_unready_source_paths(
+    context: &SubmissionContext,
+    task_id: &str,
+    paths: &[String],
+) -> Vec<String> {
+    let mut unready = collect_missing_source_paths(paths);
+    let existing: Vec<String> = paths
+        .iter()
+        .filter(|path| {
+            let trimmed = path.trim();
+            !trimmed.is_empty() && Path::new(trimmed).exists()
+        })
+        .cloned()
+        .collect();
+    for partial in collect_partial_source_paths(context, task_id, &existing) {
+        if !unready.contains(&partial) {
+            unready.push(partial);
+        }
+    }
+    unready
+}
+
 /// 在“文件不存在”之外，进一步筛出「文件存在但内容不完整」的源视频。
 /// 这类源视频必须重新下载补齐后才能开始剪辑，不能静默按完整文件处理。
 pub(super) fn collect_partial_source_paths(
@@ -1052,6 +1099,12 @@ pub(super) fn collect_partial_source_paths(
     };
     let mut total_by_path: HashMap<String, i64> = HashMap::new();
     for record in records {
+        // 正在下载中（status=1）的记录跳过：文件必然小于总大小，
+        // 若在此判为“半截”会重新排队并清掉老任务的输出，
+        // 造成两个 writer 抢同一路径。
+        if record.status == 1 {
+            continue;
+        }
         let runtime_path = normalize_runtime_source_path(context, &record.local_path);
         if runtime_path.trim().is_empty() {
             continue;
@@ -1120,7 +1173,7 @@ pub(super) async fn handle_repost_missing_assets(
     };
     let source_paths =
         source_paths_override.unwrap_or_else(|| extract_source_paths_from_task(detail));
-    let missing_sources = collect_missing_source_paths(&source_paths);
+    let missing_sources = collect_unready_source_paths(context, task_id, &source_paths);
     append_log(
     &state.app_log_path,
     &format!(
@@ -1274,7 +1327,7 @@ pub async fn submission_repost_transcode(
         )
         .await;
     }
-    let missing_sources = collect_missing_source_files(&detail.source_videos);
+    let missing_sources = collect_missing_source_files(&context, &task_id, &detail.source_videos);
     if !missing_sources.is_empty() {
         return handle_full_reprocess_missing_sources(
             &state,
@@ -3552,6 +3605,7 @@ pub(super) fn collect_retry_download_records_for_missing_sources(
                     content: None,
                     source_type: crate::commands::download::DOWNLOAD_SOURCE_BAIDU.to_string(),
                     progress_total: 0,
+                    status: 0,
                 });
                 continue;
             }
@@ -3579,6 +3633,7 @@ pub(super) fn collect_retry_download_records_for_missing_sources(
                     content: None,
                     source_type: crate::commands::download::DOWNLOAD_SOURCE_DIRECT.to_string(),
                     progress_total: 0,
+                    status: 0,
                 });
                 continue;
             }
@@ -3611,6 +3666,7 @@ pub(super) fn collect_retry_download_records_for_missing_sources(
                     content: None,
                     source_type: "BILIBILI".to_string(),
                     progress_total: 0,
+                    status: 0,
                 });
                 continue;
             }

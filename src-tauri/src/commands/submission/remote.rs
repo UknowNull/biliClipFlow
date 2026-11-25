@@ -1547,6 +1547,24 @@ pub(super) async fn verify_remote_part_count(
 ) -> Result<(), String> {
     let mut last_error: Option<String> = None;
     for attempt in 1..=REMOTE_PART_VERIFY_RETRY_LIMIT {
+        // 数量正确不代表投稿成功：媒体损坏时稿件会被B站判 -16 转码失败。
+        // 这里一并检查，覆盖所有以「分P数量通过」为完成依据的出口
+        // （pre_submit_guard / 重复提交兜底 / 对账）。
+        if let Ok(Some((state, state_desc))) =
+            fetch_remote_archive_state(context, auth, bvid).await
+        {
+            if is_remote_archive_state_failed(state) {
+                let desc = remote_archive_state_label(state, &state_desc);
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "submission_remote_archive_rejected task_id={} bvid={} state={} desc={}",
+                        task_id, bvid, state, desc
+                    ),
+                );
+                return Err(build_archive_failed_error(state, &desc));
+            }
+        }
         match fetch_remote_archive_part_count(context, auth, bvid, aid).await {
             Ok(Some(actual_parts)) if actual_parts == expected_parts => {
                 append_log(
@@ -1987,6 +2005,27 @@ pub(super) async fn refresh_submission_remote_state(context: &SubmissionQueueCon
                         (state, state_desc.as_deref(), &task_id),
                     )?;
                 }
+                // 已 COMPLETED 的稿件若在B站变成转码失败，必须纠正为 FAILED。
+                // 这类稿件通常是媒体损坏导致的，历史版本曾把它误记为完成。
+                if state == REMOTE_STATE_TRANSCODE_FAILED {
+                    let reason_text = state_desc
+                        .as_deref()
+                        .map(|value| value.trim())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("转码失败");
+                    tx.execute(
+                        "UPDATE submission_task SET status = 'FAILED', updated_at = ?1 WHERE task_id = ?2 AND status = 'COMPLETED'",
+                        (now.as_str(), &task_id),
+                    )?;
+                    tx.execute(
+                        "UPDATE workflow_instances SET status = 'FAILED', error_message = ?1, updated_at = ?2 WHERE task_id = ?3 AND status = 'COMPLETED'",
+                        (
+                            &build_archive_failed_error(state, reason_text),
+                            now.as_str(),
+                            &task_id,
+                        ),
+                    )?;
+                }
             }
             for item in &reconciled {
                 tx.execute(
@@ -2056,7 +2095,7 @@ pub(super) fn load_remote_tasks_by_owner(
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.remote_state, COALESCE(st.remote_status_ignored, 0), st.created_at, st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED') OR (st.status = 'COMPLETED' AND COALESCE(TRIM(st.bvid), '') <> '' AND (st.remote_state IS NULL OR st.remote_state IN (-1, -30, -60, -2, -4)))",
+                "SELECT st.task_id, COALESCE(st.bvid, ''), COALESCE(st.aid, 0), st.title, st.status, st.remote_state, COALESCE(st.remote_status_ignored, 0), st.created_at, st.updated_at, COALESCE((SELECT wi.error_message FROM workflow_instances wi WHERE wi.task_id = st.task_id ORDER BY wi.created_at DESC LIMIT 1), ''), (SELECT COUNT(*) FROM task_output_segment tos WHERE tos.task_id = st.task_id), st.bilibili_uid, COALESCE(st.collection_section_id, 0) FROM submission_task st WHERE st.status IN ('VERIFY_PENDING', 'SUBMIT_UNKNOWN', 'FAILED') OR (st.status = 'COMPLETED' AND COALESCE(TRIM(st.bvid), '') <> '' AND (st.remote_state IS NULL OR st.remote_state IN (-1, -30, -60, -2, -4, -16)))",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((

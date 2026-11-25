@@ -1174,12 +1174,48 @@ pub(super) fn sync_segment_upload_identity(
         .map_err(|err| err.to_string())
 }
 
+/// 提交后检查B站稿件是否已进入不可恢复的失败态。
+/// 新增投稿与更新投稿都要过这一关：只校验分P数量/数量正确，
+/// 会漏掉「媒体损坏导致转码失败」的稿件，使任务被误记为完成。
+pub(super) async fn ensure_remote_archive_not_failed(
+    context: &UploadContext,
+    auth: &AuthInfo,
+    task_id: &str,
+    bvid: &str,
+) -> Result<(), String> {
+    match fetch_remote_archive_state(context, auth, bvid).await {
+        Ok(Some((state, state_desc))) if is_remote_archive_state_failed(state) => {
+            let desc = remote_archive_state_label(state, &state_desc);
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_remote_archive_rejected task_id={} bvid={} state={} desc={}",
+                    task_id, bvid, state, desc
+                ),
+            );
+            Err(build_archive_failed_error(state, &desc))
+        }
+        Ok(_) => Ok(()),
+        Err(err) => {
+            // 读取失败不阻断投稿判定，交给 refresh 兜底。
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_remote_archive_state_skip task_id={} bvid={} err={}",
+                    task_id, bvid, err
+                ),
+            );
+            Ok(())
+        }
+    }
+}
+
 pub(super) fn is_remote_part_content_mismatch_error(err: &str) -> bool {
     err.contains("远程分P内容与本次提交不一致")
 }
 
 pub(super) fn is_remote_transcode_failure_error(err: &str) -> bool {
-    err.contains("B站稿件转码失败")
+    err.contains("B站稿件状态异常")
 }
 
 /// 读取远端稿件的转码/审核状态。
@@ -1214,10 +1250,75 @@ pub(super) async fn fetch_remote_archive_state(
     Ok(Some((state, state_desc)))
 }
 
-/// B站稿件状态是否代表「已受理成功」。
-/// 负数状态是各类失败（-16 转码失败、-30 等），必须视为失败而不是成功。
-pub(super) fn is_remote_archive_state_ok(state: i64) -> bool {
-    state >= 0
+/// B站稿件状态是否代表「已经明确失败、不必再等」。
+///
+/// 注意不能写成 `state >= 0` 判成功：刚提交的稿件状态通常是
+/// -30 创建已提交 / -9 等待转码 / -1 待审 等过渡态，
+/// 若一律判失败，会把每一次正常投稿都误杀。
+/// 这里只拦「确定不会自己恢复」的真失败态；其余状态交给后续分P校验与 refresh 兜底。
+pub(super) fn is_remote_archive_state_failed(state: i64) -> bool {
+    matches!(
+        state,
+        REMOTE_STATE_TRANSCODE_FAILED  // -16 转码失败
+            | -12                       // 转储失败
+            | -11                       // 视频源待修
+            | -2                        // 被打回
+            | -3                        // 网警锁定
+            | -4                        // 被锁定
+            | -5                        // 管理员锁定
+            | -14                       // 临时回收站
+            | -100                      // 用户删除
+    )
+}
+
+/// 把B站 state 翻译成可读描述，便于用户判断。未知状态原样返回。
+pub(super) fn remote_archive_state_label(state: i64, state_desc: &str) -> String {
+    let trimmed = state_desc.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    match state {
+        -1 => "待审".to_string(),
+        -2 => "被打回".to_string(),
+        -3 => "网警锁定".to_string(),
+        -4 => "被锁定".to_string(),
+        -5 => "管理员锁定".to_string(),
+        -6 => "修复待审".to_string(),
+        -7 => "暂缓审核".to_string(),
+        -8 => "补档待审".to_string(),
+        -9 => "等待转码".to_string(),
+        -10 => "延迟审核".to_string(),
+        -11 => "视频源待修".to_string(),
+        -12 => "转储失败".to_string(),
+        -13 => "允许评论待审".to_string(),
+        -14 => "临时回收站".to_string(),
+        -15 => "分发中".to_string(),
+        -16 => "转码失败".to_string(),
+        -20 => "创建未提交".to_string(),
+        -30 => "创建已提交".to_string(),
+        -40 => "定时发布".to_string(),
+        -50 => "仅UP主可见".to_string(),
+        -100 => "用户删除".to_string(),
+        0 => "开放浏览".to_string(),
+        1 => "橙色通过".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 构造失败提示：区分「源视频可能损坏」与「稿件在B站侧被处理掉」，
+/// 避免把所有状态都错误地归结为源视频问题。
+pub(super) fn build_archive_failed_error(state: i64, desc: &str) -> String {
+    let advice = if matches!(state, REMOTE_STATE_TRANSCODE_FAILED | -11 | -12) {
+        "请检查源视频是否完整后重新投稿"
+    } else {
+        "请到B站创作中心查看稿件状态后处理"
+    };
+    let label = if desc.trim().is_empty() {
+        format!("state={}", state)
+    } else {
+        format!("state={} {}", state, desc)
+    };
+    format!("B站稿件状态异常（{}），{}", label, advice)
 }
 
 fn summarize_cid_list(cids: &[i64]) -> String {
@@ -1250,12 +1351,8 @@ pub(super) async fn verify_remote_part_cids(
         // 先看B站稿件状态：转码失败等负状态必须立刻判失败，
         // 否则分P齐全但媒体损坏的稿件会被误记为投稿成功。
         match fetch_remote_archive_state(context, auth, bvid).await {
-            Ok(Some((state, state_desc))) if !is_remote_archive_state_ok(state) => {
-                let desc = if state_desc.trim().is_empty() {
-                    "未知原因".to_string()
-                } else {
-                    state_desc.trim().to_string()
-                };
+            Ok(Some((state, state_desc))) if is_remote_archive_state_failed(state) => {
+                let desc = remote_archive_state_label(state, &state_desc);
                 append_log(
                     &context.app_log_path,
                     &format!(
@@ -1263,12 +1360,25 @@ pub(super) async fn verify_remote_part_cids(
                         task_id, bvid, state, desc
                     ),
                 );
-                return Err(format!(
-                    "B站稿件转码失败（state={} {}），请检查源视频是否完整后重新投稿",
-                    state, desc
-                ));
+                return Err(build_archive_failed_error(state, &desc));
             }
-            Ok(_) => {}
+            Ok(Some((state, state_desc))) => {
+                // 过渡态（-30 创建已提交 / -9 等待转码 / -1 待审 等）不算失败，
+                // 记录一下便于排查，然后继续走分P校验。
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "submission_remote_archive_state_pending task_id={} bvid={} state={} desc={}",
+                        task_id,
+                        bvid,
+                        state,
+                        remote_archive_state_label(state, &state_desc)
+                    ),
+                );
+            }
+            Ok(_) => {
+                // 读不到 state（Ok(None)）时不做判断，继续走分P校验。
+            }
             Err(err) => {
                 if is_rate_limit_error(&err) {
                     return Err(err);
@@ -2347,6 +2457,26 @@ pub(super) async fn run_submission_upload(context: UploadContext, task_id: Strin
                         &format!(
                             "submission_upload_remote_part_mismatch task_id={} err={}",
                             task_id, err
+                        ),
+                    );
+                    return Err(err);
+                }
+                // 分P齐了不代表B站转码成功：媒体损坏时稿件会被判 -16 转码失败。
+                // 必须显式检查，否则损坏的投稿会被误记为完成。
+                if let Err(err) =
+                    ensure_remote_archive_not_failed(&context, &auth, &task_id, &result.bvid).await
+                {
+                    update_submission_status_with_reason(
+                        &submission_context,
+                        &task_id,
+                        "FAILED",
+                        Some(&err),
+                    )?;
+                    append_log(
+                        &context.app_log_path,
+                        &format!(
+                            "submission_upload_archive_rejected task_id={} bvid={} err={}",
+                            task_id, result.bvid, err
                         ),
                     );
                     return Err(err);

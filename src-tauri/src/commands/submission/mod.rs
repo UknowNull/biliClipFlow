@@ -899,6 +899,8 @@ struct IntegratedDownloadRecord {
     source_type: String,
     /// 下载记录里登记的完整文件大小；0 表示未知。
     progress_total: i64,
+    /// 下载状态：0 待下载 / 1 下载中 / 2 完成 / 3 失败 / 4 暂停 / 5 暂存。
+    status: i64,
 }
 
 #[derive(Clone)]
@@ -1053,7 +1055,14 @@ impl RemoteTrackedTask {
                     && !self.bvid.trim().is_empty()
                     && matches!(
                         self.remote_state,
-                        None | Some(-1) | Some(-30) | Some(-60) | Some(-2) | Some(-4)
+                        None | Some(-1)
+                            | Some(-30)
+                            | Some(-60)
+                            | Some(-2)
+                            | Some(-4)
+                            // -16 转码失败：媒体损坏的稿件曾被误记为完成，
+                            // 必须让 refresh 持续复查并把任务纠正为失败。
+                            | Some(REMOTE_STATE_TRANSCODE_FAILED)
                     )))
     }
 
@@ -1776,22 +1785,74 @@ mod tests {
 
     #[test]
     fn partial_download_file_detection_matches_incomplete_size() {
-        // 本次故障：DB 记录 4.48GB，磁盘只有约 178MB → 判定为未就绪。
-        let expected_total = 4477869772_i64;
-        let on_disk = 178044928_u64;
-        assert!(on_disk < expected_total as u64, "半截文件必须判为未就绪");
+        let dir = std::env::temp_dir().join(format!("bcf_partial_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("sample.flv");
+        // 本次故障的真实比例：DB 记录 4.48GB，磁盘只有约 178MB。
+        std::fs::write(&path, vec![0u8; 1024]).expect("write sample");
+
+        assert!(
+            is_partial_download_file(&path, 4_477_869_772),
+            "半截文件必须判为未就绪"
+        );
+        // 文件达到记录大小时不判半截。
+        assert!(!is_partial_download_file(&path, 1024));
         // 总大小未知（<=0）时不做限制，避免误杀。
-        assert!(!is_partial_download_file(Path::new("/nonexistent"), 0));
+        assert!(!is_partial_download_file(&path, 0));
+        // 容差内：DASH 音轨重编码后产物可能略小于 content-length 之和，
+        // expected 比实际大 20 字节（在 4MB 容差内）→ 应放行。
+        // 注意 expected 必须大于实际，否则会走"已满"早退分支测不到容差逻辑。
+        assert!(
+            !is_partial_download_file(&path, 1024 + 20),
+            "容差内的轻微偏小不应判为半截"
+        );
+        // 容差外：expected 比实际大 8MB（超过 4MB 下限容差）→ 必须判半截。
+        assert!(
+            is_partial_download_file(&path, 1024 + 8 * 1024 * 1024),
+            "超出容差的缺失必须判为半截"
+        );
+        // 不存在的文件由 missing 逻辑处理，这里不应判半截。
+        assert!(!is_partial_download_file(&dir.join("nope.flv"), 1000));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_archive_transient_state_is_not_failure() {
+        // 刚提交的稿件处于过渡态：绝不能判失败，否则每次投稿都会被误杀。
+        assert!(!is_remote_archive_state_failed(-30)); // 创建已提交
+        assert!(!is_remote_archive_state_failed(-9)); // 等待转码
+        assert!(!is_remote_archive_state_failed(-1)); // 待审
+        assert!(!is_remote_archive_state_failed(-15)); // 分发中
+        assert!(!is_remote_archive_state_failed(-40)); // 定时发布
+        assert!(!is_remote_archive_state_failed(0)); // 开放浏览
+        assert!(!is_remote_archive_state_failed(1)); // 橙色通过
     }
 
     #[test]
     fn remote_archive_negative_state_is_failure() {
-        // B站 -16 = 转码失败，必须判失败。
-        assert!(!is_remote_archive_state_ok(-16));
-        assert!(!is_remote_archive_state_ok(-30));
-        // 正常/审核中等状态视为已受理。
-        assert!(is_remote_archive_state_ok(0));
-        assert!(is_remote_archive_state_ok(1));
+        // 确定不会自己恢复的真失败态必须判失败。
+        assert!(is_remote_archive_state_failed(-16)); // 转码失败
+        assert!(is_remote_archive_state_failed(-12)); // 转储失败
+        assert!(is_remote_archive_state_failed(-11)); // 视频源待修
+        assert!(is_remote_archive_state_failed(-2)); // 被打回
+        assert!(is_remote_archive_state_failed(-3)); // 网警锁定
+        assert!(is_remote_archive_state_failed(-4)); // 被锁定
+        assert!(is_remote_archive_state_failed(-5)); // 管理员锁定
+        assert!(is_remote_archive_state_failed(-14)); // 临时回收站
+        assert!(is_remote_archive_state_failed(-100)); // 用户删除
+    }
+
+    #[test]
+    fn archive_failed_error_advice_matches_state() {
+        // 转码类失败才提示检查源视频；被锁定/删除类应引导去创作中心。
+        assert!(build_archive_failed_error(-16, "转码失败").contains("源视频"));
+        assert!(build_archive_failed_error(-11, "视频源待修").contains("源视频"));
+        assert!(!build_archive_failed_error(-100, "用户删除").contains("源视频"));
+        assert!(build_archive_failed_error(-100, "用户删除").contains("创作中心"));
+        // 文案不得出现重复的 state 前缀。
+        let msg = build_archive_failed_error(-3, "");
+        assert_eq!(msg.matches("state=").count(), 1, "文案: {msg}");
     }
 
     #[test]

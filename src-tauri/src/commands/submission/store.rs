@@ -22,7 +22,7 @@ pub(super) fn load_integrated_download_records(
             let mut stmt = conn.prepare(
                 "SELECT vd.id, vd.download_url, vd.bvid, vd.aid, vd.title, vd.part_title, \
                 vd.part_count, vd.current_part, vd.local_path, vd.resolution, vd.codec, \
-                vd.format, vd.cid, vd.content, vd.source_type, vd.progress_total \
+                vd.format, vd.cid, vd.content, vd.source_type, vd.progress_total, vd.status \
          FROM task_relations tr \
          JOIN video_download vd ON tr.download_task_id = vd.id \
          WHERE tr.submission_task_id = ?1 AND tr.relation_type = 'INTEGRATED'",
@@ -47,6 +47,7 @@ pub(super) fn load_integrated_download_records(
                         .get::<_, Option<String>>(14)?
                         .unwrap_or_else(|| "BILIBILI".to_string()),
                     progress_total: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
+                    status: row.get::<_, Option<i64>>(16)?.unwrap_or(0),
                 })
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
