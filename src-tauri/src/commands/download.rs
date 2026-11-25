@@ -1714,15 +1714,29 @@ async fn resolve_video_cid(context: &DownloadContext, bvid: &str) -> Option<i64>
     let params = vec![("bvid".to_string(), bvid.to_string())];
     let auth = load_auth(context);
     let url = format!("{}/x/web-interface/view", context.bilibili.base_url());
-    let data = context
+    let data = match context
         .bilibili
         .get_json(&url, &params, auth.as_ref(), false)
         .await
-        .ok()?;
-    data.get("data")
+    {
+        Ok(v) => v,
+        Err(e) => {
+            crate::utils::append_log(
+                context.app_log_path.as_path(),
+                &format!("resolve_cid_failed bvid={} err={}", bvid, e),
+            );
+            return None;
+        }
+    };
+    // 两种响应形态都要兼容：
+    //   标准：{ "code":0, "data": { "cid": ... } }
+    //   平铺：{ "cid": ..., "bvid": ... }（部分通道直出，没有 code/data 包装）
+    let cid = data
+        .get("data")
         .and_then(|d| d.get("cid"))
-        .and_then(|v| v.as_i64())
-        .filter(|v| *v > 0)
+        .or_else(|| data.get("cid"))
+        .and_then(|v| v.as_i64());
+    cid.filter(|v| *v > 0)
 }
 
 /// 供竞品分析调用：把一条 B站视频登记到下载队列，存到指定目录。
