@@ -711,17 +711,22 @@ pub(super) async fn run_submission_workflow(
         let copy_decision = match decide_clip_copy(&sources) {
             Ok(decision) => decision,
             Err(err) => {
+                // 源文件校验失败必须中止，不能降级成 copy：
+                // copy 会把缺失/损坏的源静默带进产物，正是这次转码失败的成因。
                 append_log(
                     &context.app_log_path,
                     &format!(
-                        "submission_clip_copy_check_err task_id={} err={}",
+                        "submission_clip_copy_check_fail task_id={} err={}",
                         task_id, err
                     ),
                 );
-                crate::processing::ClipCopyDecision {
-                    use_copy: true,
-                    reason: Some(format!("forced_copy_fallback err={}", err)),
-                }
+                update_submission_status_with_reason(
+                    &context,
+                    &task_id,
+                    "FAILED",
+                    Some(&err),
+                )?;
+                return Err(err);
             }
         };
         if let Some(reason) = copy_decision.reason.as_deref() {

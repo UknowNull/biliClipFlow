@@ -312,8 +312,12 @@ fn build_merge_transcode_attempts(
 /// copy 模式不重新编码，源文件有任何损坏都会原样带进产物：合并后整条投稿会被B站判转码失败。
 /// 所以这里必须真正校验源文件，而不是无条件走快路径：
 /// - 源文件不存在 → 报错
-/// - 探针时长明显短于请求的 `end_time`（文件被截断/只下载了一部分）→ 降级转码
+/// - 探针时长明显短于请求的 `end_time`（文件被截断）→ 降级转码
 /// - 其余情况才允许 copy。
+///
+/// 注意局限：FLV 头部 onMetaData 会写入完整时长，半截文件探针仍可能报“完整时长”，
+/// 因此本函数挡不住「只下载了一部分」的情况——那道防线由下载就绪判定
+/// （`collect_partial_source_paths`）和合并后时长校验（`verify_concat_output_duration`）承担。
 pub fn decide_clip_copy(sources: &[ClipSource]) -> Result<ClipCopyDecision, String> {
     for source in sources {
         let path = Path::new(&source.input_path);

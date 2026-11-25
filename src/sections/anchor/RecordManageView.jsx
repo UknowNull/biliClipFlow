@@ -138,7 +138,11 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
   const loadCompetitorCounts = () =>
     invokeCommand("competitor_clip_counts", { roomId: anchor.uid })
       .then((map) => setCompetitorCounts(map || {}))
-      .catch(() => {});
+      .catch((err) => {
+        // 不要静默失败：命令不存在或出错时，按钮会永远不显示，且无从排查
+        console.error("competitor_clip_counts failed:", err);
+        setMessage(`读取竞品统计失败: ${err?.message || err}`);
+      });
 
   useEffect(() => {
     loadSummaries();
@@ -500,7 +504,13 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                           // 有切片、或有竞品切片，都允许进入对比页：
                           // 本场分析失败时仍能查看竞品下载情况与漏切原因。
                           const clipCount = s.task?.clipCount ?? 0;
-                          const compCount = competitorCounts[s.task?.taskId] || 0;
+                          // 竞品统计按「录播分段」返回：同一竞品会命中多个分段，
+                          // 累加会重复计数，所以取场次内任一分段的最大值作为数量。
+                          // 只要有一个分段有竞品，这一场就算有竞品。
+                          const compCount = (s.recordIds || []).reduce(
+                            (max, rid) => Math.max(max, competitorCounts[String(rid)] || 0),
+                            0,
+                          );
                           if (!(st === "done" && clipCount > 0) && compCount === 0) return null;
                           return (
                             <button

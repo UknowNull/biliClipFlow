@@ -144,11 +144,9 @@ async fn run_process_task(
         .collect();
 
     let temp_dir = default_temp_dir().join(format!("process_{}", task_id));
-    let copy_decision =
-        decide_clip_copy(&sources).unwrap_or_else(|_| crate::processing::ClipCopyDecision {
-            use_copy: true,
-            reason: Some("forced_copy_fallback".to_string()),
-        });
+    // 源文件校验失败（例如文件不存在）必须直接报错：
+    // 兜底成 copy 会把损坏/缺失的源静默带进产物，正是这次故障的成因。
+    let copy_decision = decide_clip_copy(&sources)?;
     let use_copy = copy_decision.use_copy;
     let clip_outputs =
         tauri::async_runtime::spawn_blocking(move || clip_sources(&sources, &temp_dir, use_copy))

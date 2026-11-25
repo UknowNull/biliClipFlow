@@ -505,22 +505,32 @@ pub async fn competitor_up_info(
 }
 
 
-/// 某主播每个场次的竞品切片数量，供录播管理列表决定是否显示「竞品对比」。
-/// 返回 task_id → 数量。
+/// 竞品切片按「录播分段」统计，返回 record_id → 数量。
+///
+/// 不能按 task_id 统计：同一场直播在录制过程中会产生多条渐进式切片任务
+/// （分段数 4 → 9 → 13 → 21 → 28 递增），而录播管理按场次显示、只绑定其中
+/// 一条，按 task 统计会出现「竞品存在但按钮不显示」。用分段 ID 做键，
+/// 前端可以按场次包含的分段集合汇总。
 #[tauri::command(async)]
 pub fn competitor_clip_counts(
     state: State<'_, AppState>,
     room_id: String,
-) -> ApiResponse<std::collections::HashMap<i64, i64>> {
+) -> ApiResponse<std::collections::HashMap<String, i64>> {
     let result = state.db.with_conn(|conn| {
+        // 把竞品的 task 展开成它包含的每个 record_id，再按 record_id 计数。
+        // 同一竞品可能命中多个分段，用 DISTINCT 防止重复计数。
         let mut stmt = conn.prepare(
-            "SELECT task_id, COUNT(*) FROM competitor_clip \
-             WHERE room_id = ?1 AND task_id IS NOT NULL GROUP BY task_id",
+            "SELECT CAST(j.value AS TEXT) AS rid, COUNT(DISTINCT c.id) \
+             FROM competitor_clip c \
+             JOIN live_clip_task t ON t.id = c.task_id \
+             JOIN json_each(t.record_ids) j \
+             WHERE c.room_id = ?1 AND c.task_id IS NOT NULL \
+             GROUP BY j.value",
         )?;
         let rows = stmt.query_map([room_id.trim()], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })?;
-        rows.collect::<Result<std::collections::HashMap<i64, i64>, _>>()
+        rows.collect::<Result<std::collections::HashMap<String, i64>, _>>()
     });
     match result {
         Ok(map) => ApiResponse::success(map),
