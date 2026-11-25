@@ -1709,6 +1709,22 @@ async fn handle_integration_download(
     }
 }
 
+/// 取视频首个分P的 cid。竞品切片都是单P，取第一个即可。
+async fn resolve_video_cid(context: &DownloadContext, bvid: &str) -> Option<i64> {
+    let params = vec![("bvid".to_string(), bvid.to_string())];
+    let auth = load_auth(context);
+    let url = format!("{}/x/web-interface/view", context.bilibili.base_url());
+    let data = context
+        .bilibili
+        .get_json(&url, &params, auth.as_ref(), false)
+        .await
+        .ok()?;
+    data.get("data")
+        .and_then(|d| d.get("cid"))
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v > 0)
+}
+
 /// 供竞品分析调用：把一条 B站视频登记到下载队列，存到指定目录。
 /// 只负责入队，进度与完成由现有下载队列维护。
 pub async fn enqueue_competitor_download(
@@ -1718,10 +1734,15 @@ pub async fn enqueue_competitor_download(
     target_dir: &str,
 ) -> Result<i64, String> {
     let context = DownloadContext::from_state(state);
+    // 必须先取到真实 cid：playurl 接口传 cid=0 会直接返回 -400 请求错误，
+    // 下载永远不会真正开始。
+    let cid = resolve_video_cid(&context, bvid)
+        .await
+        .ok_or_else(|| format!("获取 {} 的 cid 失败", bvid))?;
     let request = DownloadRequest {
         video_url: format!("https://www.bilibili.com/video/{}", bvid),
         parts: vec![DownloadPart {
-            cid: 0,
+            cid,
             title: title.to_string(),
             duration: None,
             target_path: Some(format!("{}/{}.mp4", target_dir.trim_end_matches('/'), bvid)),

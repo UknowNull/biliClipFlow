@@ -214,7 +214,37 @@ pub fn resume_downloading(
         let video_path = dir.join(format!("{}.mp4", bvid));
         let asr_path = dir.join(format!("{}.json", bvid));
         if !video_path.exists() {
-            continue; // 还在下载
+            // 查下载队列的真实状态：失败的要回写，否则会永远卡在 DOWNLOADING
+            use rusqlite::OptionalExtension;
+            let dl_status: Option<i64> = db
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT status FROM video_download WHERE bvid = ?1 ORDER BY id DESC LIMIT 1",
+                        [&bvid],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                })
+                .ok()
+                .flatten();
+            match dl_status {
+                // 3 = 进行中，继续等
+                Some(3) | Some(1) | Some(0) | None => continue,
+                // 其余视为未完成（失败/中断），记失败让用户能看到
+                Some(code) => {
+                    let _ = competitor_media::set_status(
+                        db,
+                        id,
+                        "FAILED",
+                        &format!("下载未完成（队列状态 {}）", code),
+                    );
+                    append_log(
+                        log_path,
+                        &format!("competitor_download_failed id={} bvid={} dl_status={}", id, bvid, code),
+                    );
+                    continue;
+                }
+            }
         }
         let _ = competitor_media::set_status(db, id, "TRANSCRIBING", "");
         match competitor_media::transcribe_clip(
