@@ -13,6 +13,24 @@ const STATUS_META = {
   SKIPPED: { label: "跳过", cls: "bg-black/5 text-[var(--muted)]" },
 };
 
+/** RFC3339 → 本地「YYYY-MM-DD HH:mm」，详情里用完整日期 */
+function fmtPubTimeFull(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** RFC3339 → 本地「MM-DD HH:mm」，用于卡片上紧凑展示投稿时间 */
+function fmtPubTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 function fmtSec(secs) {
   if (!secs || secs <= 0) return "—";
   const total = Math.round(secs);
@@ -193,9 +211,14 @@ function ClipCard({ clip, cover, selected, onSelect }) {
           {clip.title || "未命名"}
         </div>
         <div className="mt-1 flex items-center gap-1 text-[11px] text-[var(--muted)]">
-          <span className="min-w-0 flex-1 truncate">
+          <span className="min-w-0 flex-1 truncate" title={clip.upName || clip.upUid}>
             {clip.upName || `UID ${clip.upUid}`}
           </span>
+          {clip.pubTime ? (
+            <span className="flex-none tabular-nums" title={clip.pubTime}>
+              {fmtPubTime(clip.pubTime)}
+            </span>
+          ) : null}
         </div>
       </div>
     </button>
@@ -239,7 +262,7 @@ function DetailPanel({ clip, onClose }) {
       <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[11.5px] text-[var(--muted)] sm:grid-cols-4">
         <span>UP 主：{clip.upName || clip.upUid}</span>
         <span>BV 号：{clip.bvid}</span>
-        <span>投稿时间：{(clip.pubTime || "").slice(0, 16).replace("T", " ")}</span>
+        <span>投稿时间：{fmtPubTimeFull(clip.pubTime) || "—"}</span>
         <span>时长：{fmtSec(clip.durationSecs)}</span>
       </div>
       {clip.statusNote ? (
