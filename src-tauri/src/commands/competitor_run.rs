@@ -54,7 +54,18 @@ fn load_competitor_rows(db: &Db, task_id: i64) -> Result<Vec<CompetitorRow>, Str
                     COALESCE(c.status_note,''), COALESCE(c.asr_path,''), COALESCE(c.file_path,'') \
              FROM competitor_clip c \
              LEFT JOIN competitor_up u ON u.room_id = c.room_id AND u.up_uid = c.up_uid \
-             WHERE c.task_id = ?1 ORDER BY c.pub_time ASC, c.id ASC",
+             -- 按场次的分段集合关联，不按 task_id 精确匹配：
+             -- 竞品可能归属到录制中较早的渐进任务上，与最终任务对不上。
+             WHERE c.task_id IN ( \
+               SELECT DISTINCT c2.task_id FROM competitor_clip c2 \
+               JOIN live_clip_task t2 ON t2.id = c2.task_id \
+               JOIN json_each(t2.record_ids) j2 \
+               WHERE j2.value IN (SELECT CAST(j.value AS INTEGER) \
+                                  FROM live_clip_task t JOIN json_each(t.record_ids) j \
+                                  WHERE t.id = ?1) \
+                 AND c2.room_id = c.room_id \
+             ) \
+             ORDER BY c.pub_time ASC, c.id ASC",
         )?;
         let rows = stmt.query_map([task_id], |row| {
             Ok(CompetitorRow {
@@ -607,3 +618,4 @@ mod tests {
         assert_eq!(voided, 1, "旧报告应标记作废");
     }
 }
+

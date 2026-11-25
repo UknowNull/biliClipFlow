@@ -256,6 +256,10 @@ pub fn resume_downloading(
                 let _ = competitor_media::attach_asr(db, id, &asr_path.to_string_lossy());
                 done += 1;
                 append_log(log_path, &format!("competitor_resume_transcribed id={}", id));
+                // 本场切片已经完成的话，新转写好的竞品要补做一次对比
+                if let Some(tid) = task_of_clip(db, id) {
+                    trigger_compare_if_session_done(db, tid, log_path);
+                }
             }
             Err(err) => {
                 let _ = competitor_media::set_status(db, id, "FAILED", &err);
@@ -359,5 +363,62 @@ async fn run_once(app: &tauri::AppHandle, app_data_dir: &std::path::Path) {
     let mdir = crate::highlight::model_dir(app_data_dir, &cfg.asr);
     if crate::highlight::asr::models_ready(&mdir) {
         resume_downloading(&db, &mdir, cfg.asr.threads, log_path.as_path());
+    }
+}
+
+/// 取竞品切片归属的 task_id
+fn task_of_clip(db: &Arc<Db>, clip_id: i64) -> Option<i64> {
+    db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT task_id FROM competitor_clip WHERE id = ?1",
+            [clip_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+    })
+    .ok()
+    .flatten()
+}
+
+/// 本场切片已完成时立即做一次对比。
+/// 未完成就跳过——切片那边完成时会自己触发，不需要在这里排队等待。
+fn trigger_compare_if_session_done(db: &Arc<Db>, task_id: i64, log_path: &Path) {
+    let done: bool = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT status FROM live_clip_task WHERE id = ?1",
+                [task_id],
+                |r| r.get::<_, String>(0),
+            )
+        })
+        .map(|s| s == "COMPLETED")
+        .unwrap_or(false);
+    if !done {
+        return;
+    }
+    let room_id: String = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT room_id FROM live_clip_task WHERE id = ?1",
+                [task_id],
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or_default();
+    if room_id.is_empty() {
+        return;
+    }
+    let max_candidates = crate::highlight::settings::load(db).clip.max_candidates;
+    match super::competitor_run::run_compare(db, &room_id, task_id, max_candidates) {
+        Ok(report) => append_log(
+            log_path,
+            &format!(
+                "competitor_compare_after_transcribe task_id={} full={} part={} zero={}",
+                task_id, report.full_count, report.part_count, report.zero_count
+            ),
+        ),
+        Err(err) => append_log(
+            log_path,
+            &format!("competitor_compare_after_transcribe_failed task_id={} err={}", task_id, err),
+        ),
     }
 }

@@ -171,6 +171,66 @@ async fn run_task_guarded(ctx: &Arc<ClipContext>, task_id: i64) {
         )
     });
     append_log(&ctx.app_log_path, &format!("auto_clip_task_end task_id={} status={} clips={} msg={}", task_id, status, count, message.unwrap_or_default()));
+
+    // 切片成功后触发竞品对比：竞品已下载转写的部分参与对比，
+    // 后续才到的竞品会在自己转写完成时再补做（另一处触发）。
+    // 失败不重试——对比不上不影响切片本身的价值。
+    if status == "COMPLETED" {
+        trigger_competitor_compare(ctx, task_id).await;
+    }
+}
+
+/// 切片任务完成后触发竞品对比。
+/// 没有竞品、或竞品都还没转写完成时直接跳过，不报错。
+async fn trigger_competitor_compare(ctx: &Arc<ClipContext>, task_id: i64) {
+    // 本场是否有已就绪的竞品切片
+    let ready: i64 = ctx
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM competitor_clip WHERE task_id = ?1 AND status = 'DONE'",
+                [task_id],
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or(0);
+    if ready == 0 {
+        append_log(
+            &ctx.app_log_path,
+            &format!("competitor_compare_skip task_id={} reason=no_ready_clips", task_id),
+        );
+        return;
+    }
+
+    let room_id: String = ctx
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT room_id FROM live_clip_task WHERE id = ?1",
+                [task_id],
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or_default();
+    if room_id.is_empty() {
+        return;
+    }
+
+    let max_candidates = settings::load(&ctx.db).clip.max_candidates;
+    match crate::commands::competitor_run::run_compare(&ctx.db, &room_id, task_id, max_candidates)
+    {
+        Ok(report) => append_log(
+            &ctx.app_log_path,
+            &format!(
+                "competitor_compare_auto_done task_id={} full={} part={} zero={} skip={}",
+                task_id, report.full_count, report.part_count, report.zero_count, report.skip_count
+            ),
+        ),
+        Err(err) => append_log(
+            &ctx.app_log_path,
+            &format!("competitor_compare_auto_failed task_id={} err={}", task_id, err),
+        ),
+    }
 }
 
 #[derive(Clone)]
