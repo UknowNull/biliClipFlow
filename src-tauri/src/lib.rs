@@ -283,6 +283,7 @@ pub fn run() {
             commands::competitor::competitor_clip_reassign,
             commands::competitor::competitor_up_info,
             commands::competitor::competitor_clip_counts,
+            commands::competitor::competitor_clip_list,
             commands::competitor_run::competitor_compare_run,
             commands::competitor_run::competitor_compare_get,
             commands::auto_clip::anchor_voiceprint_enroll,

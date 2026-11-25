@@ -4,6 +4,7 @@ import { invokeCommand } from "../../lib/tauri";
 import SessionEventsModal from "./SessionEventsModal";
 import ImportRecordsModal from "./ImportRecordsModal";
 import CompetitorConfigModal from "./CompetitorConfigModal";
+import CompetitorClipsView from "./CompetitorClipsView";
 import CompetitorCompareView from "./CompetitorCompareView";
 
 const SESSION_GAP_MS = 30 * 60 * 1000;
@@ -107,6 +108,8 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
   const [competitorOpen, setCompetitorOpen] = useState(false);
   // 正在查看竞品对比的场次；为 null 时显示场次列表
   const [compareSession, setCompareSession] = useState(null);
+  // 正在查看竞品切片列表的场次
+  const [clipsSession, setClipsSession] = useState(null);
   const [summaries, setSummaries] = useState([]);
   const [heat, setHeat] = useState({});
   const [filter, setFilter] = useState("all");
@@ -268,6 +271,24 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
       return [s.task.status === "QUEUED" ? "排队中" : `${STAGE_LABELS[s.task.stage] || "分析中"} ${Math.round(s.task.progress || 0)}%`, "bg-[#FFF3E6] text-[#9A4A0C]"];
     return ["未分析", "bg-black/5 text-[var(--muted)]"];
   };
+
+  // 查看某个场次的竞品切片列表
+  if (clipsSession) {
+    const taskId = clipsSession.task?.taskId;
+    return (
+      <div className="space-y-4">
+        <CompetitorClipsView
+          anchor={anchor}
+          task={{ id: taskId, dateLabel: clipsSession.day }}
+          onBack={() => setClipsSession(null)}
+          onOpenCompare={() => {
+            setCompareSession(clipsSession);
+            setClipsSession(null);
+          }}
+        />
+      </div>
+    );
+  }
 
   // 查看某个场次的竞品对比报告时，整页替换为报告视图
   if (compareSession) {
@@ -501,24 +522,34 @@ export default function RecordManageView({ anchor, records, loading, error, onBa
                           </button>
                         ) : null}
                         {(() => {
-                          // 有切片、或有竞品切片，都允许进入对比页：
-                          // 本场分析失败时仍能查看竞品下载情况与漏切原因。
                           const clipCount = s.task?.clipCount ?? 0;
                           // 竞品统计按「录播分段」返回：同一竞品会命中多个分段，
-                          // 累加会重复计数，所以取场次内任一分段的最大值作为数量。
-                          // 只要有一个分段有竞品，这一场就算有竞品。
+                          // 取场次内任一分段的最大值，避免重复计数。
                           const compCount = (s.recordIds || []).reduce(
                             (max, rid) => Math.max(max, competitorCounts[String(rid)] || 0),
                             0,
                           );
-                          if (!(st === "done" && clipCount > 0) && compCount === 0) return null;
+                          if (compCount === 0) return null;
+                          // 有两个按钮：先看竞品下载了什么，再看对比结果。
+                          // 本场没有切片时对比页没有意义，所以只显示「竞品切片」。
+                          const canCompare = st === "done" && clipCount > 0;
                           return (
-                            <button
-                              className="h-8 whitespace-nowrap rounded-lg border border-[rgba(31,79,184,0.32)] bg-[#EEF3FF] px-2.5 text-sm font-semibold text-[#1F4FB8] transition hover:bg-[#E3ECFF]"
-                              onClick={() => setCompareSession(s)}
-                            >
-                              竞品对比{compCount > 0 ? ` ${compCount}` : ""}
-                            </button>
+                            <>
+                              <button
+                                className="h-8 whitespace-nowrap rounded-lg border border-black/10 bg-[#F6F8FA] px-2.5 text-sm font-semibold text-[#5B6170] transition hover:bg-[#EEF1F4]"
+                                onClick={() => setClipsSession(s)}
+                              >
+                                竞品切片 {compCount}
+                              </button>
+                              {canCompare ? (
+                                <button
+                                  className="h-8 whitespace-nowrap rounded-lg border border-[rgba(31,79,184,0.32)] bg-[#EEF3FF] px-2.5 text-sm font-semibold text-[#1F4FB8] transition hover:bg-[#E3ECFF]"
+                                  onClick={() => setCompareSession(s)}
+                                >
+                                  竞品对比
+                                </button>
+                              ) : null}
+                            </>
                           );
                         })()}
                         <button

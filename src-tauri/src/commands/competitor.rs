@@ -537,3 +537,61 @@ pub fn competitor_clip_counts(
         Err(err) => ApiResponse::error(format!("统计竞品切片失败: {}", err)),
     }
 }
+
+
+/// 竞品切片列表项，供「竞品切片」页面展示。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompetitorClipItem {
+    pub id: i64,
+    pub bvid: String,
+    pub title: String,
+    pub up_uid: String,
+    pub up_name: String,
+    pub cover_url: String,
+    pub duration_secs: f64,
+    pub pub_time: String,
+    pub status: String,
+    pub status_note: String,
+    pub file_path: String,
+}
+
+/// 本场归属的竞品切片列表（按投稿时间倒序）。
+#[tauri::command(async)]
+pub fn competitor_clip_list(
+    state: State<'_, AppState>,
+    room_id: String,
+    task_id: i64,
+) -> ApiResponse<Vec<CompetitorClipItem>> {
+    let result = state.db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.bvid, COALESCE(c.title,''), c.up_uid, COALESCE(u.up_name,''), \
+                    COALESCE(c.cover_url,''), COALESCE(c.duration_secs,0), COALESCE(c.pub_time,''), \
+                    c.status, COALESCE(c.status_note,''), COALESCE(c.file_path,'') \
+             FROM competitor_clip c \
+             LEFT JOIN competitor_up u ON u.room_id = c.room_id AND u.up_uid = c.up_uid \
+             WHERE c.room_id = ?1 AND c.task_id = ?2 \
+             ORDER BY c.pub_time DESC, c.id DESC",
+        )?;
+        let rows = stmt.query_map((room_id.trim(), task_id), |r| {
+            Ok(CompetitorClipItem {
+                id: r.get(0)?,
+                bvid: r.get(1)?,
+                title: r.get(2)?,
+                up_uid: r.get(3)?,
+                up_name: r.get(4)?,
+                cover_url: r.get(5)?,
+                duration_secs: r.get(6)?,
+                pub_time: r.get(7)?,
+                status: r.get(8)?,
+                status_note: r.get(9)?,
+                file_path: r.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+    });
+    match result {
+        Ok(items) => ApiResponse::success(items),
+        Err(err) => ApiResponse::error(format!("读取竞品切片失败: {}", err)),
+    }
+}
