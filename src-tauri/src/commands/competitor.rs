@@ -381,6 +381,63 @@ mod tests {
         assert_eq!(status, "DONE", "归属没变时报告不该作废");
     }
 
+    /// 竞品挂在较早的渐进 task 上时，按最新 task 的场次也要能查到。
+    #[test]
+    fn clip_list_follows_record_overlap_not_exact_task() {
+        let db = mem_db();
+        let now = now_rfc3339();
+        db.with_conn(|conn| {
+            for rid in [1, 2, 3] {
+                conn.execute(
+                    "INSERT INTO live_record_task (id, room_id, status, file_path, segment_index, \
+                        start_time, end_time, create_time, update_time) \
+                     VALUES (?1, 'r', 'STOPPED', ?2, 1, '2026-11-24T10:00:00+00:00', \
+                        '2026-11-24T12:00:00+00:00', ?3, ?3)",
+                    (rid, format!("/rec/{}.mp4", rid), &now),
+                )?;
+            }
+            // 早期任务：只含分段 1
+            conn.execute(
+                "INSERT INTO live_clip_task (id, room_id, record_ids, date_label, status, clip_count, \
+                    create_time, update_time, session_key) VALUES (1, 'r', '[1]', 'd', 'FAILED', 0, ?1, ?1, 's')",
+                [&now],
+            )?;
+            // 最新任务：含全部 3 个分段
+            conn.execute(
+                "INSERT INTO live_clip_task (id, room_id, record_ids, date_label, status, clip_count, \
+                    create_time, update_time, session_key) VALUES (2, 'r', '[1,2,3]', 'd', 'RUNNING', 0, ?1, ?1, 's')",
+                [&now],
+            )?;
+            // 竞品挂在早期任务上
+            conn.execute(
+                "INSERT INTO competitor_clip (room_id, up_uid, bvid, title, task_id, create_time, update_time) \
+                 VALUES ('r', 'u', 'BV1a', 't', 1, ?1, ?1)",
+                [&now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // 用最新 task(2) 查，应能查到挂在 task(1) 上的竞品
+        let count: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "WITH session_records AS ( \
+                       SELECT CAST(j.value AS INTEGER) AS rid \
+                       FROM live_clip_task t JOIN json_each(t.record_ids) j WHERE t.id = 2 \
+                     ) \
+                     SELECT COUNT(*) FROM competitor_clip c \
+                     JOIN live_clip_task t2 ON t2.id = c.task_id \
+                     JOIN json_each(t2.record_ids) j2 ON j2.value IN (SELECT rid FROM session_records) \
+                     WHERE c.room_id = 'r'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(count, 1, "按场次分段应能关联到早期任务的竞品");
+    }
+
     #[test]
     fn rejects_empty_uid() {
         let db = mem_db();
@@ -557,6 +614,10 @@ pub struct CompetitorClipItem {
 }
 
 /// 本场归属的竞品切片列表（按投稿时间倒序）。
+///
+/// 按「场次的分段集合」查，而不是按 task_id 精确匹配：
+/// 同一场直播录制中会产生多条渐进式切片任务（分段 4→9→13→21→28 递增），
+/// 竞品可能归属到较早的某条，而录播管理只绑定最新那条，精确匹配会一条都查不到。
 #[tauri::command(async)]
 pub fn competitor_clip_list(
     state: State<'_, AppState>,
@@ -564,13 +625,25 @@ pub fn competitor_clip_list(
     task_id: i64,
 ) -> ApiResponse<Vec<CompetitorClipItem>> {
     let result = state.db.with_conn(|conn| {
+        // 先取本场次的分段集合，再找「分段与之有交集」的所有切片任务
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.bvid, COALESCE(c.title,''), c.up_uid, COALESCE(u.up_name,''), \
+            "WITH session_records AS ( \
+               SELECT CAST(j.value AS INTEGER) AS rid \
+               FROM live_clip_task t JOIN json_each(t.record_ids) j WHERE t.id = ?2 \
+             ), \
+             related_tasks AS ( \
+               SELECT DISTINCT c.task_id \
+               FROM competitor_clip c \
+               JOIN live_clip_task t2 ON t2.id = c.task_id \
+               JOIN json_each(t2.record_ids) j2 ON j2.value IN (SELECT rid FROM session_records) \
+               WHERE c.room_id = ?1 AND c.task_id IS NOT NULL \
+             ) \
+             SELECT c.id, c.bvid, COALESCE(c.title,''), c.up_uid, COALESCE(u.up_name,''), \
                     COALESCE(c.cover_url,''), COALESCE(c.duration_secs,0), COALESCE(c.pub_time,''), \
                     c.status, COALESCE(c.status_note,''), COALESCE(c.file_path,'') \
              FROM competitor_clip c \
              LEFT JOIN competitor_up u ON u.room_id = c.room_id AND u.up_uid = c.up_uid \
-             WHERE c.room_id = ?1 AND c.task_id = ?2 \
+             WHERE c.room_id = ?1 AND c.task_id IN (SELECT task_id FROM related_tasks) \
              ORDER BY c.pub_time DESC, c.id DESC",
         )?;
         let rows = stmt.query_map((room_id.trim(), task_id), |r| {
