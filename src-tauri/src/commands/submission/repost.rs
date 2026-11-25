@@ -1010,6 +1010,22 @@ pub(super) fn collect_missing_source_files(sources: &[TaskSourceVideoRecord]) ->
     missing
 }
 
+/// 本地源视频是否“未就绪”：不存在，或存在但只下载了一部分。
+///
+/// 只看 `exists()` 不够：aria2c 中断后留下的是半截文件，文件存在但内容残缺，
+/// 直接拿去 copy 切段会切出损坏码流，合并后整条投稿被B站判转码失败。
+/// 这里用「文件实际大小 < 下载记录总大小」判定未就绪，
+/// 同时容忍记录滞后（文件已补全但记录仍停在暂停进度）的情况。
+pub(super) fn is_partial_download_file(path: &Path, expected_total: i64) -> bool {
+    if expected_total <= 0 {
+        return false;
+    }
+    match fs::metadata(path) {
+        Ok(meta) => (meta.len() as i64) < expected_total,
+        Err(_) => false,
+    }
+}
+
 pub(super) fn collect_missing_source_paths(paths: &[String]) -> Vec<String> {
     let mut missing = Vec::new();
     for path in paths {
@@ -1022,6 +1038,42 @@ pub(super) fn collect_missing_source_paths(paths: &[String]) -> Vec<String> {
         }
     }
     missing
+}
+
+/// 在“文件不存在”之外，进一步筛出「文件存在但内容不完整」的源视频。
+/// 这类源视频必须重新下载补齐后才能开始剪辑，不能静默按完整文件处理。
+pub(super) fn collect_partial_source_paths(
+    context: &SubmissionContext,
+    task_id: &str,
+    paths: &[String],
+) -> Vec<String> {
+    let Ok(records) = load_integrated_download_records(context, task_id) else {
+        return Vec::new();
+    };
+    let mut total_by_path: HashMap<String, i64> = HashMap::new();
+    for record in records {
+        let runtime_path = normalize_runtime_source_path(context, &record.local_path);
+        if runtime_path.trim().is_empty() {
+            continue;
+        }
+        if record.progress_total > 0 {
+            total_by_path.insert(runtime_path, record.progress_total);
+        }
+    }
+    let mut partial = Vec::new();
+    for path in paths {
+        if path.trim().is_empty() {
+            continue;
+        }
+        let runtime_path = normalize_runtime_source_path(context, path);
+        let Some(expected_total) = total_by_path.get(&runtime_path).copied() else {
+            continue;
+        };
+        if is_partial_download_file(Path::new(&runtime_path), expected_total) {
+            partial.push(path.clone());
+        }
+    }
+    partial
 }
 
 pub(super) fn resolve_reprocess_source_paths(
@@ -3499,6 +3551,7 @@ pub(super) fn collect_retry_download_records_for_missing_sources(
                     cid: None,
                     content: None,
                     source_type: crate::commands::download::DOWNLOAD_SOURCE_BAIDU.to_string(),
+                    progress_total: 0,
                 });
                 continue;
             }
@@ -3525,6 +3578,7 @@ pub(super) fn collect_retry_download_records_for_missing_sources(
                     cid: None,
                     content: None,
                     source_type: crate::commands::download::DOWNLOAD_SOURCE_DIRECT.to_string(),
+                    progress_total: 0,
                 });
                 continue;
             }
@@ -3556,6 +3610,7 @@ pub(super) fn collect_retry_download_records_for_missing_sources(
                     cid: binding.remote_cid,
                     content: None,
                     source_type: "BILIBILI".to_string(),
+                    progress_total: 0,
                 });
                 continue;
             }

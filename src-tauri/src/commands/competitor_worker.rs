@@ -181,21 +181,28 @@ pub fn resume_downloading(
     threads: i32,
     log_path: &Path,
 ) -> usize {
-    let rows: Vec<(i64, String, String)> = db
+    use rusqlite::OptionalExtension;
+
+    // 直接查下载队列：以队列的 local_path 为准，不再自己拼路径。
+    // 下载器会把文件放在 <target>/<bvid>/<标题>.mp4，自己拼一定对不上。
+    // 状态：2 = 成功，3 = 进行中，其余视为未完成。
+    let rows: Vec<(i64, String, Option<i64>, Option<String>)> = db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT c.id, c.bvid, \
-                        COALESCE((SELECT r.file_path FROM live_clip_task t \
-                                  JOIN json_each(t.record_ids) j ON j.value = r.id \
-                                  JOIN live_record_task r ON r.id = j.value \
-                                  WHERE t.id = c.task_id LIMIT 1), '') \
+                        (SELECT vd.status FROM video_download vd \
+                         WHERE vd.bvid = c.bvid ORDER BY vd.id DESC LIMIT 1), \
+                        (SELECT vd.local_path FROM video_download vd \
+                         WHERE vd.bvid = c.bvid AND vd.status = 2 \
+                         ORDER BY vd.id DESC LIMIT 1) \
                  FROM competitor_clip c WHERE c.status = 'DOWNLOADING' LIMIT 10",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -203,56 +210,48 @@ pub fn resume_downloading(
         .unwrap_or_default();
 
     let mut done = 0usize;
-    for (id, bvid, source_file) in rows {
-        if source_file.trim().is_empty() {
-            let _ = competitor_media::set_status(db, id, "SKIPPED", "没有归属场次");
-            continue;
-        }
-        let Some(dir) = competitor_media::competitor_dir_of(&source_file) else {
-            continue;
-        };
-        let video_path = dir.join(format!("{}.mp4", bvid));
-        let asr_path = dir.join(format!("{}.json", bvid));
-        if !video_path.exists() {
-            // 查下载队列的真实状态：失败的要回写，否则会永远卡在 DOWNLOADING
-            use rusqlite::OptionalExtension;
-            let dl_status: Option<i64> = db
-                .with_conn(|conn| {
-                    conn.query_row(
-                        "SELECT status FROM video_download WHERE bvid = ?1 ORDER BY id DESC LIMIT 1",
-                        [&bvid],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                })
-                .ok()
-                .flatten();
-            match dl_status {
-                // 3 = 进行中，继续等
-                Some(3) | Some(1) | Some(0) | None => continue,
-                // 其余视为未完成（失败/中断），记失败让用户能看到
-                Some(code) => {
-                    let _ = competitor_media::set_status(
-                        db,
-                        id,
-                        "FAILED",
-                        &format!("下载未完成（队列状态 {}）", code),
-                    );
-                    append_log(
-                        log_path,
-                        &format!("competitor_download_failed id={} bvid={} dl_status={}", id, bvid, code),
-                    );
-                    continue;
-                }
+    for (id, bvid, dl_status, local_path) in rows {
+        match dl_status {
+            // 进行中或还没入队：继续等下一轮
+            Some(3) | Some(0) | Some(1) | None => continue,
+            // 成功：拿到真实路径去转写
+            Some(2) => {}
+            Some(code) => {
+                let _ = competitor_media::set_status(
+                    db,
+                    id,
+                    "FAILED",
+                    &format!("下载未完成（队列状态 {}）", code),
+                );
+                append_log(
+                    log_path,
+                    &format!("competitor_download_failed id={} bvid={} dl_status={}", id, bvid, code),
+                );
+                continue;
             }
         }
+
+        let Some(video_path) = local_path.filter(|p| !p.trim().is_empty()) else {
+            let _ = competitor_media::set_status(db, id, "FAILED", "下载记录缺少文件路径");
+            continue;
+        };
+        let path = std::path::Path::new(&video_path);
+        if !path.is_file() {
+            let _ = competitor_media::set_status(db, id, "FAILED", "下载的文件已不存在");
+            continue;
+        }
+
+        // 转写结果放在视频同目录，文件名用 bvid，便于查找
+        let asr_path = path
+            .parent()
+            .map(|dir| dir.join(format!("{}.json", bvid)))
+            .unwrap_or_else(|| std::path::PathBuf::from(format!("{}.json", bvid)));
+
         let _ = competitor_media::set_status(db, id, "TRANSCRIBING", "");
-        match competitor_media::transcribe_clip(
-            model_dir,
-            threads,
-            &video_path.to_string_lossy(),
-            &asr_path,
-        ) {
+        // 先把视频路径落库，界面才能看到文件
+        let _ = competitor_media::attach_file(db, id, &video_path);
+
+        match competitor_media::transcribe_clip(model_dir, threads, &video_path, &asr_path) {
             Ok(_) => {
                 let _ = competitor_media::attach_asr(db, id, &asr_path.to_string_lossy());
                 done += 1;

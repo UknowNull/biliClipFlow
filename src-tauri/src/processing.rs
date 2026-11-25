@@ -96,6 +96,42 @@ pub fn merge_files(files: &[PathBuf], output_path: &Path) -> Result<(), String> 
 
     run_ffmpeg(&args)?;
     let _ = fs::remove_file(list_path);
+
+    // copy 拼接在遇到损坏码流时会静默中断，产物只剩前面几段，
+    // ffmpeg 仍返回成功。这里必须核对输出时长，否则损坏产物会一路走到投稿。
+    verify_concat_output_duration(files, output_path)?;
+    Ok(())
+}
+
+/// 校验 copy 拼接产物时长是否约等于各输入时长之和。
+/// 偏差超过阈值说明 concat 中途失败（源码流损坏），必须报错而不是继续投稿。
+fn verify_concat_output_duration(files: &[PathBuf], output_path: &Path) -> Result<(), String> {
+    let mut expected_total = 0.0_f64;
+    for file in files {
+        expected_total += probe_duration_seconds(file).unwrap_or(0.0);
+    }
+    if expected_total <= 0.0 {
+        // 输入时长都探测不到时不做判断，避免误杀。
+        return Ok(());
+    }
+    let actual = probe_duration_seconds(output_path).unwrap_or(0.0);
+    if actual <= 0.0 {
+        return Err(format!(
+            "合并产物无法读取时长: output={}",
+            output_path.to_string_lossy()
+        ));
+    }
+    // 允许 5% 或 10 秒的偏差（关键帧与容器时间基差异）。
+    let tolerance = (expected_total * 0.05).max(10.0);
+    if expected_total - actual > tolerance {
+        return Err(format!(
+            "合并产物时长异常，疑似拼接中途失败（可能是源视频损坏或未下载完整）: inputs={} expected={:.1}s actual={:.1}s output={}",
+            files.len(),
+            expected_total,
+            actual,
+            output_path.to_string_lossy()
+        ));
+    }
     Ok(())
 }
 
@@ -271,10 +307,47 @@ fn build_merge_transcode_attempts(
     [build_args(true), build_args(false)]
 }
 
-pub fn decide_clip_copy(_sources: &[ClipSource]) -> Result<ClipCopyDecision, String> {
+/// 决定切段能否用 `-c copy`。
+///
+/// copy 模式不重新编码，源文件有任何损坏都会原样带进产物：合并后整条投稿会被B站判转码失败。
+/// 所以这里必须真正校验源文件，而不是无条件走快路径：
+/// - 源文件不存在 → 报错
+/// - 探针时长明显短于请求的 `end_time`（文件被截断/只下载了一部分）→ 降级转码
+/// - 其余情况才允许 copy。
+pub fn decide_clip_copy(sources: &[ClipSource]) -> Result<ClipCopyDecision, String> {
+    for source in sources {
+        let path = Path::new(&source.input_path);
+        if !path.exists() {
+            return Err(format!("源视频不存在: {}", source.input_path));
+        }
+        let Some(end_seconds) = source.end_time.as_deref().and_then(parse_time_to_seconds) else {
+            continue;
+        };
+        if end_seconds <= 0.0 {
+            continue;
+        }
+        // 探针失败时不阻止流程，交由后续步骤暴露；探针成功但明显偏短才判定截断。
+        let Ok(duration) = probe_duration_seconds(path) else {
+            continue;
+        };
+        if duration <= 0.0 {
+            continue;
+        }
+        // 允许 2 秒误差，避免关键帧对齐/时间基差异造成误判。
+        let tolerance = 2.0;
+        if end_seconds - duration > tolerance {
+            return Ok(ClipCopyDecision {
+                use_copy: false,
+                reason: Some(format!(
+                    "source_truncated input={} requested_end={:.3} actual={:.3}",
+                    source.input_path, end_seconds, duration
+                )),
+            });
+        }
+    }
     Ok(ClipCopyDecision {
         use_copy: true,
-        reason: Some("forced_copy_mode".to_string()),
+        reason: Some("source_duration_ok".to_string()),
     })
 }
 
@@ -1062,8 +1135,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        build_merge_filter_graph, build_merge_transcode_attempts, format_ffmpeg_time,
-        last_keyframe_at_or_before, MergeInputInfo, TranscodeProfile,
+        build_merge_filter_graph, build_merge_transcode_attempts, decide_clip_copy,
+        format_ffmpeg_time, last_keyframe_at_or_before, ClipSource, MergeInputInfo,
+        TranscodeProfile,
     };
     use serde_json::json;
 
@@ -1123,6 +1197,34 @@ mod tests {
         ]);
         assert!(graph.contains("anullsrc=r=48000:cl=stereo,atrim=duration=4.250000"));
         assert!(graph.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vout][aout]"));
+    }
+
+    #[test]
+    fn decide_clip_copy_rejects_missing_source() {
+        let sources = [ClipSource {
+            input_path: "/nonexistent/source.mp4".to_string(),
+            start_time: None,
+            end_time: None,
+            order: 1,
+        }];
+        assert!(decide_clip_copy(&sources).is_err());
+    }
+
+    #[test]
+    fn part_of_merge_duration_guard_detects_truncated_output() {
+        // 预期 30870s、实际只有 2753s（本次故障的真实数值）：必须判定异常。
+        let expected_total = 30870.0_f64;
+        let actual = 2753.262_f64;
+        let tolerance = (expected_total * 0.05).max(10.0);
+        assert!(
+            expected_total - actual > tolerance,
+            "截断产物必须被判定为异常"
+        );
+        // 正常情况（各段之和 ≈ 输出）不应误杀。
+        let ok_expected = 2756.0_f64;
+        let ok_actual = 2753.262_f64;
+        let ok_tolerance = (ok_expected * 0.05).max(10.0);
+        assert!(ok_expected - ok_actual <= ok_tolerance);
     }
 
     #[test]

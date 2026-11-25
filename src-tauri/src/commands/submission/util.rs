@@ -25,7 +25,21 @@ pub(super) fn prepare_integrated_source_downloads(
     workflow_instance_id: &str,
     source_paths: &[String],
 ) -> Result<Vec<i64>, String> {
-    let missing_sources = collect_missing_source_paths(source_paths);
+    let mut missing_sources = collect_missing_source_paths(source_paths);
+    // 文件存在但只下载了一部分的源视频，同样视为“未就绪”：
+    // 必须补全后才能剪辑，否则会切出损坏码流导致B站转码失败。
+    for partial in collect_partial_source_paths(context, task_id, source_paths) {
+        if !missing_sources.contains(&partial) {
+            append_log(
+                &context.app_log_path,
+                &format!(
+                    "submission_source_partial_download task_id={} path={}",
+                    task_id, partial
+                ),
+            );
+            missing_sources.push(partial);
+        }
+    }
     if missing_sources.is_empty() {
         return Ok(Vec::new());
     }

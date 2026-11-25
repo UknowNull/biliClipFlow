@@ -897,6 +897,8 @@ struct IntegratedDownloadRecord {
     cid: Option<i64>,
     content: Option<String>,
     source_type: String,
+    /// 下载记录里登记的完整文件大小；0 表示未知。
+    progress_total: i64,
 }
 
 #[derive(Clone)]
@@ -1770,6 +1772,26 @@ mod tests {
         );
         assert_eq!(outcome.parts[1].title, "网页新增");
         assert_eq!(outcome.parts[2].cid, 22);
+    }
+
+    #[test]
+    fn partial_download_file_detection_matches_incomplete_size() {
+        // 本次故障：DB 记录 4.48GB，磁盘只有约 178MB → 判定为未就绪。
+        let expected_total = 4477869772_i64;
+        let on_disk = 178044928_u64;
+        assert!(on_disk < expected_total as u64, "半截文件必须判为未就绪");
+        // 总大小未知（<=0）时不做限制，避免误杀。
+        assert!(!is_partial_download_file(Path::new("/nonexistent"), 0));
+    }
+
+    #[test]
+    fn remote_archive_negative_state_is_failure() {
+        // B站 -16 = 转码失败，必须判失败。
+        assert!(!is_remote_archive_state_ok(-16));
+        assert!(!is_remote_archive_state_ok(-30));
+        // 正常/审核中等状态视为已受理。
+        assert!(is_remote_archive_state_ok(0));
+        assert!(is_remote_archive_state_ok(1));
     }
 
     #[test]

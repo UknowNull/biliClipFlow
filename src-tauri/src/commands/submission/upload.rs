@@ -1178,6 +1178,48 @@ pub(super) fn is_remote_part_content_mismatch_error(err: &str) -> bool {
     err.contains("远程分P内容与本次提交不一致")
 }
 
+pub(super) fn is_remote_transcode_failure_error(err: &str) -> bool {
+    err.contains("B站稿件转码失败")
+}
+
+/// 读取远端稿件的转码/审核状态。
+/// 返回 (state, state_desc)；读不到时返回 Ok(None)。
+///
+/// 投稿接口返回成功后，稿件仍可能在B站侧转码失败（state = -16）。
+/// 只校验分P数量/cid 会把这种情况误判为成功，必须额外看 state。
+pub(super) async fn fetch_remote_archive_state(
+    context: &UploadContext,
+    auth: &AuthInfo,
+    bvid: &str,
+) -> Result<Option<(i64, String)>, String> {
+    let bvid = bvid.trim();
+    if bvid.is_empty() {
+        return Ok(None);
+    }
+    let params = vec![("bvid".to_string(), bvid.to_string())];
+    let data = context
+        .bilibili
+        .get_json(
+            "https://member.bilibili.com/x/vupre/web/archive/view",
+            &params,
+            Some(auth),
+            false,
+        )
+        .await?;
+    let Some(archive) = data.get("archive") else {
+        return Ok(None);
+    };
+    let state = json_i64_compatible(archive.get("state")).unwrap_or(0);
+    let state_desc = json_string_compatible(archive.get("state_desc")).unwrap_or_default();
+    Ok(Some((state, state_desc)))
+}
+
+/// B站稿件状态是否代表「已受理成功」。
+/// 负数状态是各类失败（-16 转码失败、-30 等），必须视为失败而不是成功。
+pub(super) fn is_remote_archive_state_ok(state: i64) -> bool {
+    state >= 0
+}
+
 fn summarize_cid_list(cids: &[i64]) -> String {
     let preview = cids
         .iter()
@@ -1201,15 +1243,50 @@ pub(super) async fn verify_remote_part_cids(
     bvid: &str,
     expected_cids: &[i64],
 ) -> Result<(), String> {
-    let mut expected = expected_cids.to_vec();
-    expected.sort_unstable();
+    let mut expected_cids_sorted = expected_cids.to_vec();
+    expected_cids_sorted.sort_unstable();
     let mut last_error: Option<String> = None;
     for attempt in 1..=REMOTE_PART_VERIFY_RETRY_LIMIT {
+        // 先看B站稿件状态：转码失败等负状态必须立刻判失败，
+        // 否则分P齐全但媒体损坏的稿件会被误记为投稿成功。
+        match fetch_remote_archive_state(context, auth, bvid).await {
+            Ok(Some((state, state_desc))) if !is_remote_archive_state_ok(state) => {
+                let desc = if state_desc.trim().is_empty() {
+                    "未知原因".to_string()
+                } else {
+                    state_desc.trim().to_string()
+                };
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "submission_remote_archive_rejected task_id={} bvid={} state={} desc={}",
+                        task_id, bvid, state, desc
+                    ),
+                );
+                return Err(format!(
+                    "B站稿件转码失败（state={} {}），请检查源视频是否完整后重新投稿",
+                    state, desc
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                if is_rate_limit_error(&err) {
+                    return Err(err);
+                }
+                append_log(
+                    &context.app_log_path,
+                    &format!(
+                        "submission_remote_archive_state_skip task_id={} bvid={} attempt={} err={}",
+                        task_id, bvid, attempt, err
+                    ),
+                );
+            }
+        }
         match fetch_remote_archive_parts(context, auth, bvid).await {
             Ok(remote_parts) => {
                 let mut actual: Vec<i64> = remote_parts.iter().map(|part| part.cid).collect();
                 actual.sort_unstable();
-                if actual == expected {
+                if actual == expected_cids_sorted {
                     append_log(
                         &context.app_log_path,
                         &format!(
@@ -1221,16 +1298,16 @@ pub(super) async fn verify_remote_part_cids(
                     );
                     return Ok(());
                 }
-                last_error = Some(if actual.len() != expected.len() {
+                last_error = Some(if actual.len() != expected_cids_sorted.len() {
                     format!(
                         "远程分P数量与本地不一致（本地={}，远程={}）",
-                        expected.len(),
+                        expected_cids_sorted.len(),
                         actual.len()
                     )
                 } else {
                     format!(
                         "远程分P内容与本次提交不一致（提交={}，远程={}）",
-                        summarize_cid_list(&expected),
+                        summarize_cid_list(&expected_cids_sorted),
                         summarize_cid_list(&actual)
                     )
                 });
@@ -2071,6 +2148,7 @@ pub(super) async fn run_submission_upload(context: UploadContext, task_id: Strin
                 {
                     if !is_remote_part_count_mismatch_error(&err)
                         && !is_remote_part_content_mismatch_error(&err)
+                        && !is_remote_transcode_failure_error(&err)
                     {
                         update_submission_status_with_reason(
                             &submission_context,
